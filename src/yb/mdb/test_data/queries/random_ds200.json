@@ -1,0 +1,3992 @@
+[
+  {
+    "id": 1,
+    "template": "RND_FILTER_BOUND",
+    "category": "Random FILTER",
+    "query": "SELECT ?s ?o WHERE { ?s <http://example.org/collaboratesWith> ?o . FILTER(BOUND(?o)) }"
+  },
+  {
+    "id": 2,
+    "template": "RND_FILTER_sameTerm",
+    "category": "Random FILTER",
+    "query": "SELECT ?s ?o WHERE { ?s <http://example.org/fundedBy> ?o . FILTER(sameTerm(?s, ?s)) }"
+  },
+  {
+    "id": 3,
+    "template": "RND_FILTER_eq",
+    "category": "Random FILTER",
+    "query": "SELECT ?s ?o WHERE { ?s <http://example.org/developedBy> ?o . FILTER(?s != ?o) }"
+  },
+  {
+    "id": 4,
+    "template": "RND_FILTER_BOUND",
+    "category": "Random FILTER",
+    "query": "SELECT ?s ?o WHERE { ?s <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> ?o . FILTER(BOUND(?o)) }"
+  },
+  {
+    "id": 5,
+    "template": "RND_LIMIT_OFFSET",
+    "category": "Random LIMIT",
+    "query": "SELECT ?s ?o WHERE { ?s <http://example.org/contains> ?o } LIMIT 20 OFFSET 20"
+  },
+  {
+    "id": 6,
+    "template": "RND_PATH_inverse",
+    "category": "Random Path",
+    "query": "SELECT ?s ?o WHERE { ?s ^<http://example.org/collaboratesWith> ?o }"
+  },
+  {
+    "id": 7,
+    "template": "RND_BGP",
+    "category": "Random BGP",
+    "query": "SELECT ?s ?o WHERE { ?s <http://example.org/contains> ?o }"
+  },
+  {
+    "id": 8,
+    "template": "RND_FILTER_CONTAINS",
+    "category": "Random FILTER",
+    "query": "SELECT ?s ?l WHERE { ?s rdfs:label ?l . FILTER(CONTAINS(?l, \"ct\")) }"
+  },
+  {
+    "id": 9,
+    "template": "RND_LIMIT",
+    "category": "Random LIMIT",
+    "query": "SELECT ?s ?o WHERE { ?s <http://example.org/worksFor> ?o } LIMIT 5"
+  },
+  {
+    "id": 10,
+    "template": "RND_LIMIT_OFFSET",
+    "category": "Random LIMIT",
+    "query": "SELECT ?s ?o WHERE { ?s <http://example.org/fundedBy> ?o } LIMIT 20 OFFSET 20"
+  },
+  {
+    "id": 11,
+    "template": "RND_LIMIT_OFFSET",
+    "category": "Random LIMIT",
+    "query": "SELECT ?s ?o WHERE { ?s <http://example.org/manages> ?o } LIMIT 5 OFFSET 5"
+  },
+  {
+    "id": 12,
+    "template": "RND_ORDER_DESC",
+    "category": "Random ORDER",
+    "query": "SELECT ?s ?o WHERE { ?s <http://example.org/worksFor> ?o } ORDER BY DESC(?s)"
+  },
+  {
+    "id": 13,
+    "template": "RND_BGP",
+    "category": "Random BGP",
+    "query": "SELECT ?s ?o WHERE { ?s <http://example.org/developedBy> ?o }"
+  },
+  {
+    "id": 14,
+    "template": "RND_PATH_inverse",
+    "category": "Random Path",
+    "query": "SELECT ?s ?o WHERE { ?s ^<http://example.org/locatedIn> ?o }"
+  },
+  {
+    "id": 15,
+    "template": "RND_FILTER_sameTerm",
+    "category": "Random FILTER",
+    "query": "SELECT ?s ?o WHERE { ?s <http://example.org/developedBy> ?o . FILTER(sameTerm(?s, ?s)) }"
+  },
+  {
+    "id": 16,
+    "template": "RND_FILTER_CONTAINS",
+    "category": "Random FILTER",
+    "query": "SELECT ?s ?l WHERE { ?s rdfs:label ?l . FILTER(CONTAINS(?l, \"ce\")) }"
+  },
+  {
+    "id": 17,
+    "template": "RND_FILTER_BOUND",
+    "category": "Random FILTER",
+    "query": "SELECT ?s ?o WHERE { ?s <http://example.org/contains> ?o . FILTER(BOUND(?o)) }"
+  },
+  {
+    "id": 18,
+    "template": "RND_PATH_plus",
+    "category": "Random Path",
+    "query": "SELECT ?s ?o WHERE { ?s <http://example.org/contains>+ ?o }"
+  },
+  {
+    "id": 19,
+    "template": "RND_PATH_star",
+    "category": "Random Path",
+    "query": "SELECT ?s ?o WHERE { ?s <http://example.org/locatedIn>* ?o }"
+  },
+  {
+    "id": 20,
+    "template": "RND_RDF_TYPE",
+    "category": "Random BGP",
+    "query": "SELECT ?s ?t WHERE { ?s rdf:type ?t }"
+  },
+  {
+    "id": 21,
+    "template": "RND_FILTER_sameTerm",
+    "category": "Random FILTER",
+    "query": "SELECT ?s ?o WHERE { ?s <http://example.org/collaboratesWith> ?o . FILTER(sameTerm(?s, ?s)) }"
+  },
+  {
+    "id": 22,
+    "template": "RND_ORDER_ASC",
+    "category": "Random ORDER",
+    "query": "SELECT ?s ?o WHERE { ?s <http://example.org/reportsTo> ?o } ORDER BY ASC(?s)"
+  },
+  {
+    "id": 23,
+    "template": "RND_LIMIT_OFFSET",
+    "category": "Random LIMIT",
+    "query": "SELECT ?s ?o WHERE { ?s <http://example.org/knows> ?o } LIMIT 20 OFFSET 20"
+  },
+  {
+    "id": 24,
+    "template": "RND_PATH_star",
+    "category": "Random Path",
+    "query": "SELECT ?s ?o WHERE { ?s <http://example.org/worksFor>* ?o }"
+  },
+  {
+    "id": 25,
+    "template": "RND_FILTER_CONTAINS",
+    "category": "Random FILTER",
+    "query": "SELECT ?s ?l WHERE { ?s rdfs:label ?l . FILTER(CONTAINS(?l, \"on\")) }"
+  },
+  {
+    "id": 26,
+    "template": "RND_JOIN",
+    "category": "Random Join",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> ?o . ?o <http://example.org/fundedBy> ?z }"
+  },
+  {
+    "id": 27,
+    "template": "RND_OPTIONAL",
+    "category": "Random OPTIONAL",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/contains> ?o . OPTIONAL { ?o <http://example.org/fundedBy> ?z } }"
+  },
+  {
+    "id": 28,
+    "template": "RND_FILTER_BOUND",
+    "category": "Random FILTER",
+    "query": "SELECT ?s ?o WHERE { ?s <http://example.org/manages> ?o . FILTER(BOUND(?o)) }"
+  },
+  {
+    "id": 29,
+    "template": "RND_FILTER_sameTerm",
+    "category": "Random FILTER",
+    "query": "SELECT ?s ?o WHERE { ?s <http://example.org/memberOf> ?o . FILTER(sameTerm(?s, ?s)) }"
+  },
+  {
+    "id": 30,
+    "template": "RND_PATH_star",
+    "category": "Random Path",
+    "query": "SELECT ?s ?o WHERE { ?s <http://example.org/developedBy>* ?o }"
+  },
+  {
+    "id": 31,
+    "template": "RND_FILTER_CONTAINS",
+    "category": "Random FILTER",
+    "query": "SELECT ?s ?l WHERE { ?s rdfs:label ?l . FILTER(CONTAINS(?l, \"en\")) }"
+  },
+  {
+    "id": 32,
+    "template": "RND_FILTER_isIRI",
+    "category": "Random FILTER",
+    "query": "SELECT ?s ?o WHERE { ?s <http://example.org/worksFor> ?o . FILTER(isIRI(?s)) }"
+  },
+  {
+    "id": 33,
+    "template": "RND_FILTER_STRSTARTS",
+    "category": "Random FILTER",
+    "query": "SELECT ?s ?l WHERE { ?s rdfs:label ?l . FILTER(STRSTARTS(?l, \"Organization\")) }"
+  },
+  {
+    "id": 34,
+    "template": "RND_ORDER_DESC",
+    "category": "Random ORDER",
+    "query": "SELECT ?s ?o WHERE { ?s <http://example.org/manages> ?o } ORDER BY DESC(?s)"
+  },
+  {
+    "id": 35,
+    "template": "RND_UNION",
+    "category": "Random UNION",
+    "query": "SELECT ?s ?o WHERE { { ?s <http://example.org/collaboratesWith> ?o } UNION { ?s <http://example.org/fundedBy> ?o } }"
+  },
+  {
+    "id": 36,
+    "template": "RND_JOIN",
+    "category": "Random Join",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/locatedIn> ?o . ?o <http://example.org/manages> ?z }"
+  },
+  {
+    "id": 37,
+    "template": "RND_FILTER_sameTerm",
+    "category": "Random FILTER",
+    "query": "SELECT ?s ?o WHERE { ?s <http://example.org/contains> ?o . FILTER(sameTerm(?s, ?s)) }"
+  },
+  {
+    "id": 38,
+    "template": "RND_FILTER_CONTAINS",
+    "category": "Random FILTER",
+    "query": "SELECT ?s ?l WHERE { ?s rdfs:label ?l . FILTER(CONTAINS(?l, \"Te\")) }"
+  },
+  {
+    "id": 39,
+    "template": "RND_UNION",
+    "category": "Random UNION",
+    "query": "SELECT ?s ?o WHERE { { ?s <http://example.org/fundedBy> ?o } UNION { ?s <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> ?o } }"
+  },
+  {
+    "id": 40,
+    "template": "RND_DISTINCT",
+    "category": "Random DISTINCT",
+    "query": "SELECT DISTINCT ?s ?o WHERE { ?s <http://example.org/manages> ?o }"
+  },
+  {
+    "id": 41,
+    "template": "RND_ORDER_DESC",
+    "category": "Random ORDER",
+    "query": "SELECT ?s ?o WHERE { ?s <http://example.org/developedBy> ?o } ORDER BY DESC(?s)"
+  },
+  {
+    "id": 42,
+    "template": "RND_FILTER_REGEX",
+    "category": "Random FILTER",
+    "query": "SELECT ?s ?l WHERE { ?s rdfs:label ?l . FILTER(REGEX(?l, \"Product\")) }"
+  },
+  {
+    "id": 43,
+    "template": "RND_LIMIT_OFFSET",
+    "category": "Random LIMIT",
+    "query": "SELECT ?s ?o WHERE { ?s <http://example.org/reportsTo> ?o } LIMIT 10 OFFSET 10"
+  },
+  {
+    "id": 44,
+    "template": "RND_PATH_inverse",
+    "category": "Random Path",
+    "query": "SELECT ?s ?o WHERE { ?s ^<http://example.org/worksFor> ?o }"
+  },
+  {
+    "id": 45,
+    "template": "RND_PATH_plus",
+    "category": "Random Path",
+    "query": "SELECT ?s ?o WHERE { ?s <http://example.org/locatedIn>+ ?o }"
+  },
+  {
+    "id": 46,
+    "template": "RND_LIMIT",
+    "category": "Random LIMIT",
+    "query": "SELECT ?s ?o WHERE { ?s <http://example.org/memberOf> ?o } LIMIT 5"
+  },
+  {
+    "id": 47,
+    "template": "RND_JOIN",
+    "category": "Random Join",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/contains> ?o . ?o <http://example.org/developedBy> ?z }"
+  },
+  {
+    "id": 48,
+    "template": "RND_FILTER_STRSTARTS",
+    "category": "Random FILTER",
+    "query": "SELECT ?s ?l WHERE { ?s rdfs:label ?l . FILTER(STRSTARTS(?l, \"Technology\")) }"
+  },
+  {
+    "id": 49,
+    "template": "RND_FILTER_isIRI",
+    "category": "Random FILTER",
+    "query": "SELECT ?s ?o WHERE { ?s <http://example.org/manages> ?o . FILTER(isIRI(?s)) }"
+  },
+  {
+    "id": 50,
+    "template": "RND_PATH_plus",
+    "category": "Random Path",
+    "query": "SELECT ?s ?o WHERE { ?s <http://example.org/worksFor>+ ?o }"
+  },
+  {
+    "id": 51,
+    "template": "RND_ORDER_DESC",
+    "category": "Random ORDER",
+    "query": "SELECT ?s ?o WHERE { ?s <http://example.org/reportsTo> ?o } ORDER BY DESC(?s)"
+  },
+  {
+    "id": 52,
+    "template": "RND_LIMIT_OFFSET",
+    "category": "Random LIMIT",
+    "query": "SELECT ?s ?o WHERE { ?s <http://example.org/collaboratesWith> ?o } LIMIT 20 OFFSET 20"
+  },
+  {
+    "id": 53,
+    "template": "RND_UNION",
+    "category": "Random UNION",
+    "query": "SELECT ?s ?o WHERE { { ?s <http://example.org/contains> ?o } UNION { ?s <http://example.org/knows> ?o } }"
+  },
+  {
+    "id": 54,
+    "template": "RND_PATH_inverse",
+    "category": "Random Path",
+    "query": "SELECT ?s ?o WHERE { ?s ^<http://example.org/developedBy> ?o }"
+  },
+  {
+    "id": 55,
+    "template": "RND_ORDER_DESC",
+    "category": "Random ORDER",
+    "query": "SELECT ?s ?o WHERE { ?s <http://example.org/collaboratesWith> ?o } ORDER BY DESC(?s)"
+  },
+  {
+    "id": 56,
+    "template": "RND_LIMIT",
+    "category": "Random LIMIT",
+    "query": "SELECT ?s ?o WHERE { ?s <http://example.org/developedBy> ?o } LIMIT 5"
+  },
+  {
+    "id": 57,
+    "template": "RND_OPTIONAL",
+    "category": "Random OPTIONAL",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> ?o . OPTIONAL { ?o <http://example.org/reportsTo> ?z } }"
+  },
+  {
+    "id": 58,
+    "template": "RND_FILTER_CONTAINS",
+    "category": "Random FILTER",
+    "query": "SELECT ?s ?l WHERE { ?s rdfs:label ?l . FILTER(CONTAINS(?l, \"an\")) }"
+  },
+  {
+    "id": 59,
+    "template": "RND_LIMIT_OFFSET",
+    "category": "Random LIMIT",
+    "query": "SELECT ?s ?o WHERE { ?s <http://example.org/reportsTo> ?o } LIMIT 5 OFFSET 5"
+  },
+  {
+    "id": 60,
+    "template": "RND_UNION",
+    "category": "Random UNION",
+    "query": "SELECT ?s ?o WHERE { { ?s <http://example.org/memberOf> ?o } UNION { ?s <http://example.org/collaboratesWith> ?o } }"
+  },
+  {
+    "id": 61,
+    "template": "RND_FILTER_BOUND",
+    "category": "Random FILTER",
+    "query": "SELECT ?s ?o WHERE { ?s <http://example.org/locatedIn> ?o . FILTER(BOUND(?o)) }"
+  },
+  {
+    "id": 62,
+    "template": "RND_OPTIONAL",
+    "category": "Random OPTIONAL",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/fundedBy> ?o . OPTIONAL { ?o <http://example.org/collaboratesWith> ?z } }"
+  },
+  {
+    "id": 63,
+    "template": "RND_FILTER_eq",
+    "category": "Random FILTER",
+    "query": "SELECT ?s ?o WHERE { ?s <http://example.org/worksFor> ?o . FILTER(?s != ?o) }"
+  },
+  {
+    "id": 64,
+    "template": "RND_FILTER_isIRI",
+    "category": "Random FILTER",
+    "query": "SELECT ?s ?o WHERE { ?s <http://example.org/contains> ?o . FILTER(isIRI(?s)) }"
+  },
+  {
+    "id": 65,
+    "template": "RND_DISTINCT",
+    "category": "Random DISTINCT",
+    "query": "SELECT DISTINCT ?s ?o WHERE { ?s <http://example.org/contains> ?o }"
+  },
+  {
+    "id": 66,
+    "template": "RND_LIMIT_OFFSET",
+    "category": "Random LIMIT",
+    "query": "SELECT ?s ?o WHERE { ?s <http://example.org/developedBy> ?o } LIMIT 5 OFFSET 5"
+  },
+  {
+    "id": 67,
+    "template": "RND_DISTINCT",
+    "category": "Random DISTINCT",
+    "query": "SELECT DISTINCT ?s ?o WHERE { ?s <http://example.org/reportsTo> ?o }"
+  },
+  {
+    "id": 68,
+    "template": "RND_FILTER_STRSTARTS",
+    "category": "Random FILTER",
+    "query": "SELECT ?s ?l WHERE { ?s rdfs:label ?l . FILTER(STRSTARTS(?l, \"Department\")) }"
+  },
+  {
+    "id": 69,
+    "template": "RND_LIMIT",
+    "category": "Random LIMIT",
+    "query": "SELECT ?s ?o WHERE { ?s <http://example.org/worksFor> ?o } LIMIT 50"
+  },
+  {
+    "id": 70,
+    "template": "RND_FILTER_CONTAINS",
+    "category": "Random FILTER",
+    "query": "SELECT ?s ?l WHERE { ?s rdfs:label ?l . FILTER(CONTAINS(?l, \"Pr\")) }"
+  },
+  {
+    "id": 71,
+    "template": "RND_PATH_plus",
+    "category": "Random Path",
+    "query": "SELECT ?s ?o WHERE { ?s <http://www.w3.org/1999/02/22-rdf-syntax-ns#type>+ ?o }"
+  },
+  {
+    "id": 72,
+    "template": "RND_PATH_star",
+    "category": "Random Path",
+    "query": "SELECT ?s ?o WHERE { ?s <http://example.org/memberOf>* ?o }"
+  },
+  {
+    "id": 73,
+    "template": "RND_FILTER_eq",
+    "category": "Random FILTER",
+    "query": "SELECT ?s ?o WHERE { ?s <http://example.org/fundedBy> ?o . FILTER(?s != ?o) }"
+  },
+  {
+    "id": 74,
+    "template": "RND_FILTER_isIRI",
+    "category": "Random FILTER",
+    "query": "SELECT ?s ?o WHERE { ?s <http://example.org/locatedIn> ?o . FILTER(isIRI(?s)) }"
+  },
+  {
+    "id": 75,
+    "template": "RND_BGP",
+    "category": "Random BGP",
+    "query": "SELECT ?s ?o WHERE { ?s <http://example.org/worksFor> ?o }"
+  },
+  {
+    "id": 76,
+    "template": "RND_FILTER_eq",
+    "category": "Random FILTER",
+    "query": "SELECT ?s ?o WHERE { ?s <http://example.org/collaboratesWith> ?o . FILTER(?s != ?o) }"
+  },
+  {
+    "id": 77,
+    "template": "RND_FILTER_isIRI",
+    "category": "Random FILTER",
+    "query": "SELECT ?s ?o WHERE { ?s <http://www.w3.org/2000/01/rdf-schema#label> ?o . FILTER(isIRI(?s)) }"
+  },
+  {
+    "id": 78,
+    "template": "RND_JOIN",
+    "category": "Random Join",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/fundedBy> ?o . ?o <http://example.org/contains> ?z }"
+  },
+  {
+    "id": 79,
+    "template": "RND_JOIN",
+    "category": "Random Join",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/locatedIn> ?o . ?o <http://example.org/contains> ?z }"
+  },
+  {
+    "id": 80,
+    "template": "RND_LIMIT",
+    "category": "Random LIMIT",
+    "query": "SELECT ?s ?o WHERE { ?s <http://example.org/fundedBy> ?o } LIMIT 20"
+  },
+  {
+    "id": 81,
+    "template": "RND_DISTINCT",
+    "category": "Random DISTINCT",
+    "query": "SELECT DISTINCT ?s ?o WHERE { ?s <http://example.org/fundedBy> ?o }"
+  },
+  {
+    "id": 82,
+    "template": "RND_LIMIT_OFFSET",
+    "category": "Random LIMIT",
+    "query": "SELECT ?s ?o WHERE { ?s <http://example.org/developedBy> ?o } LIMIT 20 OFFSET 20"
+  },
+  {
+    "id": 83,
+    "template": "RND_PATH_inverse",
+    "category": "Random Path",
+    "query": "SELECT ?s ?o WHERE { ?s ^<http://example.org/manages> ?o }"
+  },
+  {
+    "id": 84,
+    "template": "RND_ORDER_ASC",
+    "category": "Random ORDER",
+    "query": "SELECT ?s ?o WHERE { ?s <http://www.w3.org/2000/01/rdf-schema#label> ?o } ORDER BY ASC(?s)"
+  },
+  {
+    "id": 85,
+    "template": "RND_PATH_plus",
+    "category": "Random Path",
+    "query": "SELECT ?s ?o WHERE { ?s <http://www.w3.org/2000/01/rdf-schema#label>+ ?o }"
+  },
+  {
+    "id": 86,
+    "template": "RND_UNION",
+    "category": "Random UNION",
+    "query": "SELECT ?s ?o WHERE { { ?s <http://example.org/contains> ?o } UNION { ?s <http://example.org/fundedBy> ?o } }"
+  },
+  {
+    "id": 87,
+    "template": "RND_LIMIT_OFFSET",
+    "category": "Random LIMIT",
+    "query": "SELECT ?s ?o WHERE { ?s <http://example.org/memberOf> ?o } LIMIT 5 OFFSET 5"
+  },
+  {
+    "id": 88,
+    "template": "RND_FILTER_eq",
+    "category": "Random FILTER",
+    "query": "SELECT ?s ?o WHERE { ?s <http://example.org/contains> ?o . FILTER(?s != ?o) }"
+  },
+  {
+    "id": 89,
+    "template": "RND_JOIN",
+    "category": "Random Join",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> ?o . ?o <http://example.org/reportsTo> ?z }"
+  },
+  {
+    "id": 90,
+    "template": "RND_PATH_inverse",
+    "category": "Random Path",
+    "query": "SELECT ?s ?o WHERE { ?s ^<http://example.org/memberOf> ?o }"
+  },
+  {
+    "id": 91,
+    "template": "RND_PATH_plus",
+    "category": "Random Path",
+    "query": "SELECT ?s ?o WHERE { ?s <http://example.org/collaboratesWith>+ ?o }"
+  },
+  {
+    "id": 92,
+    "template": "RND_BGP",
+    "category": "Random BGP",
+    "query": "SELECT ?s ?o WHERE { ?s <http://example.org/manages> ?o }"
+  },
+  {
+    "id": 93,
+    "template": "RND_OPTIONAL",
+    "category": "Random OPTIONAL",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/manages> ?o . OPTIONAL { ?o <http://www.w3.org/2000/01/rdf-schema#label> ?z } }"
+  },
+  {
+    "id": 94,
+    "template": "RND_LIMIT_OFFSET",
+    "category": "Random LIMIT",
+    "query": "SELECT ?s ?o WHERE { ?s <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> ?o } LIMIT 20 OFFSET 20"
+  },
+  {
+    "id": 95,
+    "template": "RND_DISTINCT",
+    "category": "Random DISTINCT",
+    "query": "SELECT DISTINCT ?s ?o WHERE { ?s <http://example.org/developedBy> ?o }"
+  },
+  {
+    "id": 96,
+    "template": "RND_FILTER_CONTAINS",
+    "category": "Random FILTER",
+    "query": "SELECT ?s ?l WHERE { ?s rdfs:label ?l . FILTER(CONTAINS(?l, \"er\")) }"
+  },
+  {
+    "id": 97,
+    "template": "RND_UNION",
+    "category": "Random UNION",
+    "query": "SELECT ?s ?o WHERE { { ?s <http://example.org/collaboratesWith> ?o } UNION { ?s <http://example.org/collaboratesWith> ?o } }"
+  },
+  {
+    "id": 98,
+    "template": "RND_LIMIT",
+    "category": "Random LIMIT",
+    "query": "SELECT ?s ?o WHERE { ?s <http://example.org/contains> ?o } LIMIT 10"
+  },
+  {
+    "id": 99,
+    "template": "RND_FILTER_isIRI",
+    "category": "Random FILTER",
+    "query": "SELECT ?s ?o WHERE { ?s <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> ?o . FILTER(isIRI(?s)) }"
+  },
+  {
+    "id": 100,
+    "template": "RND_FILTER_eq",
+    "category": "Random FILTER",
+    "query": "SELECT ?s ?o WHERE { ?s <http://example.org/manages> ?o . FILTER(?s != ?o) }"
+  },
+  {
+    "id": 101,
+    "template": "RND_FILTER_BOUND",
+    "category": "Random FILTER",
+    "query": "SELECT ?s ?o WHERE { ?s <http://example.org/worksFor> ?o . FILTER(BOUND(?o)) }"
+  },
+  {
+    "id": 102,
+    "template": "RND_JOIN",
+    "category": "Random Join",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/worksFor> ?o . ?o <http://example.org/contains> ?z }"
+  },
+  {
+    "id": 103,
+    "template": "RND_PATH_inverse",
+    "category": "Random Path",
+    "query": "SELECT ?s ?o WHERE { ?s ^<http://www.w3.org/1999/02/22-rdf-syntax-ns#type> ?o }"
+  },
+  {
+    "id": 104,
+    "template": "RND_LIMIT",
+    "category": "Random LIMIT",
+    "query": "SELECT ?s ?o WHERE { ?s <http://example.org/locatedIn> ?o } LIMIT 20"
+  },
+  {
+    "id": 105,
+    "template": "RND_FILTER_eq",
+    "category": "Random FILTER",
+    "query": "SELECT ?s ?o WHERE { ?s <http://example.org/knows> ?o . FILTER(?s != ?o) }"
+  },
+  {
+    "id": 106,
+    "template": "RND_PATH_plus",
+    "category": "Random Path",
+    "query": "SELECT ?s ?o WHERE { ?s <http://example.org/developedBy>+ ?o }"
+  },
+  {
+    "id": 107,
+    "template": "RND_OPTIONAL",
+    "category": "Random OPTIONAL",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/memberOf> ?o . OPTIONAL { ?o <http://example.org/locatedIn> ?z } }"
+  },
+  {
+    "id": 108,
+    "template": "RND_FILTER_isIRI",
+    "category": "Random FILTER",
+    "query": "SELECT ?s ?o WHERE { ?s <http://example.org/collaboratesWith> ?o . FILTER(isIRI(?s)) }"
+  },
+  {
+    "id": 109,
+    "template": "RND_ORDER_ASC",
+    "category": "Random ORDER",
+    "query": "SELECT ?s ?o WHERE { ?s <http://example.org/worksFor> ?o } ORDER BY ASC(?s)"
+  },
+  {
+    "id": 110,
+    "template": "RND_FILTER_isIRI",
+    "category": "Random FILTER",
+    "query": "SELECT ?s ?o WHERE { ?s <http://example.org/reportsTo> ?o . FILTER(isIRI(?s)) }"
+  },
+  {
+    "id": 111,
+    "template": "RND_PATH_star",
+    "category": "Random Path",
+    "query": "SELECT ?s ?o WHERE { ?s <http://example.org/contains>* ?o }"
+  },
+  {
+    "id": 112,
+    "template": "RND_FILTER_eq",
+    "category": "Random FILTER",
+    "query": "SELECT ?s ?o WHERE { ?s <http://example.org/locatedIn> ?o . FILTER(?s != ?o) }"
+  },
+  {
+    "id": 113,
+    "template": "RND_OPTIONAL",
+    "category": "Random OPTIONAL",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/developedBy> ?o . OPTIONAL { ?o <http://example.org/memberOf> ?z } }"
+  },
+  {
+    "id": 114,
+    "template": "RND_LIMIT_OFFSET",
+    "category": "Random LIMIT",
+    "query": "SELECT ?s ?o WHERE { ?s <http://www.w3.org/2000/01/rdf-schema#label> ?o } LIMIT 10 OFFSET 10"
+  },
+  {
+    "id": 115,
+    "template": "RND_LIMIT",
+    "category": "Random LIMIT",
+    "query": "SELECT ?s ?o WHERE { ?s <http://example.org/collaboratesWith> ?o } LIMIT 20"
+  },
+  {
+    "id": 116,
+    "template": "RND_FILTER_BOUND",
+    "category": "Random FILTER",
+    "query": "SELECT ?s ?o WHERE { ?s <http://example.org/developedBy> ?o . FILTER(BOUND(?o)) }"
+  },
+  {
+    "id": 117,
+    "template": "RND_FILTER_BOUND",
+    "category": "Random FILTER",
+    "query": "SELECT ?s ?o WHERE { ?s <http://www.w3.org/2000/01/rdf-schema#label> ?o . FILTER(BOUND(?o)) }"
+  },
+  {
+    "id": 118,
+    "template": "RND_LIMIT_OFFSET",
+    "category": "Random LIMIT",
+    "query": "SELECT ?s ?o WHERE { ?s <http://example.org/developedBy> ?o } LIMIT 10 OFFSET 10"
+  },
+  {
+    "id": 119,
+    "template": "RND_OPTIONAL",
+    "category": "Random OPTIONAL",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/worksFor> ?o . OPTIONAL { ?o <http://example.org/fundedBy> ?z } }"
+  },
+  {
+    "id": 120,
+    "template": "RND_FILTER_sameTerm",
+    "category": "Random FILTER",
+    "query": "SELECT ?s ?o WHERE { ?s <http://example.org/reportsTo> ?o . FILTER(sameTerm(?s, ?s)) }"
+  },
+  {
+    "id": 121,
+    "template": "RND_DISTINCT",
+    "category": "Random DISTINCT",
+    "query": "SELECT DISTINCT ?s ?o WHERE { ?s <http://example.org/knows> ?o }"
+  },
+  {
+    "id": 122,
+    "template": "RND_JOIN",
+    "category": "Random Join",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/contains> ?o . ?o <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> ?z }"
+  },
+  {
+    "id": 123,
+    "template": "RND_PATH_inverse",
+    "category": "Random Path",
+    "query": "SELECT ?s ?o WHERE { ?s ^<http://example.org/knows> ?o }"
+  },
+  {
+    "id": 124,
+    "template": "RND_JOIN",
+    "category": "Random Join",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/collaboratesWith> ?o . ?o <http://example.org/locatedIn> ?z }"
+  },
+  {
+    "id": 125,
+    "template": "RND_FILTER_REGEX",
+    "category": "Random FILTER",
+    "query": "SELECT ?s ?l WHERE { ?s rdfs:label ?l . FILTER(REGEX(?l, \"Department\")) }"
+  },
+  {
+    "id": 126,
+    "template": "RND_FILTER_STRSTARTS",
+    "category": "Random FILTER",
+    "query": "SELECT ?s ?l WHERE { ?s rdfs:label ?l . FILTER(STRSTARTS(?l, \"Event\")) }"
+  },
+  {
+    "id": 127,
+    "template": "RND_LIMIT_OFFSET",
+    "category": "Random LIMIT",
+    "query": "SELECT ?s ?o WHERE { ?s <http://example.org/collaboratesWith> ?o } LIMIT 5 OFFSET 5"
+  },
+  {
+    "id": 128,
+    "template": "RND_FILTER_REGEX",
+    "category": "Random FILTER",
+    "query": "SELECT ?s ?l WHERE { ?s rdfs:label ?l . FILTER(REGEX(?l, \"Organization\")) }"
+  },
+  {
+    "id": 129,
+    "template": "RND_JOIN",
+    "category": "Random Join",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/locatedIn> ?o . ?o <http://example.org/worksFor> ?z }"
+  },
+  {
+    "id": 130,
+    "template": "RND_FILTER_REGEX",
+    "category": "Random FILTER",
+    "query": "SELECT ?s ?l WHERE { ?s rdfs:label ?l . FILTER(REGEX(?l, \"Person\")) }"
+  },
+  {
+    "id": 131,
+    "template": "RND_OPTIONAL",
+    "category": "Random OPTIONAL",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/locatedIn> ?o . OPTIONAL { ?o <http://example.org/collaboratesWith> ?z } }"
+  },
+  {
+    "id": 132,
+    "template": "RND_PATH_star",
+    "category": "Random Path",
+    "query": "SELECT ?s ?o WHERE { ?s <http://example.org/fundedBy>* ?o }"
+  },
+  {
+    "id": 133,
+    "template": "RND_FILTER_eq",
+    "category": "Random FILTER",
+    "query": "SELECT ?s ?o WHERE { ?s <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> ?o . FILTER(?s != ?o) }"
+  },
+  {
+    "id": 134,
+    "template": "RND_LIMIT_OFFSET",
+    "category": "Random LIMIT",
+    "query": "SELECT ?s ?o WHERE { ?s <http://example.org/manages> ?o } LIMIT 20 OFFSET 20"
+  },
+  {
+    "id": 135,
+    "template": "RND_FILTER_STRSTARTS",
+    "category": "Random FILTER",
+    "query": "SELECT ?s ?l WHERE { ?s rdfs:label ?l . FILTER(STRSTARTS(?l, \"City\")) }"
+  },
+  {
+    "id": 136,
+    "template": "RND_FILTER_STRSTARTS",
+    "category": "Random FILTER",
+    "query": "SELECT ?s ?l WHERE { ?s rdfs:label ?l . FILTER(STRSTARTS(?l, \"Project\")) }"
+  },
+  {
+    "id": 137,
+    "template": "RND_FILTER_STRSTARTS",
+    "category": "Random FILTER",
+    "query": "SELECT ?s ?l WHERE { ?s rdfs:label ?l . FILTER(STRSTARTS(?l, \"Company\")) }"
+  },
+  {
+    "id": 138,
+    "template": "RND_FILTER_CONTAINS",
+    "category": "Random FILTER",
+    "query": "SELECT ?s ?l WHERE { ?s rdfs:label ?l . FILTER(CONTAINS(?l, \"De\")) }"
+  },
+  {
+    "id": 139,
+    "template": "RND_PATH_star",
+    "category": "Random Path",
+    "query": "SELECT ?s ?o WHERE { ?s <http://example.org/knows>* ?o }"
+  },
+  {
+    "id": 140,
+    "template": "RND_BGP",
+    "category": "Random BGP",
+    "query": "SELECT ?s ?o WHERE { ?s <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> ?o }"
+  },
+  {
+    "id": 141,
+    "template": "RND_FILTER_CONTAINS",
+    "category": "Random FILTER",
+    "query": "SELECT ?s ?l WHERE { ?s rdfs:label ?l . FILTER(CONTAINS(?l, \"em\")) }"
+  },
+  {
+    "id": 142,
+    "template": "RND_UNION",
+    "category": "Random UNION",
+    "query": "SELECT ?s ?o WHERE { { ?s <http://example.org/knows> ?o } UNION { ?s <http://example.org/contains> ?o } }"
+  },
+  {
+    "id": 143,
+    "template": "RND_FILTER_sameTerm",
+    "category": "Random FILTER",
+    "query": "SELECT ?s ?o WHERE { ?s <http://example.org/locatedIn> ?o . FILTER(sameTerm(?s, ?s)) }"
+  },
+  {
+    "id": 144,
+    "template": "RND_LIMIT",
+    "category": "Random LIMIT",
+    "query": "SELECT ?s ?o WHERE { ?s <http://example.org/manages> ?o } LIMIT 20"
+  },
+  {
+    "id": 145,
+    "template": "RND_UNION",
+    "category": "Random UNION",
+    "query": "SELECT ?s ?o WHERE { { ?s <http://example.org/manages> ?o } UNION { ?s <http://example.org/worksFor> ?o } }"
+  },
+  {
+    "id": 146,
+    "template": "RND_LIMIT",
+    "category": "Random LIMIT",
+    "query": "SELECT ?s ?o WHERE { ?s <http://example.org/contains> ?o } LIMIT 50"
+  },
+  {
+    "id": 147,
+    "template": "RND_JOIN",
+    "category": "Random Join",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://www.w3.org/2000/01/rdf-schema#label> ?o . ?o <http://example.org/manages> ?z }"
+  },
+  {
+    "id": 148,
+    "template": "RND_BGP",
+    "category": "Random BGP",
+    "query": "SELECT ?s ?o WHERE { ?s <http://example.org/reportsTo> ?o }"
+  },
+  {
+    "id": 149,
+    "template": "RND_PATH_inverse",
+    "category": "Random Path",
+    "query": "SELECT ?s ?o WHERE { ?s ^<http://example.org/contains> ?o }"
+  },
+  {
+    "id": 150,
+    "template": "RND_UNION",
+    "category": "Random UNION",
+    "query": "SELECT ?s ?o WHERE { { ?s <http://example.org/worksFor> ?o } UNION { ?s <http://example.org/locatedIn> ?o } }"
+  },
+  {
+    "id": 151,
+    "template": "RND_OPTIONAL",
+    "category": "Random OPTIONAL",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/reportsTo> ?o . OPTIONAL { ?o <http://example.org/knows> ?z } }"
+  },
+  {
+    "id": 152,
+    "template": "RND_OPTIONAL",
+    "category": "Random OPTIONAL",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/reportsTo> ?o . OPTIONAL { ?o <http://example.org/developedBy> ?z } }"
+  },
+  {
+    "id": 153,
+    "template": "RND_FILTER_STRSTARTS",
+    "category": "Random FILTER",
+    "query": "SELECT ?s ?l WHERE { ?s rdfs:label ?l . FILTER(STRSTARTS(?l, \"Service\")) }"
+  },
+  {
+    "id": 154,
+    "template": "RND_OPTIONAL",
+    "category": "Random OPTIONAL",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/manages> ?o . OPTIONAL { ?o <http://example.org/reportsTo> ?z } }"
+  },
+  {
+    "id": 155,
+    "template": "RND_BGP",
+    "category": "Random BGP",
+    "query": "SELECT ?s ?o WHERE { ?s <http://example.org/knows> ?o }"
+  },
+  {
+    "id": 156,
+    "template": "RND_OPTIONAL",
+    "category": "Random OPTIONAL",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/fundedBy> ?o . OPTIONAL { ?o <http://example.org/manages> ?z } }"
+  },
+  {
+    "id": 157,
+    "template": "RND_UNION",
+    "category": "Random UNION",
+    "query": "SELECT ?s ?o WHERE { { ?s <http://example.org/memberOf> ?o } UNION { ?s <http://example.org/memberOf> ?o } }"
+  },
+  {
+    "id": 158,
+    "template": "RND_ORDER_ASC",
+    "category": "Random ORDER",
+    "query": "SELECT ?s ?o WHERE { ?s <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> ?o } ORDER BY ASC(?s)"
+  },
+  {
+    "id": 159,
+    "template": "RND_LIMIT",
+    "category": "Random LIMIT",
+    "query": "SELECT ?s ?o WHERE { ?s <http://example.org/memberOf> ?o } LIMIT 10"
+  },
+  {
+    "id": 160,
+    "template": "RND_FILTER_isIRI",
+    "category": "Random FILTER",
+    "query": "SELECT ?s ?o WHERE { ?s <http://example.org/knows> ?o . FILTER(isIRI(?s)) }"
+  },
+  {
+    "id": 161,
+    "template": "RND_LIMIT",
+    "category": "Random LIMIT",
+    "query": "SELECT ?s ?o WHERE { ?s <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> ?o } LIMIT 20"
+  },
+  {
+    "id": 162,
+    "template": "RND_FILTER_isIRI",
+    "category": "Random FILTER",
+    "query": "SELECT ?s ?o WHERE { ?s <http://example.org/fundedBy> ?o . FILTER(isIRI(?s)) }"
+  },
+  {
+    "id": 163,
+    "template": "RND_OPTIONAL",
+    "category": "Random OPTIONAL",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/fundedBy> ?o . OPTIONAL { ?o <http://example.org/fundedBy> ?z } }"
+  },
+  {
+    "id": 164,
+    "template": "RND_JOIN",
+    "category": "Random Join",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/fundedBy> ?o . ?o <http://example.org/memberOf> ?z }"
+  },
+  {
+    "id": 165,
+    "template": "RND_FILTER_isIRI",
+    "category": "Random FILTER",
+    "query": "SELECT ?s ?o WHERE { ?s <http://example.org/memberOf> ?o . FILTER(isIRI(?s)) }"
+  },
+  {
+    "id": 166,
+    "template": "RND_PATH_inverse",
+    "category": "Random Path",
+    "query": "SELECT ?s ?o WHERE { ?s ^<http://example.org/fundedBy> ?o }"
+  },
+  {
+    "id": 167,
+    "template": "RND_ORDER_ASC",
+    "category": "Random ORDER",
+    "query": "SELECT ?s ?o WHERE { ?s <http://example.org/collaboratesWith> ?o } ORDER BY ASC(?s)"
+  },
+  {
+    "id": 168,
+    "template": "RND_FILTER_BOUND",
+    "category": "Random FILTER",
+    "query": "SELECT ?s ?o WHERE { ?s <http://example.org/memberOf> ?o . FILTER(BOUND(?o)) }"
+  },
+  {
+    "id": 169,
+    "template": "RND_FILTER_REGEX",
+    "category": "Random FILTER",
+    "query": "SELECT ?s ?l WHERE { ?s rdfs:label ?l . FILTER(REGEX(?l, \"Event\")) }"
+  },
+  {
+    "id": 170,
+    "template": "RND_LIMIT",
+    "category": "Random LIMIT",
+    "query": "SELECT ?s ?o WHERE { ?s <http://example.org/reportsTo> ?o } LIMIT 20"
+  },
+  {
+    "id": 171,
+    "template": "RND_DISTINCT",
+    "category": "Random DISTINCT",
+    "query": "SELECT DISTINCT ?s ?o WHERE { ?s <http://example.org/memberOf> ?o }"
+  },
+  {
+    "id": 172,
+    "template": "RND_DISTINCT",
+    "category": "Random DISTINCT",
+    "query": "SELECT DISTINCT ?s ?o WHERE { ?s <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> ?o }"
+  },
+  {
+    "id": 173,
+    "template": "RND_ORDER_DESC",
+    "category": "Random ORDER",
+    "query": "SELECT ?s ?o WHERE { ?s <http://example.org/contains> ?o } ORDER BY DESC(?s)"
+  },
+  {
+    "id": 174,
+    "template": "RND_UNION",
+    "category": "Random UNION",
+    "query": "SELECT ?s ?o WHERE { { ?s <http://example.org/locatedIn> ?o } UNION { ?s <http://example.org/reportsTo> ?o } }"
+  },
+  {
+    "id": 175,
+    "template": "RND_FILTER_isIRI",
+    "category": "Random FILTER",
+    "query": "SELECT ?s ?o WHERE { ?s <http://example.org/developedBy> ?o . FILTER(isIRI(?s)) }"
+  },
+  {
+    "id": 176,
+    "template": "RND_LIMIT_OFFSET",
+    "category": "Random LIMIT",
+    "query": "SELECT ?s ?o WHERE { ?s <http://example.org/memberOf> ?o } LIMIT 10 OFFSET 10"
+  },
+  {
+    "id": 177,
+    "template": "RND_JOIN",
+    "category": "Random Join",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/fundedBy> ?o . ?o <http://example.org/manages> ?z }"
+  },
+  {
+    "id": 178,
+    "template": "RND_PATH_plus",
+    "category": "Random Path",
+    "query": "SELECT ?s ?o WHERE { ?s <http://example.org/memberOf>+ ?o }"
+  },
+  {
+    "id": 179,
+    "template": "RND_BGP",
+    "category": "Random BGP",
+    "query": "SELECT ?s ?o WHERE { ?s <http://example.org/locatedIn> ?o }"
+  },
+  {
+    "id": 180,
+    "template": "RND_OPTIONAL",
+    "category": "Random OPTIONAL",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/manages> ?o . OPTIONAL { ?o <http://example.org/manages> ?z } }"
+  },
+  {
+    "id": 181,
+    "template": "RND_LIMIT_OFFSET",
+    "category": "Random LIMIT",
+    "query": "SELECT ?s ?o WHERE { ?s <http://www.w3.org/2000/01/rdf-schema#label> ?o } LIMIT 20 OFFSET 20"
+  },
+  {
+    "id": 182,
+    "template": "RND_LIMIT_OFFSET",
+    "category": "Random LIMIT",
+    "query": "SELECT ?s ?o WHERE { ?s <http://example.org/worksFor> ?o } LIMIT 5 OFFSET 5"
+  },
+  {
+    "id": 183,
+    "template": "RND_FILTER_sameTerm",
+    "category": "Random FILTER",
+    "query": "SELECT ?s ?o WHERE { ?s <http://example.org/manages> ?o . FILTER(sameTerm(?s, ?s)) }"
+  },
+  {
+    "id": 184,
+    "template": "RND_DISTINCT",
+    "category": "Random DISTINCT",
+    "query": "SELECT DISTINCT ?s ?o WHERE { ?s <http://example.org/collaboratesWith> ?o }"
+  },
+  {
+    "id": 185,
+    "template": "RND_FILTER_REGEX",
+    "category": "Random FILTER",
+    "query": "SELECT ?s ?l WHERE { ?s rdfs:label ?l . FILTER(REGEX(?l, \"Service\")) }"
+  },
+  {
+    "id": 186,
+    "template": "RND_LIMIT_OFFSET",
+    "category": "Random LIMIT",
+    "query": "SELECT ?s ?o WHERE { ?s <http://example.org/collaboratesWith> ?o } LIMIT 10 OFFSET 10"
+  },
+  {
+    "id": 187,
+    "template": "RND_ORDER_ASC",
+    "category": "Random ORDER",
+    "query": "SELECT ?s ?o WHERE { ?s <http://example.org/developedBy> ?o } ORDER BY ASC(?s)"
+  },
+  {
+    "id": 188,
+    "template": "RND_UNION",
+    "category": "Random UNION",
+    "query": "SELECT ?s ?o WHERE { { ?s <http://example.org/fundedBy> ?o } UNION { ?s <http://example.org/memberOf> ?o } }"
+  },
+  {
+    "id": 189,
+    "template": "RND_UNION",
+    "category": "Random UNION",
+    "query": "SELECT ?s ?o WHERE { { ?s <http://example.org/locatedIn> ?o } UNION { ?s <http://example.org/manages> ?o } }"
+  },
+  {
+    "id": 190,
+    "template": "RND_JOIN",
+    "category": "Random Join",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/collaboratesWith> ?o . ?o <http://example.org/fundedBy> ?z }"
+  },
+  {
+    "id": 191,
+    "template": "RND_OPTIONAL",
+    "category": "Random OPTIONAL",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/contains> ?o . OPTIONAL { ?o <http://example.org/worksFor> ?z } }"
+  },
+  {
+    "id": 192,
+    "template": "RND_PATH_plus",
+    "category": "Random Path",
+    "query": "SELECT ?s ?o WHERE { ?s <http://example.org/manages>+ ?o }"
+  },
+  {
+    "id": 193,
+    "template": "RND_OPTIONAL",
+    "category": "Random OPTIONAL",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> ?o . OPTIONAL { ?o <http://example.org/worksFor> ?z } }"
+  },
+  {
+    "id": 194,
+    "template": "RND_JOIN",
+    "category": "Random Join",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/locatedIn> ?o . ?o <http://example.org/reportsTo> ?z }"
+  },
+  {
+    "id": 195,
+    "template": "RND_PATH_inverse",
+    "category": "Random Path",
+    "query": "SELECT ?s ?o WHERE { ?s ^<http://www.w3.org/2000/01/rdf-schema#label> ?o }"
+  },
+  {
+    "id": 196,
+    "template": "RND_FILTER_eq",
+    "category": "Random FILTER",
+    "query": "SELECT ?s ?o WHERE { ?s <http://example.org/memberOf> ?o . FILTER(?s != ?o) }"
+  },
+  {
+    "id": 197,
+    "template": "RND_BGP",
+    "category": "Random BGP",
+    "query": "SELECT ?s ?o WHERE { ?s <http://example.org/memberOf> ?o }"
+  },
+  {
+    "id": 198,
+    "template": "RND_UNION",
+    "category": "Random UNION",
+    "query": "SELECT ?s ?o WHERE { { ?s <http://example.org/developedBy> ?o } UNION { ?s <http://example.org/memberOf> ?o } }"
+  },
+  {
+    "id": 199,
+    "template": "RND_FILTER_sameTerm",
+    "category": "Random FILTER",
+    "query": "SELECT ?s ?o WHERE { ?s <http://example.org/worksFor> ?o . FILTER(sameTerm(?s, ?s)) }"
+  },
+  {
+    "id": 200,
+    "template": "RND_FILTER_eq",
+    "category": "Random FILTER",
+    "query": "SELECT ?s ?o WHERE { ?s <http://www.w3.org/2000/01/rdf-schema#label> ?o . FILTER(?s != ?o) }"
+  },
+  {
+    "id": 201,
+    "template": "RND_LIMIT_OFFSET",
+    "category": "Random LIMIT",
+    "query": "SELECT ?s ?o WHERE { ?s <http://example.org/locatedIn> ?o } LIMIT 10 OFFSET 10"
+  },
+  {
+    "id": 202,
+    "template": "RND_ORDER_DESC",
+    "category": "Random ORDER",
+    "query": "SELECT ?s ?o WHERE { ?s <http://example.org/knows> ?o } ORDER BY DESC(?s)"
+  },
+  {
+    "id": 203,
+    "template": "RND_LIMIT_OFFSET",
+    "category": "Random LIMIT",
+    "query": "SELECT ?s ?o WHERE { ?s <http://www.w3.org/2000/01/rdf-schema#label> ?o } LIMIT 5 OFFSET 5"
+  },
+  {
+    "id": 204,
+    "template": "RND_LIMIT",
+    "category": "Random LIMIT",
+    "query": "SELECT ?s ?o WHERE { ?s <http://example.org/worksFor> ?o } LIMIT 20"
+  },
+  {
+    "id": 205,
+    "template": "RND_FILTER_BOUND",
+    "category": "Random FILTER",
+    "query": "SELECT ?s ?o WHERE { ?s <http://example.org/fundedBy> ?o . FILTER(BOUND(?o)) }"
+  },
+  {
+    "id": 206,
+    "template": "RND_OPTIONAL",
+    "category": "Random OPTIONAL",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/fundedBy> ?o . OPTIONAL { ?o <http://example.org/locatedIn> ?z } }"
+  },
+  {
+    "id": 207,
+    "template": "RND_BGP",
+    "category": "Random BGP",
+    "query": "SELECT ?s ?o WHERE { ?s <http://www.w3.org/2000/01/rdf-schema#label> ?o }"
+  },
+  {
+    "id": 208,
+    "template": "RND_JOIN",
+    "category": "Random Join",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/collaboratesWith> ?o . ?o <http://example.org/reportsTo> ?z }"
+  },
+  {
+    "id": 209,
+    "template": "RND_OPTIONAL",
+    "category": "Random OPTIONAL",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://www.w3.org/2000/01/rdf-schema#label> ?o . OPTIONAL { ?o <http://example.org/developedBy> ?z } }"
+  },
+  {
+    "id": 210,
+    "template": "RND_OPTIONAL",
+    "category": "Random OPTIONAL",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/memberOf> ?o . OPTIONAL { ?o <http://example.org/memberOf> ?z } }"
+  },
+  {
+    "id": 211,
+    "template": "RND_ORDER_ASC",
+    "category": "Random ORDER",
+    "query": "SELECT ?s ?o WHERE { ?s <http://example.org/locatedIn> ?o } ORDER BY ASC(?s)"
+  },
+  {
+    "id": 212,
+    "template": "RND_JOIN",
+    "category": "Random Join",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/knows> ?o . ?o <http://example.org/memberOf> ?z }"
+  },
+  {
+    "id": 213,
+    "template": "RND_JOIN",
+    "category": "Random Join",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/developedBy> ?o . ?o <http://example.org/developedBy> ?z }"
+  },
+  {
+    "id": 214,
+    "template": "RND_FILTER_BOUND",
+    "category": "Random FILTER",
+    "query": "SELECT ?s ?o WHERE { ?s <http://example.org/reportsTo> ?o . FILTER(BOUND(?o)) }"
+  },
+  {
+    "id": 215,
+    "template": "RND_FILTER_eq",
+    "category": "Random FILTER",
+    "query": "SELECT ?s ?o WHERE { ?s <http://example.org/reportsTo> ?o . FILTER(?s != ?o) }"
+  },
+  {
+    "id": 216,
+    "template": "RND_OPTIONAL",
+    "category": "Random OPTIONAL",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/worksFor> ?o . OPTIONAL { ?o <http://example.org/worksFor> ?z } }"
+  },
+  {
+    "id": 217,
+    "template": "RND_JOIN",
+    "category": "Random Join",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/worksFor> ?o . ?o <http://www.w3.org/2000/01/rdf-schema#label> ?z }"
+  },
+  {
+    "id": 218,
+    "template": "RND_LIMIT_OFFSET",
+    "category": "Random LIMIT",
+    "query": "SELECT ?s ?o WHERE { ?s <http://example.org/contains> ?o } LIMIT 5 OFFSET 5"
+  },
+  {
+    "id": 219,
+    "template": "RND_ORDER_DESC",
+    "category": "Random ORDER",
+    "query": "SELECT ?s ?o WHERE { ?s <http://www.w3.org/2000/01/rdf-schema#label> ?o } ORDER BY DESC(?s)"
+  },
+  {
+    "id": 220,
+    "template": "RND_OPTIONAL",
+    "category": "Random OPTIONAL",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/collaboratesWith> ?o . OPTIONAL { ?o <http://example.org/fundedBy> ?z } }"
+  },
+  {
+    "id": 221,
+    "template": "RND_OPTIONAL",
+    "category": "Random OPTIONAL",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://www.w3.org/2000/01/rdf-schema#label> ?o . OPTIONAL { ?o <http://example.org/knows> ?z } }"
+  },
+  {
+    "id": 222,
+    "template": "RND_ORDER_ASC",
+    "category": "Random ORDER",
+    "query": "SELECT ?s ?o WHERE { ?s <http://example.org/contains> ?o } ORDER BY ASC(?s)"
+  },
+  {
+    "id": 223,
+    "template": "RND_FILTER_sameTerm",
+    "category": "Random FILTER",
+    "query": "SELECT ?s ?o WHERE { ?s <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> ?o . FILTER(sameTerm(?s, ?s)) }"
+  },
+  {
+    "id": 224,
+    "template": "RND_FILTER_REGEX",
+    "category": "Random FILTER",
+    "query": "SELECT ?s ?l WHERE { ?s rdfs:label ?l . FILTER(REGEX(?l, \"Company\")) }"
+  },
+  {
+    "id": 225,
+    "template": "RND_JOIN",
+    "category": "Random Join",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/developedBy> ?o . ?o <http://example.org/knows> ?z }"
+  },
+  {
+    "id": 226,
+    "template": "RND_OPTIONAL",
+    "category": "Random OPTIONAL",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/memberOf> ?o . OPTIONAL { ?o <http://example.org/contains> ?z } }"
+  },
+  {
+    "id": 227,
+    "template": "RND_PATH_plus",
+    "category": "Random Path",
+    "query": "SELECT ?s ?o WHERE { ?s <http://example.org/knows>+ ?o }"
+  },
+  {
+    "id": 228,
+    "template": "RND_LIMIT",
+    "category": "Random LIMIT",
+    "query": "SELECT ?s ?o WHERE { ?s <http://example.org/reportsTo> ?o } LIMIT 50"
+  },
+  {
+    "id": 229,
+    "template": "RND_UNION",
+    "category": "Random UNION",
+    "query": "SELECT ?s ?o WHERE { { ?s <http://example.org/worksFor> ?o } UNION { ?s <http://example.org/knows> ?o } }"
+  },
+  {
+    "id": 230,
+    "template": "RND_JOIN",
+    "category": "Random Join",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/developedBy> ?o . ?o <http://example.org/memberOf> ?z }"
+  },
+  {
+    "id": 231,
+    "template": "RND_LIMIT",
+    "category": "Random LIMIT",
+    "query": "SELECT ?s ?o WHERE { ?s <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> ?o } LIMIT 50"
+  },
+  {
+    "id": 232,
+    "template": "RND_DISTINCT",
+    "category": "Random DISTINCT",
+    "query": "SELECT DISTINCT ?s ?o WHERE { ?s <http://example.org/locatedIn> ?o }"
+  },
+  {
+    "id": 233,
+    "template": "RND_UNION",
+    "category": "Random UNION",
+    "query": "SELECT ?s ?o WHERE { { ?s <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> ?o } UNION { ?s <http://example.org/contains> ?o } }"
+  },
+  {
+    "id": 234,
+    "template": "RND_PATH_plus",
+    "category": "Random Path",
+    "query": "SELECT ?s ?o WHERE { ?s <http://example.org/reportsTo>+ ?o }"
+  },
+  {
+    "id": 235,
+    "template": "RND_JOIN",
+    "category": "Random Join",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/memberOf> ?o . ?o <http://example.org/contains> ?z }"
+  },
+  {
+    "id": 236,
+    "template": "RND_UNION",
+    "category": "Random UNION",
+    "query": "SELECT ?s ?o WHERE { { ?s <http://example.org/knows> ?o } UNION { ?s <http://example.org/locatedIn> ?o } }"
+  },
+  {
+    "id": 237,
+    "template": "RND_LIMIT",
+    "category": "Random LIMIT",
+    "query": "SELECT ?s ?o WHERE { ?s <http://example.org/collaboratesWith> ?o } LIMIT 50"
+  },
+  {
+    "id": 238,
+    "template": "RND_DISTINCT",
+    "category": "Random DISTINCT",
+    "query": "SELECT DISTINCT ?s ?o WHERE { ?s <http://www.w3.org/2000/01/rdf-schema#label> ?o }"
+  },
+  {
+    "id": 239,
+    "template": "RND_OPTIONAL",
+    "category": "Random OPTIONAL",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/reportsTo> ?o . OPTIONAL { ?o <http://www.w3.org/2000/01/rdf-schema#label> ?z } }"
+  },
+  {
+    "id": 240,
+    "template": "RND_LIMIT",
+    "category": "Random LIMIT",
+    "query": "SELECT ?s ?o WHERE { ?s <http://www.w3.org/2000/01/rdf-schema#label> ?o } LIMIT 10"
+  },
+  {
+    "id": 241,
+    "template": "RND_LIMIT",
+    "category": "Random LIMIT",
+    "query": "SELECT ?s ?o WHERE { ?s <http://example.org/knows> ?o } LIMIT 5"
+  },
+  {
+    "id": 242,
+    "template": "RND_PATH_plus",
+    "category": "Random Path",
+    "query": "SELECT ?s ?o WHERE { ?s <http://example.org/fundedBy>+ ?o }"
+  },
+  {
+    "id": 243,
+    "template": "RND_UNION",
+    "category": "Random UNION",
+    "query": "SELECT ?s ?o WHERE { { ?s <http://www.w3.org/2000/01/rdf-schema#label> ?o } UNION { ?s <http://example.org/memberOf> ?o } }"
+  },
+  {
+    "id": 244,
+    "template": "RND_JOIN",
+    "category": "Random Join",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/developedBy> ?o . ?o <http://example.org/reportsTo> ?z }"
+  },
+  {
+    "id": 245,
+    "template": "RND_UNION",
+    "category": "Random UNION",
+    "query": "SELECT ?s ?o WHERE { { ?s <http://example.org/contains> ?o } UNION { ?s <http://example.org/memberOf> ?o } }"
+  },
+  {
+    "id": 246,
+    "template": "RND_UNION",
+    "category": "Random UNION",
+    "query": "SELECT ?s ?o WHERE { { ?s <http://example.org/worksFor> ?o } UNION { ?s <http://www.w3.org/2000/01/rdf-schema#label> ?o } }"
+  },
+  {
+    "id": 247,
+    "template": "RND_LIMIT_OFFSET",
+    "category": "Random LIMIT",
+    "query": "SELECT ?s ?o WHERE { ?s <http://example.org/manages> ?o } LIMIT 10 OFFSET 10"
+  },
+  {
+    "id": 248,
+    "template": "RND_OPTIONAL",
+    "category": "Random OPTIONAL",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/fundedBy> ?o . OPTIONAL { ?o <http://www.w3.org/2000/01/rdf-schema#label> ?z } }"
+  },
+  {
+    "id": 249,
+    "template": "RND_BGP",
+    "category": "Random BGP",
+    "query": "SELECT ?s ?o WHERE { ?s <http://example.org/collaboratesWith> ?o }"
+  },
+  {
+    "id": 250,
+    "template": "RND_UNION",
+    "category": "Random UNION",
+    "query": "SELECT ?s ?o WHERE { { ?s <http://example.org/collaboratesWith> ?o } UNION { ?s <http://example.org/knows> ?o } }"
+  },
+  {
+    "id": 251,
+    "template": "RND_ORDER_DESC",
+    "category": "Random ORDER",
+    "query": "SELECT ?s ?o WHERE { ?s <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> ?o } ORDER BY DESC(?s)"
+  },
+  {
+    "id": 252,
+    "template": "RND_ORDER_ASC",
+    "category": "Random ORDER",
+    "query": "SELECT ?s ?o WHERE { ?s <http://example.org/knows> ?o } ORDER BY ASC(?s)"
+  },
+  {
+    "id": 253,
+    "template": "RND_OPTIONAL",
+    "category": "Random OPTIONAL",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> ?o . OPTIONAL { ?o <http://example.org/manages> ?z } }"
+  },
+  {
+    "id": 254,
+    "template": "RND_JOIN",
+    "category": "Random Join",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/worksFor> ?o . ?o <http://example.org/locatedIn> ?z }"
+  },
+  {
+    "id": 255,
+    "template": "RND_OPTIONAL",
+    "category": "Random OPTIONAL",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/locatedIn> ?o . OPTIONAL { ?o <http://www.w3.org/2000/01/rdf-schema#label> ?z } }"
+  },
+  {
+    "id": 256,
+    "template": "RND_LIMIT_OFFSET",
+    "category": "Random LIMIT",
+    "query": "SELECT ?s ?o WHERE { ?s <http://example.org/locatedIn> ?o } LIMIT 20 OFFSET 20"
+  },
+  {
+    "id": 257,
+    "template": "RND_LIMIT",
+    "category": "Random LIMIT",
+    "query": "SELECT ?s ?o WHERE { ?s <http://example.org/knows> ?o } LIMIT 10"
+  },
+  {
+    "id": 258,
+    "template": "RND_OPTIONAL",
+    "category": "Random OPTIONAL",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://www.w3.org/2000/01/rdf-schema#label> ?o . OPTIONAL { ?o <http://example.org/locatedIn> ?z } }"
+  },
+  {
+    "id": 259,
+    "template": "RND_PATH_star",
+    "category": "Random Path",
+    "query": "SELECT ?s ?o WHERE { ?s <http://www.w3.org/1999/02/22-rdf-syntax-ns#type>* ?o }"
+  },
+  {
+    "id": 260,
+    "template": "RND_FILTER_REGEX",
+    "category": "Random FILTER",
+    "query": "SELECT ?s ?l WHERE { ?s rdfs:label ?l . FILTER(REGEX(?l, \"Technology\")) }"
+  },
+  {
+    "id": 261,
+    "template": "RND_ORDER_DESC",
+    "category": "Random ORDER",
+    "query": "SELECT ?s ?o WHERE { ?s <http://example.org/locatedIn> ?o } ORDER BY DESC(?s)"
+  },
+  {
+    "id": 262,
+    "template": "RND_JOIN",
+    "category": "Random Join",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://www.w3.org/2000/01/rdf-schema#label> ?o . ?o <http://example.org/locatedIn> ?z }"
+  },
+  {
+    "id": 263,
+    "template": "RND_ORDER_DESC",
+    "category": "Random ORDER",
+    "query": "SELECT ?s ?o WHERE { ?s <http://example.org/fundedBy> ?o } ORDER BY DESC(?s)"
+  },
+  {
+    "id": 264,
+    "template": "RND_PATH_star",
+    "category": "Random Path",
+    "query": "SELECT ?s ?o WHERE { ?s <http://example.org/reportsTo>* ?o }"
+  },
+  {
+    "id": 265,
+    "template": "RND_PATH_star",
+    "category": "Random Path",
+    "query": "SELECT ?s ?o WHERE { ?s <http://example.org/collaboratesWith>* ?o }"
+  },
+  {
+    "id": 266,
+    "template": "RND_UNION",
+    "category": "Random UNION",
+    "query": "SELECT ?s ?o WHERE { { ?s <http://example.org/fundedBy> ?o } UNION { ?s <http://example.org/developedBy> ?o } }"
+  },
+  {
+    "id": 267,
+    "template": "RND_UNION",
+    "category": "Random UNION",
+    "query": "SELECT ?s ?o WHERE { { ?s <http://example.org/developedBy> ?o } UNION { ?s <http://example.org/worksFor> ?o } }"
+  },
+  {
+    "id": 268,
+    "template": "RND_FILTER_REGEX",
+    "category": "Random FILTER",
+    "query": "SELECT ?s ?l WHERE { ?s rdfs:label ?l . FILTER(REGEX(?l, \"City\")) }"
+  },
+  {
+    "id": 269,
+    "template": "RND_LIMIT_OFFSET",
+    "category": "Random LIMIT",
+    "query": "SELECT ?s ?o WHERE { ?s <http://example.org/knows> ?o } LIMIT 5 OFFSET 5"
+  },
+  {
+    "id": 270,
+    "template": "RND_UNION",
+    "category": "Random UNION",
+    "query": "SELECT ?s ?o WHERE { { ?s <http://example.org/collaboratesWith> ?o } UNION { ?s <http://example.org/developedBy> ?o } }"
+  },
+  {
+    "id": 271,
+    "template": "RND_LIMIT",
+    "category": "Random LIMIT",
+    "query": "SELECT ?s ?o WHERE { ?s <http://example.org/contains> ?o } LIMIT 5"
+  },
+  {
+    "id": 272,
+    "template": "RND_LIMIT",
+    "category": "Random LIMIT",
+    "query": "SELECT ?s ?o WHERE { ?s <http://example.org/fundedBy> ?o } LIMIT 5"
+  },
+  {
+    "id": 273,
+    "template": "RND_LIMIT",
+    "category": "Random LIMIT",
+    "query": "SELECT ?s ?o WHERE { ?s <http://example.org/knows> ?o } LIMIT 50"
+  },
+  {
+    "id": 274,
+    "template": "RND_UNION",
+    "category": "Random UNION",
+    "query": "SELECT ?s ?o WHERE { { ?s <http://example.org/worksFor> ?o } UNION { ?s <http://example.org/developedBy> ?o } }"
+  },
+  {
+    "id": 275,
+    "template": "RND_UNION",
+    "category": "Random UNION",
+    "query": "SELECT ?s ?o WHERE { { ?s <http://example.org/memberOf> ?o } UNION { ?s <http://example.org/manages> ?o } }"
+  },
+  {
+    "id": 276,
+    "template": "RND_JOIN",
+    "category": "Random Join",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/knows> ?o . ?o <http://example.org/worksFor> ?z }"
+  },
+  {
+    "id": 277,
+    "template": "RND_OPTIONAL",
+    "category": "Random OPTIONAL",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/locatedIn> ?o . OPTIONAL { ?o <http://example.org/contains> ?z } }"
+  },
+  {
+    "id": 278,
+    "template": "RND_LIMIT",
+    "category": "Random LIMIT",
+    "query": "SELECT ?s ?o WHERE { ?s <http://example.org/fundedBy> ?o } LIMIT 10"
+  },
+  {
+    "id": 279,
+    "template": "RND_LIMIT_OFFSET",
+    "category": "Random LIMIT",
+    "query": "SELECT ?s ?o WHERE { ?s <http://example.org/locatedIn> ?o } LIMIT 5 OFFSET 5"
+  },
+  {
+    "id": 280,
+    "template": "RND_LIMIT_OFFSET",
+    "category": "Random LIMIT",
+    "query": "SELECT ?s ?o WHERE { ?s <http://example.org/worksFor> ?o } LIMIT 20 OFFSET 20"
+  },
+  {
+    "id": 281,
+    "template": "RND_OPTIONAL",
+    "category": "Random OPTIONAL",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/locatedIn> ?o . OPTIONAL { ?o <http://example.org/locatedIn> ?z } }"
+  },
+  {
+    "id": 282,
+    "template": "RND_LIMIT",
+    "category": "Random LIMIT",
+    "query": "SELECT ?s ?o WHERE { ?s <http://example.org/fundedBy> ?o } LIMIT 50"
+  },
+  {
+    "id": 283,
+    "template": "RND_UNION",
+    "category": "Random UNION",
+    "query": "SELECT ?s ?o WHERE { { ?s <http://example.org/developedBy> ?o } UNION { ?s <http://example.org/locatedIn> ?o } }"
+  },
+  {
+    "id": 284,
+    "template": "RND_JOIN",
+    "category": "Random Join",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> ?o . ?o <http://example.org/contains> ?z }"
+  },
+  {
+    "id": 285,
+    "template": "RND_OPTIONAL",
+    "category": "Random OPTIONAL",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> ?o . OPTIONAL { ?o <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> ?z } }"
+  },
+  {
+    "id": 286,
+    "template": "RND_OPTIONAL",
+    "category": "Random OPTIONAL",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/fundedBy> ?o . OPTIONAL { ?o <http://example.org/developedBy> ?z } }"
+  },
+  {
+    "id": 287,
+    "template": "RND_FILTER_sameTerm",
+    "category": "Random FILTER",
+    "query": "SELECT ?s ?o WHERE { ?s <http://example.org/knows> ?o . FILTER(sameTerm(?s, ?s)) }"
+  },
+  {
+    "id": 288,
+    "template": "RND_UNION",
+    "category": "Random UNION",
+    "query": "SELECT ?s ?o WHERE { { ?s <http://example.org/contains> ?o } UNION { ?s <http://example.org/collaboratesWith> ?o } }"
+  },
+  {
+    "id": 289,
+    "template": "RND_JOIN",
+    "category": "Random Join",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/manages> ?o . ?o <http://example.org/collaboratesWith> ?z }"
+  },
+  {
+    "id": 290,
+    "template": "RND_LIMIT",
+    "category": "Random LIMIT",
+    "query": "SELECT ?s ?o WHERE { ?s <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> ?o } LIMIT 5"
+  },
+  {
+    "id": 291,
+    "template": "RND_LIMIT",
+    "category": "Random LIMIT",
+    "query": "SELECT ?s ?o WHERE { ?s <http://example.org/reportsTo> ?o } LIMIT 10"
+  },
+  {
+    "id": 292,
+    "template": "RND_UNION",
+    "category": "Random UNION",
+    "query": "SELECT ?s ?o WHERE { { ?s <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> ?o } UNION { ?s <http://example.org/locatedIn> ?o } }"
+  },
+  {
+    "id": 293,
+    "template": "RND_ORDER_ASC",
+    "category": "Random ORDER",
+    "query": "SELECT ?s ?o WHERE { ?s <http://example.org/memberOf> ?o } ORDER BY ASC(?s)"
+  },
+  {
+    "id": 294,
+    "template": "RND_JOIN",
+    "category": "Random Join",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/locatedIn> ?o . ?o <http://example.org/knows> ?z }"
+  },
+  {
+    "id": 295,
+    "template": "RND_LIMIT",
+    "category": "Random LIMIT",
+    "query": "SELECT ?s ?o WHERE { ?s <http://example.org/manages> ?o } LIMIT 50"
+  },
+  {
+    "id": 296,
+    "template": "RND_UNION",
+    "category": "Random UNION",
+    "query": "SELECT ?s ?o WHERE { { ?s <http://example.org/worksFor> ?o } UNION { ?s <http://example.org/memberOf> ?o } }"
+  },
+  {
+    "id": 297,
+    "template": "RND_FILTER_STRSTARTS",
+    "category": "Random FILTER",
+    "query": "SELECT ?s ?l WHERE { ?s rdfs:label ?l . FILTER(STRSTARTS(?l, \"Person\")) }"
+  },
+  {
+    "id": 298,
+    "template": "RND_UNION",
+    "category": "Random UNION",
+    "query": "SELECT ?s ?o WHERE { { ?s <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> ?o } UNION { ?s <http://example.org/worksFor> ?o } }"
+  },
+  {
+    "id": 299,
+    "template": "RND_JOIN",
+    "category": "Random Join",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> ?o . ?o <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> ?z }"
+  },
+  {
+    "id": 300,
+    "template": "RND_UNION",
+    "category": "Random UNION",
+    "query": "SELECT ?s ?o WHERE { { ?s <http://example.org/contains> ?o } UNION { ?s <http://example.org/locatedIn> ?o } }"
+  },
+  {
+    "id": 301,
+    "template": "RND_FILTER_sameTerm",
+    "category": "Random FILTER",
+    "query": "SELECT ?s ?o WHERE { ?s <http://www.w3.org/2000/01/rdf-schema#label> ?o . FILTER(sameTerm(?s, ?s)) }"
+  },
+  {
+    "id": 302,
+    "template": "RND_FILTER_REGEX",
+    "category": "Random FILTER",
+    "query": "SELECT ?s ?l WHERE { ?s rdfs:label ?l . FILTER(REGEX(?l, \"Project\")) }"
+  },
+  {
+    "id": 303,
+    "template": "RND_OPTIONAL",
+    "category": "Random OPTIONAL",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> ?o . OPTIONAL { ?o <http://www.w3.org/2000/01/rdf-schema#label> ?z } }"
+  },
+  {
+    "id": 304,
+    "template": "RND_UNION",
+    "category": "Random UNION",
+    "query": "SELECT ?s ?o WHERE { { ?s <http://example.org/developedBy> ?o } UNION { ?s <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> ?o } }"
+  },
+  {
+    "id": 305,
+    "template": "RND_LIMIT",
+    "category": "Random LIMIT",
+    "query": "SELECT ?s ?o WHERE { ?s <http://example.org/locatedIn> ?o } LIMIT 5"
+  },
+  {
+    "id": 306,
+    "template": "RND_FILTER_STRSTARTS",
+    "category": "Random FILTER",
+    "query": "SELECT ?s ?l WHERE { ?s rdfs:label ?l . FILTER(STRSTARTS(?l, \"Product\")) }"
+  },
+  {
+    "id": 307,
+    "template": "RND_UNION",
+    "category": "Random UNION",
+    "query": "SELECT ?s ?o WHERE { { ?s <http://example.org/memberOf> ?o } UNION { ?s <http://example.org/fundedBy> ?o } }"
+  },
+  {
+    "id": 308,
+    "template": "RND_OPTIONAL",
+    "category": "Random OPTIONAL",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/contains> ?o . OPTIONAL { ?o <http://example.org/reportsTo> ?z } }"
+  },
+  {
+    "id": 309,
+    "template": "RND_JOIN",
+    "category": "Random Join",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> ?o . ?o <http://example.org/locatedIn> ?z }"
+  },
+  {
+    "id": 310,
+    "template": "RND_JOIN",
+    "category": "Random Join",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/manages> ?o . ?o <http://example.org/locatedIn> ?z }"
+  },
+  {
+    "id": 311,
+    "template": "RND_OPTIONAL",
+    "category": "Random OPTIONAL",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://www.w3.org/2000/01/rdf-schema#label> ?o . OPTIONAL { ?o <http://example.org/memberOf> ?z } }"
+  },
+  {
+    "id": 312,
+    "template": "RND_ORDER_DESC",
+    "category": "Random ORDER",
+    "query": "SELECT ?s ?o WHERE { ?s <http://example.org/memberOf> ?o } ORDER BY DESC(?s)"
+  },
+  {
+    "id": 313,
+    "template": "RND_LIMIT",
+    "category": "Random LIMIT",
+    "query": "SELECT ?s ?o WHERE { ?s <http://example.org/manages> ?o } LIMIT 10"
+  },
+  {
+    "id": 314,
+    "template": "RND_JOIN",
+    "category": "Random Join",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> ?o . ?o <http://example.org/memberOf> ?z }"
+  },
+  {
+    "id": 315,
+    "template": "RND_LIMIT",
+    "category": "Random LIMIT",
+    "query": "SELECT ?s ?o WHERE { ?s <http://example.org/contains> ?o } LIMIT 20"
+  },
+  {
+    "id": 316,
+    "template": "RND_LIMIT",
+    "category": "Random LIMIT",
+    "query": "SELECT ?s ?o WHERE { ?s <http://example.org/developedBy> ?o } LIMIT 50"
+  },
+  {
+    "id": 317,
+    "template": "RND_UNION",
+    "category": "Random UNION",
+    "query": "SELECT ?s ?o WHERE { { ?s <http://example.org/developedBy> ?o } UNION { ?s <http://example.org/developedBy> ?o } }"
+  },
+  {
+    "id": 318,
+    "template": "RND_LIMIT",
+    "category": "Random LIMIT",
+    "query": "SELECT ?s ?o WHERE { ?s <http://example.org/manages> ?o } LIMIT 5"
+  },
+  {
+    "id": 319,
+    "template": "RND_OPTIONAL",
+    "category": "Random OPTIONAL",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/fundedBy> ?o . OPTIONAL { ?o <http://example.org/knows> ?z } }"
+  },
+  {
+    "id": 320,
+    "template": "RND_DISTINCT",
+    "category": "Random DISTINCT",
+    "query": "SELECT DISTINCT ?s ?o WHERE { ?s <http://example.org/worksFor> ?o }"
+  },
+  {
+    "id": 321,
+    "template": "RND_LIMIT",
+    "category": "Random LIMIT",
+    "query": "SELECT ?s ?o WHERE { ?s <http://example.org/worksFor> ?o } LIMIT 10"
+  },
+  {
+    "id": 322,
+    "template": "RND_LIMIT",
+    "category": "Random LIMIT",
+    "query": "SELECT ?s ?o WHERE { ?s <http://example.org/reportsTo> ?o } LIMIT 5"
+  },
+  {
+    "id": 323,
+    "template": "RND_JOIN",
+    "category": "Random Join",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> ?o . ?o <http://example.org/manages> ?z }"
+  },
+  {
+    "id": 324,
+    "template": "RND_UNION",
+    "category": "Random UNION",
+    "query": "SELECT ?s ?o WHERE { { ?s <http://example.org/developedBy> ?o } UNION { ?s <http://example.org/collaboratesWith> ?o } }"
+  },
+  {
+    "id": 325,
+    "template": "RND_UNION",
+    "category": "Random UNION",
+    "query": "SELECT ?s ?o WHERE { { ?s <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> ?o } UNION { ?s <http://example.org/developedBy> ?o } }"
+  },
+  {
+    "id": 326,
+    "template": "RND_UNION",
+    "category": "Random UNION",
+    "query": "SELECT ?s ?o WHERE { { ?s <http://example.org/knows> ?o } UNION { ?s <http://example.org/reportsTo> ?o } }"
+  },
+  {
+    "id": 327,
+    "template": "RND_PATH_star",
+    "category": "Random Path",
+    "query": "SELECT ?s ?o WHERE { ?s <http://example.org/manages>* ?o }"
+  },
+  {
+    "id": 328,
+    "template": "RND_OPTIONAL",
+    "category": "Random OPTIONAL",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/knows> ?o . OPTIONAL { ?o <http://example.org/memberOf> ?z } }"
+  },
+  {
+    "id": 329,
+    "template": "RND_JOIN",
+    "category": "Random Join",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/worksFor> ?o . ?o <http://example.org/developedBy> ?z }"
+  },
+  {
+    "id": 330,
+    "template": "RND_LIMIT",
+    "category": "Random LIMIT",
+    "query": "SELECT ?s ?o WHERE { ?s <http://example.org/locatedIn> ?o } LIMIT 50"
+  },
+  {
+    "id": 331,
+    "template": "RND_UNION",
+    "category": "Random UNION",
+    "query": "SELECT ?s ?o WHERE { { ?s <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> ?o } UNION { ?s <http://example.org/knows> ?o } }"
+  },
+  {
+    "id": 332,
+    "template": "RND_LIMIT_OFFSET",
+    "category": "Random LIMIT",
+    "query": "SELECT ?s ?o WHERE { ?s <http://example.org/knows> ?o } LIMIT 10 OFFSET 10"
+  },
+  {
+    "id": 333,
+    "template": "RND_LIMIT_OFFSET",
+    "category": "Random LIMIT",
+    "query": "SELECT ?s ?o WHERE { ?s <http://example.org/worksFor> ?o } LIMIT 10 OFFSET 10"
+  },
+  {
+    "id": 334,
+    "template": "RND_PATH_inverse",
+    "category": "Random Path",
+    "query": "SELECT ?s ?o WHERE { ?s ^<http://example.org/reportsTo> ?o }"
+  },
+  {
+    "id": 335,
+    "template": "RND_JOIN",
+    "category": "Random Join",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/contains> ?o . ?o <http://example.org/reportsTo> ?z }"
+  },
+  {
+    "id": 336,
+    "template": "RND_UNION",
+    "category": "Random UNION",
+    "query": "SELECT ?s ?o WHERE { { ?s <http://www.w3.org/2000/01/rdf-schema#label> ?o } UNION { ?s <http://example.org/fundedBy> ?o } }"
+  },
+  {
+    "id": 337,
+    "template": "RND_OPTIONAL",
+    "category": "Random OPTIONAL",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/contains> ?o . OPTIONAL { ?o <http://example.org/knows> ?z } }"
+  },
+  {
+    "id": 338,
+    "template": "RND_OPTIONAL",
+    "category": "Random OPTIONAL",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/worksFor> ?o . OPTIONAL { ?o <http://example.org/reportsTo> ?z } }"
+  },
+  {
+    "id": 339,
+    "template": "RND_UNION",
+    "category": "Random UNION",
+    "query": "SELECT ?s ?o WHERE { { ?s <http://example.org/worksFor> ?o } UNION { ?s <http://example.org/collaboratesWith> ?o } }"
+  },
+  {
+    "id": 340,
+    "template": "RND_JOIN",
+    "category": "Random Join",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> ?o . ?o <http://example.org/worksFor> ?z }"
+  },
+  {
+    "id": 341,
+    "template": "RND_OPTIONAL",
+    "category": "Random OPTIONAL",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/memberOf> ?o . OPTIONAL { ?o <http://example.org/fundedBy> ?z } }"
+  },
+  {
+    "id": 342,
+    "template": "RND_UNION",
+    "category": "Random UNION",
+    "query": "SELECT ?s ?o WHERE { { ?s <http://www.w3.org/2000/01/rdf-schema#label> ?o } UNION { ?s <http://example.org/locatedIn> ?o } }"
+  },
+  {
+    "id": 343,
+    "template": "RND_LIMIT_OFFSET",
+    "category": "Random LIMIT",
+    "query": "SELECT ?s ?o WHERE { ?s <http://example.org/contains> ?o } LIMIT 10 OFFSET 10"
+  },
+  {
+    "id": 344,
+    "template": "RND_FILTER_BOUND",
+    "category": "Random FILTER",
+    "query": "SELECT ?s ?o WHERE { ?s <http://example.org/knows> ?o . FILTER(BOUND(?o)) }"
+  },
+  {
+    "id": 345,
+    "template": "RND_ORDER_ASC",
+    "category": "Random ORDER",
+    "query": "SELECT ?s ?o WHERE { ?s <http://example.org/fundedBy> ?o } ORDER BY ASC(?s)"
+  },
+  {
+    "id": 346,
+    "template": "RND_OPTIONAL",
+    "category": "Random OPTIONAL",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/manages> ?o . OPTIONAL { ?o <http://example.org/worksFor> ?z } }"
+  },
+  {
+    "id": 347,
+    "template": "RND_LIMIT_OFFSET",
+    "category": "Random LIMIT",
+    "query": "SELECT ?s ?o WHERE { ?s <http://example.org/fundedBy> ?o } LIMIT 10 OFFSET 10"
+  },
+  {
+    "id": 348,
+    "template": "RND_JOIN",
+    "category": "Random Join",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/collaboratesWith> ?o . ?o <http://example.org/developedBy> ?z }"
+  },
+  {
+    "id": 349,
+    "template": "RND_UNION",
+    "category": "Random UNION",
+    "query": "SELECT ?s ?o WHERE { { ?s <http://example.org/memberOf> ?o } UNION { ?s <http://example.org/reportsTo> ?o } }"
+  },
+  {
+    "id": 350,
+    "template": "RND_OPTIONAL",
+    "category": "Random OPTIONAL",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/worksFor> ?o . OPTIONAL { ?o <http://example.org/locatedIn> ?z } }"
+  },
+  {
+    "id": 351,
+    "template": "RND_OPTIONAL",
+    "category": "Random OPTIONAL",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/memberOf> ?o . OPTIONAL { ?o <http://example.org/collaboratesWith> ?z } }"
+  },
+  {
+    "id": 352,
+    "template": "RND_OPTIONAL",
+    "category": "Random OPTIONAL",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://www.w3.org/2000/01/rdf-schema#label> ?o . OPTIONAL { ?o <http://www.w3.org/2000/01/rdf-schema#label> ?z } }"
+  },
+  {
+    "id": 353,
+    "template": "RND_JOIN",
+    "category": "Random Join",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/worksFor> ?o . ?o <http://example.org/memberOf> ?z }"
+  },
+  {
+    "id": 354,
+    "template": "RND_UNION",
+    "category": "Random UNION",
+    "query": "SELECT ?s ?o WHERE { { ?s <http://example.org/manages> ?o } UNION { ?s <http://example.org/developedBy> ?o } }"
+  },
+  {
+    "id": 355,
+    "template": "RND_JOIN",
+    "category": "Random Join",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://www.w3.org/2000/01/rdf-schema#label> ?o . ?o <http://example.org/developedBy> ?z }"
+  },
+  {
+    "id": 356,
+    "template": "RND_OPTIONAL",
+    "category": "Random OPTIONAL",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/knows> ?o . OPTIONAL { ?o <http://www.w3.org/2000/01/rdf-schema#label> ?z } }"
+  },
+  {
+    "id": 357,
+    "template": "RND_UNION",
+    "category": "Random UNION",
+    "query": "SELECT ?s ?o WHERE { { ?s <http://example.org/memberOf> ?o } UNION { ?s <http://example.org/locatedIn> ?o } }"
+  },
+  {
+    "id": 358,
+    "template": "RND_OPTIONAL",
+    "category": "Random OPTIONAL",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/collaboratesWith> ?o . OPTIONAL { ?o <http://example.org/knows> ?z } }"
+  },
+  {
+    "id": 359,
+    "template": "RND_UNION",
+    "category": "Random UNION",
+    "query": "SELECT ?s ?o WHERE { { ?s <http://example.org/knows> ?o } UNION { ?s <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> ?o } }"
+  },
+  {
+    "id": 360,
+    "template": "RND_JOIN",
+    "category": "Random Join",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/developedBy> ?o . ?o <http://example.org/manages> ?z }"
+  },
+  {
+    "id": 361,
+    "template": "RND_JOIN",
+    "category": "Random Join",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/collaboratesWith> ?o . ?o <http://example.org/knows> ?z }"
+  },
+  {
+    "id": 362,
+    "template": "RND_OPTIONAL",
+    "category": "Random OPTIONAL",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/memberOf> ?o . OPTIONAL { ?o <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> ?z } }"
+  },
+  {
+    "id": 363,
+    "template": "RND_UNION",
+    "category": "Random UNION",
+    "query": "SELECT ?s ?o WHERE { { ?s <http://example.org/knows> ?o } UNION { ?s <http://example.org/worksFor> ?o } }"
+  },
+  {
+    "id": 364,
+    "template": "RND_UNION",
+    "category": "Random UNION",
+    "query": "SELECT ?s ?o WHERE { { ?s <http://example.org/fundedBy> ?o } UNION { ?s <http://example.org/collaboratesWith> ?o } }"
+  },
+  {
+    "id": 365,
+    "template": "RND_OPTIONAL",
+    "category": "Random OPTIONAL",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/worksFor> ?o . OPTIONAL { ?o <http://www.w3.org/2000/01/rdf-schema#label> ?z } }"
+  },
+  {
+    "id": 366,
+    "template": "RND_PATH_star",
+    "category": "Random Path",
+    "query": "SELECT ?s ?o WHERE { ?s <http://www.w3.org/2000/01/rdf-schema#label>* ?o }"
+  },
+  {
+    "id": 367,
+    "template": "RND_OPTIONAL",
+    "category": "Random OPTIONAL",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/developedBy> ?o . OPTIONAL { ?o <http://example.org/manages> ?z } }"
+  },
+  {
+    "id": 368,
+    "template": "RND_LIMIT",
+    "category": "Random LIMIT",
+    "query": "SELECT ?s ?o WHERE { ?s <http://www.w3.org/2000/01/rdf-schema#label> ?o } LIMIT 20"
+  },
+  {
+    "id": 369,
+    "template": "RND_OPTIONAL",
+    "category": "Random OPTIONAL",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/locatedIn> ?o . OPTIONAL { ?o <http://example.org/worksFor> ?z } }"
+  },
+  {
+    "id": 370,
+    "template": "RND_LIMIT_OFFSET",
+    "category": "Random LIMIT",
+    "query": "SELECT ?s ?o WHERE { ?s <http://example.org/memberOf> ?o } LIMIT 20 OFFSET 20"
+  },
+  {
+    "id": 371,
+    "template": "RND_UNION",
+    "category": "Random UNION",
+    "query": "SELECT ?s ?o WHERE { { ?s <http://example.org/reportsTo> ?o } UNION { ?s <http://example.org/memberOf> ?o } }"
+  },
+  {
+    "id": 372,
+    "template": "RND_OPTIONAL",
+    "category": "Random OPTIONAL",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://www.w3.org/2000/01/rdf-schema#label> ?o . OPTIONAL { ?o <http://example.org/collaboratesWith> ?z } }"
+  },
+  {
+    "id": 373,
+    "template": "RND_JOIN",
+    "category": "Random Join",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/contains> ?o . ?o <http://example.org/memberOf> ?z }"
+  },
+  {
+    "id": 374,
+    "template": "RND_JOIN",
+    "category": "Random Join",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/knows> ?o . ?o <http://example.org/manages> ?z }"
+  },
+  {
+    "id": 375,
+    "template": "RND_BGP",
+    "category": "Random BGP",
+    "query": "SELECT ?s ?o WHERE { ?s <http://example.org/fundedBy> ?o }"
+  },
+  {
+    "id": 376,
+    "template": "RND_JOIN",
+    "category": "Random Join",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/memberOf> ?o . ?o <http://example.org/worksFor> ?z }"
+  },
+  {
+    "id": 377,
+    "template": "RND_JOIN",
+    "category": "Random Join",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/fundedBy> ?o . ?o <http://www.w3.org/2000/01/rdf-schema#label> ?z }"
+  },
+  {
+    "id": 378,
+    "template": "RND_JOIN",
+    "category": "Random Join",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/manages> ?o . ?o <http://example.org/memberOf> ?z }"
+  },
+  {
+    "id": 379,
+    "template": "RND_UNION",
+    "category": "Random UNION",
+    "query": "SELECT ?s ?o WHERE { { ?s <http://example.org/worksFor> ?o } UNION { ?s <http://example.org/worksFor> ?o } }"
+  },
+  {
+    "id": 380,
+    "template": "RND_UNION",
+    "category": "Random UNION",
+    "query": "SELECT ?s ?o WHERE { { ?s <http://example.org/fundedBy> ?o } UNION { ?s <http://example.org/knows> ?o } }"
+  },
+  {
+    "id": 381,
+    "template": "RND_OPTIONAL",
+    "category": "Random OPTIONAL",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/knows> ?o . OPTIONAL { ?o <http://example.org/collaboratesWith> ?z } }"
+  },
+  {
+    "id": 382,
+    "template": "RND_UNION",
+    "category": "Random UNION",
+    "query": "SELECT ?s ?o WHERE { { ?s <http://www.w3.org/2000/01/rdf-schema#label> ?o } UNION { ?s <http://example.org/manages> ?o } }"
+  },
+  {
+    "id": 383,
+    "template": "RND_OPTIONAL",
+    "category": "Random OPTIONAL",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/manages> ?o . OPTIONAL { ?o <http://example.org/developedBy> ?z } }"
+  },
+  {
+    "id": 384,
+    "template": "RND_JOIN",
+    "category": "Random Join",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/reportsTo> ?o . ?o <http://example.org/manages> ?z }"
+  },
+  {
+    "id": 385,
+    "template": "RND_JOIN",
+    "category": "Random Join",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/contains> ?o . ?o <http://example.org/fundedBy> ?z }"
+  },
+  {
+    "id": 386,
+    "template": "RND_UNION",
+    "category": "Random UNION",
+    "query": "SELECT ?s ?o WHERE { { ?s <http://example.org/knows> ?o } UNION { ?s <http://example.org/manages> ?o } }"
+  },
+  {
+    "id": 387,
+    "template": "RND_OPTIONAL",
+    "category": "Random OPTIONAL",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/knows> ?o . OPTIONAL { ?o <http://example.org/locatedIn> ?z } }"
+  },
+  {
+    "id": 388,
+    "template": "RND_LIMIT",
+    "category": "Random LIMIT",
+    "query": "SELECT ?s ?o WHERE { ?s <http://example.org/memberOf> ?o } LIMIT 50"
+  },
+  {
+    "id": 389,
+    "template": "RND_UNION",
+    "category": "Random UNION",
+    "query": "SELECT ?s ?o WHERE { { ?s <http://example.org/manages> ?o } UNION { ?s <http://example.org/collaboratesWith> ?o } }"
+  },
+  {
+    "id": 390,
+    "template": "RND_UNION",
+    "category": "Random UNION",
+    "query": "SELECT ?s ?o WHERE { { ?s <http://example.org/fundedBy> ?o } UNION { ?s <http://example.org/manages> ?o } }"
+  },
+  {
+    "id": 391,
+    "template": "RND_UNION",
+    "category": "Random UNION",
+    "query": "SELECT ?s ?o WHERE { { ?s <http://example.org/knows> ?o } UNION { ?s <http://example.org/memberOf> ?o } }"
+  },
+  {
+    "id": 392,
+    "template": "RND_LIMIT_OFFSET",
+    "category": "Random LIMIT",
+    "query": "SELECT ?s ?o WHERE { ?s <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> ?o } LIMIT 5 OFFSET 5"
+  },
+  {
+    "id": 393,
+    "template": "RND_LIMIT",
+    "category": "Random LIMIT",
+    "query": "SELECT ?s ?o WHERE { ?s <http://example.org/collaboratesWith> ?o } LIMIT 5"
+  },
+  {
+    "id": 394,
+    "template": "RND_JOIN",
+    "category": "Random Join",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/collaboratesWith> ?o . ?o <http://example.org/manages> ?z }"
+  },
+  {
+    "id": 395,
+    "template": "RND_OPTIONAL",
+    "category": "Random OPTIONAL",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/collaboratesWith> ?o . OPTIONAL { ?o <http://example.org/reportsTo> ?z } }"
+  },
+  {
+    "id": 396,
+    "template": "RND_LIMIT",
+    "category": "Random LIMIT",
+    "query": "SELECT ?s ?o WHERE { ?s <http://example.org/developedBy> ?o } LIMIT 10"
+  },
+  {
+    "id": 397,
+    "template": "RND_LIMIT",
+    "category": "Random LIMIT",
+    "query": "SELECT ?s ?o WHERE { ?s <http://example.org/knows> ?o } LIMIT 20"
+  },
+  {
+    "id": 398,
+    "template": "RND_JOIN",
+    "category": "Random Join",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/contains> ?o . ?o <http://example.org/manages> ?z }"
+  },
+  {
+    "id": 399,
+    "template": "RND_UNION",
+    "category": "Random UNION",
+    "query": "SELECT ?s ?o WHERE { { ?s <http://example.org/worksFor> ?o } UNION { ?s <http://example.org/contains> ?o } }"
+  },
+  {
+    "id": 400,
+    "template": "RND_LIMIT",
+    "category": "Random LIMIT",
+    "query": "SELECT ?s ?o WHERE { ?s <http://example.org/collaboratesWith> ?o } LIMIT 10"
+  },
+  {
+    "id": 401,
+    "template": "RND_JOIN",
+    "category": "Random Join",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/developedBy> ?o . ?o <http://example.org/locatedIn> ?z }"
+  },
+  {
+    "id": 402,
+    "template": "RND_UNION",
+    "category": "Random UNION",
+    "query": "SELECT ?s ?o WHERE { { ?s <http://example.org/locatedIn> ?o } UNION { ?s <http://example.org/contains> ?o } }"
+  },
+  {
+    "id": 403,
+    "template": "RND_OPTIONAL",
+    "category": "Random OPTIONAL",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/collaboratesWith> ?o . OPTIONAL { ?o <http://example.org/manages> ?z } }"
+  },
+  {
+    "id": 404,
+    "template": "RND_UNION",
+    "category": "Random UNION",
+    "query": "SELECT ?s ?o WHERE { { ?s <http://example.org/worksFor> ?o } UNION { ?s <http://example.org/manages> ?o } }"
+  },
+  {
+    "id": 405,
+    "template": "RND_UNION",
+    "category": "Random UNION",
+    "query": "SELECT ?s ?o WHERE { { ?s <http://example.org/developedBy> ?o } UNION { ?s <http://example.org/manages> ?o } }"
+  },
+  {
+    "id": 406,
+    "template": "RND_UNION",
+    "category": "Random UNION",
+    "query": "SELECT ?s ?o WHERE { { ?s <http://example.org/knows> ?o } UNION { ?s <http://www.w3.org/2000/01/rdf-schema#label> ?o } }"
+  },
+  {
+    "id": 407,
+    "template": "RND_LIMIT",
+    "category": "Random LIMIT",
+    "query": "SELECT ?s ?o WHERE { ?s <http://www.w3.org/2000/01/rdf-schema#label> ?o } LIMIT 50"
+  },
+  {
+    "id": 408,
+    "template": "RND_JOIN",
+    "category": "Random Join",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/worksFor> ?o . ?o <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> ?z }"
+  },
+  {
+    "id": 409,
+    "template": "RND_OPTIONAL",
+    "category": "Random OPTIONAL",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/manages> ?o . OPTIONAL { ?o <http://example.org/contains> ?z } }"
+  },
+  {
+    "id": 410,
+    "template": "RND_OPTIONAL",
+    "category": "Random OPTIONAL",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/locatedIn> ?o . OPTIONAL { ?o <http://example.org/memberOf> ?z } }"
+  },
+  {
+    "id": 411,
+    "template": "RND_JOIN",
+    "category": "Random Join",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://www.w3.org/2000/01/rdf-schema#label> ?o . ?o <http://example.org/contains> ?z }"
+  },
+  {
+    "id": 412,
+    "template": "RND_UNION",
+    "category": "Random UNION",
+    "query": "SELECT ?s ?o WHERE { { ?s <http://example.org/reportsTo> ?o } UNION { ?s <http://example.org/manages> ?o } }"
+  },
+  {
+    "id": 413,
+    "template": "RND_OPTIONAL",
+    "category": "Random OPTIONAL",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/contains> ?o . OPTIONAL { ?o <http://example.org/developedBy> ?z } }"
+  },
+  {
+    "id": 414,
+    "template": "RND_OPTIONAL",
+    "category": "Random OPTIONAL",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/developedBy> ?o . OPTIONAL { ?o <http://example.org/developedBy> ?z } }"
+  },
+  {
+    "id": 415,
+    "template": "RND_UNION",
+    "category": "Random UNION",
+    "query": "SELECT ?s ?o WHERE { { ?s <http://example.org/memberOf> ?o } UNION { ?s <http://example.org/worksFor> ?o } }"
+  },
+  {
+    "id": 416,
+    "template": "RND_JOIN",
+    "category": "Random Join",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/locatedIn> ?o . ?o <http://example.org/collaboratesWith> ?z }"
+  },
+  {
+    "id": 417,
+    "template": "RND_LIMIT_OFFSET",
+    "category": "Random LIMIT",
+    "query": "SELECT ?s ?o WHERE { ?s <http://example.org/reportsTo> ?o } LIMIT 20 OFFSET 20"
+  },
+  {
+    "id": 418,
+    "template": "RND_JOIN",
+    "category": "Random Join",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://www.w3.org/2000/01/rdf-schema#label> ?o . ?o <http://example.org/memberOf> ?z }"
+  },
+  {
+    "id": 419,
+    "template": "RND_JOIN",
+    "category": "Random Join",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/memberOf> ?o . ?o <http://example.org/knows> ?z }"
+  },
+  {
+    "id": 420,
+    "template": "RND_OPTIONAL",
+    "category": "Random OPTIONAL",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/knows> ?o . OPTIONAL { ?o <http://example.org/worksFor> ?z } }"
+  },
+  {
+    "id": 421,
+    "template": "RND_JOIN",
+    "category": "Random Join",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/collaboratesWith> ?o . ?o <http://example.org/contains> ?z }"
+  },
+  {
+    "id": 422,
+    "template": "RND_OPTIONAL",
+    "category": "Random OPTIONAL",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/developedBy> ?o . OPTIONAL { ?o <http://example.org/knows> ?z } }"
+  },
+  {
+    "id": 423,
+    "template": "RND_UNION",
+    "category": "Random UNION",
+    "query": "SELECT ?s ?o WHERE { { ?s <http://example.org/contains> ?o } UNION { ?s <http://example.org/manages> ?o } }"
+  },
+  {
+    "id": 424,
+    "template": "RND_UNION",
+    "category": "Random UNION",
+    "query": "SELECT ?s ?o WHERE { { ?s <http://example.org/locatedIn> ?o } UNION { ?s <http://example.org/knows> ?o } }"
+  },
+  {
+    "id": 425,
+    "template": "RND_OPTIONAL",
+    "category": "Random OPTIONAL",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/fundedBy> ?o . OPTIONAL { ?o <http://example.org/reportsTo> ?z } }"
+  },
+  {
+    "id": 426,
+    "template": "RND_OPTIONAL",
+    "category": "Random OPTIONAL",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> ?o . OPTIONAL { ?o <http://example.org/collaboratesWith> ?z } }"
+  },
+  {
+    "id": 427,
+    "template": "RND_UNION",
+    "category": "Random UNION",
+    "query": "SELECT ?s ?o WHERE { { ?s <http://example.org/manages> ?o } UNION { ?s <http://example.org/knows> ?o } }"
+  },
+  {
+    "id": 428,
+    "template": "RND_JOIN",
+    "category": "Random Join",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/memberOf> ?o . ?o <http://example.org/locatedIn> ?z }"
+  },
+  {
+    "id": 429,
+    "template": "RND_OPTIONAL",
+    "category": "Random OPTIONAL",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://www.w3.org/2000/01/rdf-schema#label> ?o . OPTIONAL { ?o <http://example.org/worksFor> ?z } }"
+  },
+  {
+    "id": 430,
+    "template": "RND_LIMIT_OFFSET",
+    "category": "Random LIMIT",
+    "query": "SELECT ?s ?o WHERE { ?s <http://example.org/fundedBy> ?o } LIMIT 5 OFFSET 5"
+  },
+  {
+    "id": 431,
+    "template": "RND_JOIN",
+    "category": "Random Join",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/manages> ?o . ?o <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> ?z }"
+  },
+  {
+    "id": 432,
+    "template": "RND_UNION",
+    "category": "Random UNION",
+    "query": "SELECT ?s ?o WHERE { { ?s <http://example.org/locatedIn> ?o } UNION { ?s <http://example.org/memberOf> ?o } }"
+  },
+  {
+    "id": 433,
+    "template": "RND_JOIN",
+    "category": "Random Join",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/fundedBy> ?o . ?o <http://example.org/locatedIn> ?z }"
+  },
+  {
+    "id": 434,
+    "template": "RND_JOIN",
+    "category": "Random Join",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> ?o . ?o <http://example.org/knows> ?z }"
+  },
+  {
+    "id": 435,
+    "template": "RND_JOIN",
+    "category": "Random Join",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/fundedBy> ?o . ?o <http://example.org/developedBy> ?z }"
+  },
+  {
+    "id": 436,
+    "template": "RND_OPTIONAL",
+    "category": "Random OPTIONAL",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/memberOf> ?o . OPTIONAL { ?o <http://example.org/manages> ?z } }"
+  },
+  {
+    "id": 437,
+    "template": "RND_UNION",
+    "category": "Random UNION",
+    "query": "SELECT ?s ?o WHERE { { ?s <http://www.w3.org/2000/01/rdf-schema#label> ?o } UNION { ?s <http://www.w3.org/2000/01/rdf-schema#label> ?o } }"
+  },
+  {
+    "id": 438,
+    "template": "RND_UNION",
+    "category": "Random UNION",
+    "query": "SELECT ?s ?o WHERE { { ?s <http://example.org/worksFor> ?o } UNION { ?s <http://example.org/fundedBy> ?o } }"
+  },
+  {
+    "id": 439,
+    "template": "RND_OPTIONAL",
+    "category": "Random OPTIONAL",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/locatedIn> ?o . OPTIONAL { ?o <http://example.org/developedBy> ?z } }"
+  },
+  {
+    "id": 440,
+    "template": "RND_UNION",
+    "category": "Random UNION",
+    "query": "SELECT ?s ?o WHERE { { ?s <http://example.org/developedBy> ?o } UNION { ?s <http://www.w3.org/2000/01/rdf-schema#label> ?o } }"
+  },
+  {
+    "id": 441,
+    "template": "RND_JOIN",
+    "category": "Random Join",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/developedBy> ?o . ?o <http://example.org/worksFor> ?z }"
+  },
+  {
+    "id": 442,
+    "template": "RND_OPTIONAL",
+    "category": "Random OPTIONAL",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/collaboratesWith> ?o . OPTIONAL { ?o <http://example.org/locatedIn> ?z } }"
+  },
+  {
+    "id": 443,
+    "template": "RND_JOIN",
+    "category": "Random Join",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/contains> ?o . ?o <http://example.org/locatedIn> ?z }"
+  },
+  {
+    "id": 444,
+    "template": "RND_OPTIONAL",
+    "category": "Random OPTIONAL",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/knows> ?o . OPTIONAL { ?o <http://example.org/fundedBy> ?z } }"
+  },
+  {
+    "id": 445,
+    "template": "RND_OPTIONAL",
+    "category": "Random OPTIONAL",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/contains> ?o . OPTIONAL { ?o <http://example.org/memberOf> ?z } }"
+  },
+  {
+    "id": 446,
+    "template": "RND_JOIN",
+    "category": "Random Join",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/developedBy> ?o . ?o <http://www.w3.org/2000/01/rdf-schema#label> ?z }"
+  },
+  {
+    "id": 447,
+    "template": "RND_JOIN",
+    "category": "Random Join",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/manages> ?o . ?o <http://example.org/reportsTo> ?z }"
+  },
+  {
+    "id": 448,
+    "template": "RND_OPTIONAL",
+    "category": "Random OPTIONAL",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/contains> ?o . OPTIONAL { ?o <http://example.org/manages> ?z } }"
+  },
+  {
+    "id": 449,
+    "template": "RND_JOIN",
+    "category": "Random Join",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/reportsTo> ?o . ?o <http://example.org/worksFor> ?z }"
+  },
+  {
+    "id": 450,
+    "template": "RND_UNION",
+    "category": "Random UNION",
+    "query": "SELECT ?s ?o WHERE { { ?s <http://example.org/knows> ?o } UNION { ?s <http://example.org/knows> ?o } }"
+  },
+  {
+    "id": 451,
+    "template": "RND_OPTIONAL",
+    "category": "Random OPTIONAL",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://www.w3.org/2000/01/rdf-schema#label> ?o . OPTIONAL { ?o <http://example.org/reportsTo> ?z } }"
+  },
+  {
+    "id": 452,
+    "template": "RND_OPTIONAL",
+    "category": "Random OPTIONAL",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/knows> ?o . OPTIONAL { ?o <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> ?z } }"
+  },
+  {
+    "id": 453,
+    "template": "RND_LIMIT_OFFSET",
+    "category": "Random LIMIT",
+    "query": "SELECT ?s ?o WHERE { ?s <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> ?o } LIMIT 10 OFFSET 10"
+  },
+  {
+    "id": 454,
+    "template": "RND_OPTIONAL",
+    "category": "Random OPTIONAL",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/developedBy> ?o . OPTIONAL { ?o <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> ?z } }"
+  },
+  {
+    "id": 455,
+    "template": "RND_OPTIONAL",
+    "category": "Random OPTIONAL",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/manages> ?o . OPTIONAL { ?o <http://example.org/locatedIn> ?z } }"
+  },
+  {
+    "id": 456,
+    "template": "RND_OPTIONAL",
+    "category": "Random OPTIONAL",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/manages> ?o . OPTIONAL { ?o <http://example.org/collaboratesWith> ?z } }"
+  },
+  {
+    "id": 457,
+    "template": "RND_JOIN",
+    "category": "Random Join",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/collaboratesWith> ?o . ?o <http://example.org/memberOf> ?z }"
+  },
+  {
+    "id": 458,
+    "template": "RND_JOIN",
+    "category": "Random Join",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/reportsTo> ?o . ?o <http://example.org/fundedBy> ?z }"
+  },
+  {
+    "id": 459,
+    "template": "RND_UNION",
+    "category": "Random UNION",
+    "query": "SELECT ?s ?o WHERE { { ?s <http://example.org/reportsTo> ?o } UNION { ?s <http://example.org/fundedBy> ?o } }"
+  },
+  {
+    "id": 460,
+    "template": "RND_OPTIONAL",
+    "category": "Random OPTIONAL",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/developedBy> ?o . OPTIONAL { ?o <http://example.org/contains> ?z } }"
+  },
+  {
+    "id": 461,
+    "template": "RND_JOIN",
+    "category": "Random Join",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/knows> ?o . ?o <http://example.org/knows> ?z }"
+  },
+  {
+    "id": 462,
+    "template": "RND_JOIN",
+    "category": "Random Join",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/worksFor> ?o . ?o <http://example.org/collaboratesWith> ?z }"
+  },
+  {
+    "id": 463,
+    "template": "RND_ORDER_ASC",
+    "category": "Random ORDER",
+    "query": "SELECT ?s ?o WHERE { ?s <http://example.org/manages> ?o } ORDER BY ASC(?s)"
+  },
+  {
+    "id": 464,
+    "template": "RND_LIMIT",
+    "category": "Random LIMIT",
+    "query": "SELECT ?s ?o WHERE { ?s <http://www.w3.org/2000/01/rdf-schema#label> ?o } LIMIT 5"
+  },
+  {
+    "id": 465,
+    "template": "RND_OPTIONAL",
+    "category": "Random OPTIONAL",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/contains> ?o . OPTIONAL { ?o <http://example.org/contains> ?z } }"
+  },
+  {
+    "id": 466,
+    "template": "RND_JOIN",
+    "category": "Random Join",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/knows> ?o . ?o <http://example.org/locatedIn> ?z }"
+  },
+  {
+    "id": 467,
+    "template": "RND_UNION",
+    "category": "Random UNION",
+    "query": "SELECT ?s ?o WHERE { { ?s <http://example.org/manages> ?o } UNION { ?s <http://www.w3.org/2000/01/rdf-schema#label> ?o } }"
+  },
+  {
+    "id": 468,
+    "template": "RND_UNION",
+    "category": "Random UNION",
+    "query": "SELECT ?s ?o WHERE { { ?s <http://example.org/developedBy> ?o } UNION { ?s <http://example.org/contains> ?o } }"
+  },
+  {
+    "id": 469,
+    "template": "RND_JOIN",
+    "category": "Random Join",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/contains> ?o . ?o <http://example.org/knows> ?z }"
+  },
+  {
+    "id": 470,
+    "template": "RND_UNION",
+    "category": "Random UNION",
+    "query": "SELECT ?s ?o WHERE { { ?s <http://example.org/collaboratesWith> ?o } UNION { ?s <http://www.w3.org/2000/01/rdf-schema#label> ?o } }"
+  },
+  {
+    "id": 471,
+    "template": "RND_UNION",
+    "category": "Random UNION",
+    "query": "SELECT ?s ?o WHERE { { ?s <http://example.org/reportsTo> ?o } UNION { ?s <http://example.org/reportsTo> ?o } }"
+  },
+  {
+    "id": 472,
+    "template": "RND_JOIN",
+    "category": "Random Join",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/reportsTo> ?o . ?o <http://example.org/reportsTo> ?z }"
+  },
+  {
+    "id": 473,
+    "template": "RND_OPTIONAL",
+    "category": "Random OPTIONAL",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/reportsTo> ?o . OPTIONAL { ?o <http://example.org/reportsTo> ?z } }"
+  },
+  {
+    "id": 474,
+    "template": "RND_UNION",
+    "category": "Random UNION",
+    "query": "SELECT ?s ?o WHERE { { ?s <http://example.org/locatedIn> ?o } UNION { ?s <http://example.org/collaboratesWith> ?o } }"
+  },
+  {
+    "id": 475,
+    "template": "RND_UNION",
+    "category": "Random UNION",
+    "query": "SELECT ?s ?o WHERE { { ?s <http://example.org/reportsTo> ?o } UNION { ?s <http://example.org/worksFor> ?o } }"
+  },
+  {
+    "id": 476,
+    "template": "RND_UNION",
+    "category": "Random UNION",
+    "query": "SELECT ?s ?o WHERE { { ?s <http://example.org/locatedIn> ?o } UNION { ?s <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> ?o } }"
+  },
+  {
+    "id": 477,
+    "template": "RND_OPTIONAL",
+    "category": "Random OPTIONAL",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/memberOf> ?o . OPTIONAL { ?o <http://example.org/developedBy> ?z } }"
+  },
+  {
+    "id": 478,
+    "template": "RND_OPTIONAL",
+    "category": "Random OPTIONAL",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> ?o . OPTIONAL { ?o <http://example.org/locatedIn> ?z } }"
+  },
+  {
+    "id": 479,
+    "template": "RND_JOIN",
+    "category": "Random Join",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> ?o . ?o <http://example.org/collaboratesWith> ?z }"
+  },
+  {
+    "id": 480,
+    "template": "RND_JOIN",
+    "category": "Random Join",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://www.w3.org/2000/01/rdf-schema#label> ?o . ?o <http://example.org/knows> ?z }"
+  },
+  {
+    "id": 481,
+    "template": "RND_JOIN",
+    "category": "Random Join",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/locatedIn> ?o . ?o <http://example.org/memberOf> ?z }"
+  },
+  {
+    "id": 482,
+    "template": "RND_JOIN",
+    "category": "Random Join",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/manages> ?o . ?o <http://example.org/manages> ?z }"
+  },
+  {
+    "id": 483,
+    "template": "RND_UNION",
+    "category": "Random UNION",
+    "query": "SELECT ?s ?o WHERE { { ?s <http://example.org/reportsTo> ?o } UNION { ?s <http://example.org/collaboratesWith> ?o } }"
+  },
+  {
+    "id": 484,
+    "template": "RND_JOIN",
+    "category": "Random Join",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/manages> ?o . ?o <http://example.org/knows> ?z }"
+  },
+  {
+    "id": 485,
+    "template": "RND_UNION",
+    "category": "Random UNION",
+    "query": "SELECT ?s ?o WHERE { { ?s <http://example.org/memberOf> ?o } UNION { ?s <http://www.w3.org/2000/01/rdf-schema#label> ?o } }"
+  },
+  {
+    "id": 486,
+    "template": "RND_OPTIONAL",
+    "category": "Random OPTIONAL",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/memberOf> ?o . OPTIONAL { ?o <http://example.org/worksFor> ?z } }"
+  },
+  {
+    "id": 487,
+    "template": "RND_UNION",
+    "category": "Random UNION",
+    "query": "SELECT ?s ?o WHERE { { ?s <http://example.org/locatedIn> ?o } UNION { ?s <http://example.org/locatedIn> ?o } }"
+  },
+  {
+    "id": 488,
+    "template": "RND_OPTIONAL",
+    "category": "Random OPTIONAL",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/fundedBy> ?o . OPTIONAL { ?o <http://example.org/worksFor> ?z } }"
+  },
+  {
+    "id": 489,
+    "template": "RND_UNION",
+    "category": "Random UNION",
+    "query": "SELECT ?s ?o WHERE { { ?s <http://example.org/manages> ?o } UNION { ?s <http://example.org/contains> ?o } }"
+  },
+  {
+    "id": 490,
+    "template": "RND_JOIN",
+    "category": "Random Join",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/knows> ?o . ?o <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> ?z }"
+  },
+  {
+    "id": 491,
+    "template": "RND_JOIN",
+    "category": "Random Join",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/contains> ?o . ?o <http://example.org/contains> ?z }"
+  },
+  {
+    "id": 492,
+    "template": "RND_OPTIONAL",
+    "category": "Random OPTIONAL",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/worksFor> ?o . OPTIONAL { ?o <http://example.org/contains> ?z } }"
+  },
+  {
+    "id": 493,
+    "template": "RND_OPTIONAL",
+    "category": "Random OPTIONAL",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> ?o . OPTIONAL { ?o <http://example.org/developedBy> ?z } }"
+  },
+  {
+    "id": 494,
+    "template": "RND_JOIN",
+    "category": "Random Join",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/reportsTo> ?o . ?o <http://example.org/memberOf> ?z }"
+  },
+  {
+    "id": 495,
+    "template": "RND_UNION",
+    "category": "Random UNION",
+    "query": "SELECT ?s ?o WHERE { { ?s <http://example.org/worksFor> ?o } UNION { ?s <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> ?o } }"
+  },
+  {
+    "id": 496,
+    "template": "RND_JOIN",
+    "category": "Random Join",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/collaboratesWith> ?o . ?o <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> ?z }"
+  },
+  {
+    "id": 497,
+    "template": "RND_UNION",
+    "category": "Random UNION",
+    "query": "SELECT ?s ?o WHERE { { ?s <http://example.org/contains> ?o } UNION { ?s <http://www.w3.org/2000/01/rdf-schema#label> ?o } }"
+  },
+  {
+    "id": 498,
+    "template": "RND_UNION",
+    "category": "Random UNION",
+    "query": "SELECT ?s ?o WHERE { { ?s <http://www.w3.org/2000/01/rdf-schema#label> ?o } UNION { ?s <http://example.org/contains> ?o } }"
+  },
+  {
+    "id": 499,
+    "template": "RND_JOIN",
+    "category": "Random Join",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://www.w3.org/2000/01/rdf-schema#label> ?o . ?o <http://example.org/reportsTo> ?z }"
+  },
+  {
+    "id": 500,
+    "template": "RND_JOIN",
+    "category": "Random Join",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/worksFor> ?o . ?o <http://example.org/reportsTo> ?z }"
+  },
+  {
+    "id": 501,
+    "template": "RND_UNION",
+    "category": "Random UNION",
+    "query": "SELECT ?s ?o WHERE { { ?s <http://example.org/contains> ?o } UNION { ?s <http://example.org/reportsTo> ?o } }"
+  },
+  {
+    "id": 502,
+    "template": "RND_UNION",
+    "category": "Random UNION",
+    "query": "SELECT ?s ?o WHERE { { ?s <http://example.org/locatedIn> ?o } UNION { ?s <http://example.org/fundedBy> ?o } }"
+  },
+  {
+    "id": 503,
+    "template": "RND_LIMIT",
+    "category": "Random LIMIT",
+    "query": "SELECT ?s ?o WHERE { ?s <http://example.org/memberOf> ?o } LIMIT 20"
+  },
+  {
+    "id": 504,
+    "template": "RND_UNION",
+    "category": "Random UNION",
+    "query": "SELECT ?s ?o WHERE { { ?s <http://example.org/locatedIn> ?o } UNION { ?s <http://example.org/developedBy> ?o } }"
+  },
+  {
+    "id": 505,
+    "template": "RND_JOIN",
+    "category": "Random Join",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/manages> ?o . ?o <http://example.org/contains> ?z }"
+  },
+  {
+    "id": 506,
+    "template": "RND_UNION",
+    "category": "Random UNION",
+    "query": "SELECT ?s ?o WHERE { { ?s <http://example.org/manages> ?o } UNION { ?s <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> ?o } }"
+  },
+  {
+    "id": 507,
+    "template": "RND_UNION",
+    "category": "Random UNION",
+    "query": "SELECT ?s ?o WHERE { { ?s <http://example.org/fundedBy> ?o } UNION { ?s <http://example.org/locatedIn> ?o } }"
+  },
+  {
+    "id": 508,
+    "template": "RND_LIMIT",
+    "category": "Random LIMIT",
+    "query": "SELECT ?s ?o WHERE { ?s <http://example.org/developedBy> ?o } LIMIT 20"
+  },
+  {
+    "id": 509,
+    "template": "RND_OPTIONAL",
+    "category": "Random OPTIONAL",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/memberOf> ?o . OPTIONAL { ?o <http://example.org/reportsTo> ?z } }"
+  },
+  {
+    "id": 510,
+    "template": "RND_OPTIONAL",
+    "category": "Random OPTIONAL",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/contains> ?o . OPTIONAL { ?o <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> ?z } }"
+  },
+  {
+    "id": 511,
+    "template": "RND_JOIN",
+    "category": "Random Join",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/reportsTo> ?o . ?o <http://example.org/collaboratesWith> ?z }"
+  },
+  {
+    "id": 512,
+    "template": "RND_OPTIONAL",
+    "category": "Random OPTIONAL",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/knows> ?o . OPTIONAL { ?o <http://example.org/developedBy> ?z } }"
+  },
+  {
+    "id": 513,
+    "template": "RND_UNION",
+    "category": "Random UNION",
+    "query": "SELECT ?s ?o WHERE { { ?s <http://example.org/contains> ?o } UNION { ?s <http://example.org/developedBy> ?o } }"
+  },
+  {
+    "id": 514,
+    "template": "RND_UNION",
+    "category": "Random UNION",
+    "query": "SELECT ?s ?o WHERE { { ?s <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> ?o } UNION { ?s <http://example.org/collaboratesWith> ?o } }"
+  },
+  {
+    "id": 515,
+    "template": "RND_JOIN",
+    "category": "Random Join",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/locatedIn> ?o . ?o <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> ?z }"
+  },
+  {
+    "id": 516,
+    "template": "RND_UNION",
+    "category": "Random UNION",
+    "query": "SELECT ?s ?o WHERE { { ?s <http://example.org/reportsTo> ?o } UNION { ?s <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> ?o } }"
+  },
+  {
+    "id": 517,
+    "template": "RND_JOIN",
+    "category": "Random Join",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/memberOf> ?o . ?o <http://www.w3.org/2000/01/rdf-schema#label> ?z }"
+  },
+  {
+    "id": 518,
+    "template": "RND_OPTIONAL",
+    "category": "Random OPTIONAL",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/knows> ?o . OPTIONAL { ?o <http://example.org/reportsTo> ?z } }"
+  },
+  {
+    "id": 519,
+    "template": "RND_OPTIONAL",
+    "category": "Random OPTIONAL",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/locatedIn> ?o . OPTIONAL { ?o <http://example.org/manages> ?z } }"
+  },
+  {
+    "id": 520,
+    "template": "RND_UNION",
+    "category": "Random UNION",
+    "query": "SELECT ?s ?o WHERE { { ?s <http://example.org/contains> ?o } UNION { ?s <http://example.org/contains> ?o } }"
+  },
+  {
+    "id": 521,
+    "template": "RND_JOIN",
+    "category": "Random Join",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/worksFor> ?o . ?o <http://example.org/knows> ?z }"
+  },
+  {
+    "id": 522,
+    "template": "RND_UNION",
+    "category": "Random UNION",
+    "query": "SELECT ?s ?o WHERE { { ?s <http://example.org/memberOf> ?o } UNION { ?s <http://example.org/developedBy> ?o } }"
+  },
+  {
+    "id": 523,
+    "template": "RND_OPTIONAL",
+    "category": "Random OPTIONAL",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/collaboratesWith> ?o . OPTIONAL { ?o <http://www.w3.org/2000/01/rdf-schema#label> ?z } }"
+  },
+  {
+    "id": 524,
+    "template": "RND_JOIN",
+    "category": "Random Join",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/locatedIn> ?o . ?o <http://example.org/locatedIn> ?z }"
+  },
+  {
+    "id": 525,
+    "template": "RND_OPTIONAL",
+    "category": "Random OPTIONAL",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/reportsTo> ?o . OPTIONAL { ?o <http://example.org/collaboratesWith> ?z } }"
+  },
+  {
+    "id": 526,
+    "template": "RND_JOIN",
+    "category": "Random Join",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/fundedBy> ?o . ?o <http://example.org/worksFor> ?z }"
+  },
+  {
+    "id": 527,
+    "template": "RND_UNION",
+    "category": "Random UNION",
+    "query": "SELECT ?s ?o WHERE { { ?s <http://example.org/fundedBy> ?o } UNION { ?s <http://www.w3.org/2000/01/rdf-schema#label> ?o } }"
+  },
+  {
+    "id": 528,
+    "template": "RND_JOIN",
+    "category": "Random Join",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/fundedBy> ?o . ?o <http://example.org/reportsTo> ?z }"
+  },
+  {
+    "id": 529,
+    "template": "RND_UNION",
+    "category": "Random UNION",
+    "query": "SELECT ?s ?o WHERE { { ?s <http://example.org/manages> ?o } UNION { ?s <http://example.org/manages> ?o } }"
+  },
+  {
+    "id": 530,
+    "template": "RND_OPTIONAL",
+    "category": "Random OPTIONAL",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/memberOf> ?o . OPTIONAL { ?o <http://www.w3.org/2000/01/rdf-schema#label> ?z } }"
+  },
+  {
+    "id": 531,
+    "template": "RND_JOIN",
+    "category": "Random Join",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/reportsTo> ?o . ?o <http://example.org/contains> ?z }"
+  },
+  {
+    "id": 532,
+    "template": "RND_UNION",
+    "category": "Random UNION",
+    "query": "SELECT ?s ?o WHERE { { ?s <http://www.w3.org/2000/01/rdf-schema#label> ?o } UNION { ?s <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> ?o } }"
+  },
+  {
+    "id": 533,
+    "template": "RND_JOIN",
+    "category": "Random Join",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/developedBy> ?o . ?o <http://example.org/collaboratesWith> ?z }"
+  },
+  {
+    "id": 534,
+    "template": "RND_OPTIONAL",
+    "category": "Random OPTIONAL",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/worksFor> ?o . OPTIONAL { ?o <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> ?z } }"
+  },
+  {
+    "id": 535,
+    "template": "RND_JOIN",
+    "category": "Random Join",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/contains> ?o . ?o <http://example.org/worksFor> ?z }"
+  },
+  {
+    "id": 536,
+    "template": "RND_UNION",
+    "category": "Random UNION",
+    "query": "SELECT ?s ?o WHERE { { ?s <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> ?o } UNION { ?s <http://example.org/memberOf> ?o } }"
+  },
+  {
+    "id": 537,
+    "template": "RND_JOIN",
+    "category": "Random Join",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/reportsTo> ?o . ?o <http://example.org/knows> ?z }"
+  },
+  {
+    "id": 538,
+    "template": "RND_UNION",
+    "category": "Random UNION",
+    "query": "SELECT ?s ?o WHERE { { ?s <http://www.w3.org/2000/01/rdf-schema#label> ?o } UNION { ?s <http://example.org/collaboratesWith> ?o } }"
+  },
+  {
+    "id": 539,
+    "template": "RND_LIMIT",
+    "category": "Random LIMIT",
+    "query": "SELECT ?s ?o WHERE { ?s <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> ?o } LIMIT 10"
+  },
+  {
+    "id": 540,
+    "template": "RND_OPTIONAL",
+    "category": "Random OPTIONAL",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> ?o . OPTIONAL { ?o <http://example.org/fundedBy> ?z } }"
+  },
+  {
+    "id": 541,
+    "template": "RND_UNION",
+    "category": "Random UNION",
+    "query": "SELECT ?s ?o WHERE { { ?s <http://example.org/fundedBy> ?o } UNION { ?s <http://example.org/fundedBy> ?o } }"
+  },
+  {
+    "id": 542,
+    "template": "RND_UNION",
+    "category": "Random UNION",
+    "query": "SELECT ?s ?o WHERE { { ?s <http://example.org/memberOf> ?o } UNION { ?s <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> ?o } }"
+  },
+  {
+    "id": 543,
+    "template": "RND_UNION",
+    "category": "Random UNION",
+    "query": "SELECT ?s ?o WHERE { { ?s <http://example.org/knows> ?o } UNION { ?s <http://example.org/developedBy> ?o } }"
+  },
+  {
+    "id": 544,
+    "template": "RND_OPTIONAL",
+    "category": "Random OPTIONAL",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/locatedIn> ?o . OPTIONAL { ?o <http://example.org/fundedBy> ?z } }"
+  },
+  {
+    "id": 545,
+    "template": "RND_OPTIONAL",
+    "category": "Random OPTIONAL",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/reportsTo> ?o . OPTIONAL { ?o <http://example.org/memberOf> ?z } }"
+  },
+  {
+    "id": 546,
+    "template": "RND_UNION",
+    "category": "Random UNION",
+    "query": "SELECT ?s ?o WHERE { { ?s <http://example.org/reportsTo> ?o } UNION { ?s <http://www.w3.org/2000/01/rdf-schema#label> ?o } }"
+  },
+  {
+    "id": 547,
+    "template": "RND_JOIN",
+    "category": "Random Join",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/collaboratesWith> ?o . ?o <http://example.org/worksFor> ?z }"
+  },
+  {
+    "id": 548,
+    "template": "RND_UNION",
+    "category": "Random UNION",
+    "query": "SELECT ?s ?o WHERE { { ?s <http://example.org/manages> ?o } UNION { ?s <http://example.org/locatedIn> ?o } }"
+  },
+  {
+    "id": 549,
+    "template": "RND_JOIN",
+    "category": "Random Join",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://www.w3.org/2000/01/rdf-schema#label> ?o . ?o <http://example.org/worksFor> ?z }"
+  },
+  {
+    "id": 550,
+    "template": "RND_UNION",
+    "category": "Random UNION",
+    "query": "SELECT ?s ?o WHERE { { ?s <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> ?o } UNION { ?s <http://www.w3.org/2000/01/rdf-schema#label> ?o } }"
+  },
+  {
+    "id": 551,
+    "template": "RND_UNION",
+    "category": "Random UNION",
+    "query": "SELECT ?s ?o WHERE { { ?s <http://example.org/collaboratesWith> ?o } UNION { ?s <http://example.org/locatedIn> ?o } }"
+  },
+  {
+    "id": 552,
+    "template": "RND_JOIN",
+    "category": "Random Join",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/developedBy> ?o . ?o <http://example.org/contains> ?z }"
+  },
+  {
+    "id": 553,
+    "template": "RND_JOIN",
+    "category": "Random Join",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/reportsTo> ?o . ?o <http://example.org/developedBy> ?z }"
+  },
+  {
+    "id": 554,
+    "template": "RND_UNION",
+    "category": "Random UNION",
+    "query": "SELECT ?s ?o WHERE { { ?s <http://example.org/fundedBy> ?o } UNION { ?s <http://example.org/contains> ?o } }"
+  },
+  {
+    "id": 555,
+    "template": "RND_JOIN",
+    "category": "Random Join",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/knows> ?o . ?o <http://example.org/developedBy> ?z }"
+  },
+  {
+    "id": 556,
+    "template": "RND_OPTIONAL",
+    "category": "Random OPTIONAL",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/fundedBy> ?o . OPTIONAL { ?o <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> ?z } }"
+  },
+  {
+    "id": 557,
+    "template": "RND_OPTIONAL",
+    "category": "Random OPTIONAL",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/developedBy> ?o . OPTIONAL { ?o <http://www.w3.org/2000/01/rdf-schema#label> ?z } }"
+  },
+  {
+    "id": 558,
+    "template": "RND_OPTIONAL",
+    "category": "Random OPTIONAL",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/manages> ?o . OPTIONAL { ?o <http://example.org/knows> ?z } }"
+  },
+  {
+    "id": 559,
+    "template": "RND_UNION",
+    "category": "Random UNION",
+    "query": "SELECT ?s ?o WHERE { { ?s <http://example.org/fundedBy> ?o } UNION { ?s <http://example.org/reportsTo> ?o } }"
+  },
+  {
+    "id": 560,
+    "template": "RND_OPTIONAL",
+    "category": "Random OPTIONAL",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/manages> ?o . OPTIONAL { ?o <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> ?z } }"
+  },
+  {
+    "id": 561,
+    "template": "RND_OPTIONAL",
+    "category": "Random OPTIONAL",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/fundedBy> ?o . OPTIONAL { ?o <http://example.org/contains> ?z } }"
+  },
+  {
+    "id": 562,
+    "template": "RND_UNION",
+    "category": "Random UNION",
+    "query": "SELECT ?s ?o WHERE { { ?s <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> ?o } UNION { ?s <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> ?o } }"
+  },
+  {
+    "id": 563,
+    "template": "RND_OPTIONAL",
+    "category": "Random OPTIONAL",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/contains> ?o . OPTIONAL { ?o <http://example.org/collaboratesWith> ?z } }"
+  },
+  {
+    "id": 564,
+    "template": "RND_OPTIONAL",
+    "category": "Random OPTIONAL",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/memberOf> ?o . OPTIONAL { ?o <http://example.org/knows> ?z } }"
+  },
+  {
+    "id": 565,
+    "template": "RND_UNION",
+    "category": "Random UNION",
+    "query": "SELECT ?s ?o WHERE { { ?s <http://example.org/collaboratesWith> ?o } UNION { ?s <http://example.org/worksFor> ?o } }"
+  },
+  {
+    "id": 566,
+    "template": "RND_UNION",
+    "category": "Random UNION",
+    "query": "SELECT ?s ?o WHERE { { ?s <http://example.org/contains> ?o } UNION { ?s <http://example.org/worksFor> ?o } }"
+  },
+  {
+    "id": 567,
+    "template": "RND_OPTIONAL",
+    "category": "Random OPTIONAL",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/worksFor> ?o . OPTIONAL { ?o <http://example.org/knows> ?z } }"
+  },
+  {
+    "id": 568,
+    "template": "RND_LIMIT",
+    "category": "Random LIMIT",
+    "query": "SELECT ?s ?o WHERE { ?s <http://example.org/locatedIn> ?o } LIMIT 10"
+  },
+  {
+    "id": 569,
+    "template": "RND_OPTIONAL",
+    "category": "Random OPTIONAL",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/developedBy> ?o . OPTIONAL { ?o <http://example.org/reportsTo> ?z } }"
+  },
+  {
+    "id": 570,
+    "template": "RND_OPTIONAL",
+    "category": "Random OPTIONAL",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/manages> ?o . OPTIONAL { ?o <http://example.org/fundedBy> ?z } }"
+  },
+  {
+    "id": 571,
+    "template": "RND_UNION",
+    "category": "Random UNION",
+    "query": "SELECT ?s ?o WHERE { { ?s <http://example.org/fundedBy> ?o } UNION { ?s <http://example.org/worksFor> ?o } }"
+  },
+  {
+    "id": 572,
+    "template": "RND_UNION",
+    "category": "Random UNION",
+    "query": "SELECT ?s ?o WHERE { { ?s <http://example.org/developedBy> ?o } UNION { ?s <http://example.org/knows> ?o } }"
+  },
+  {
+    "id": 573,
+    "template": "RND_UNION",
+    "category": "Random UNION",
+    "query": "SELECT ?s ?o WHERE { { ?s <http://example.org/manages> ?o } UNION { ?s <http://example.org/memberOf> ?o } }"
+  },
+  {
+    "id": 574,
+    "template": "RND_OPTIONAL",
+    "category": "Random OPTIONAL",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/worksFor> ?o . OPTIONAL { ?o <http://example.org/manages> ?z } }"
+  },
+  {
+    "id": 575,
+    "template": "RND_UNION",
+    "category": "Random UNION",
+    "query": "SELECT ?s ?o WHERE { { ?s <http://example.org/contains> ?o } UNION { ?s <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> ?o } }"
+  },
+  {
+    "id": 576,
+    "template": "RND_JOIN",
+    "category": "Random Join",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/memberOf> ?o . ?o <http://example.org/reportsTo> ?z }"
+  },
+  {
+    "id": 577,
+    "template": "RND_JOIN",
+    "category": "Random Join",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://www.w3.org/2000/01/rdf-schema#label> ?o . ?o <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> ?z }"
+  },
+  {
+    "id": 578,
+    "template": "RND_UNION",
+    "category": "Random UNION",
+    "query": "SELECT ?s ?o WHERE { { ?s <http://example.org/knows> ?o } UNION { ?s <http://example.org/fundedBy> ?o } }"
+  },
+  {
+    "id": 579,
+    "template": "RND_UNION",
+    "category": "Random UNION",
+    "query": "SELECT ?s ?o WHERE { { ?s <http://www.w3.org/2000/01/rdf-schema#label> ?o } UNION { ?s <http://example.org/reportsTo> ?o } }"
+  },
+  {
+    "id": 580,
+    "template": "RND_JOIN",
+    "category": "Random Join",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/reportsTo> ?o . ?o <http://example.org/locatedIn> ?z }"
+  },
+  {
+    "id": 581,
+    "template": "RND_UNION",
+    "category": "Random UNION",
+    "query": "SELECT ?s ?o WHERE { { ?s <http://example.org/reportsTo> ?o } UNION { ?s <http://example.org/contains> ?o } }"
+  },
+  {
+    "id": 582,
+    "template": "RND_JOIN",
+    "category": "Random Join",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/memberOf> ?o . ?o <http://example.org/memberOf> ?z }"
+  },
+  {
+    "id": 583,
+    "template": "RND_JOIN",
+    "category": "Random Join",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> ?o . ?o <http://www.w3.org/2000/01/rdf-schema#label> ?z }"
+  },
+  {
+    "id": 584,
+    "template": "RND_JOIN",
+    "category": "Random Join",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/manages> ?o . ?o <http://example.org/developedBy> ?z }"
+  },
+  {
+    "id": 585,
+    "template": "RND_OPTIONAL",
+    "category": "Random OPTIONAL",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/worksFor> ?o . OPTIONAL { ?o <http://example.org/memberOf> ?z } }"
+  },
+  {
+    "id": 586,
+    "template": "RND_OPTIONAL",
+    "category": "Random OPTIONAL",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/reportsTo> ?o . OPTIONAL { ?o <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> ?z } }"
+  },
+  {
+    "id": 587,
+    "template": "RND_JOIN",
+    "category": "Random Join",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/memberOf> ?o . ?o <http://example.org/collaboratesWith> ?z }"
+  },
+  {
+    "id": 588,
+    "template": "RND_OPTIONAL",
+    "category": "Random OPTIONAL",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://www.w3.org/2000/01/rdf-schema#label> ?o . OPTIONAL { ?o <http://example.org/fundedBy> ?z } }"
+  },
+  {
+    "id": 589,
+    "template": "RND_JOIN",
+    "category": "Random Join",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://www.w3.org/2000/01/rdf-schema#label> ?o . ?o <http://example.org/fundedBy> ?z }"
+  },
+  {
+    "id": 590,
+    "template": "RND_OPTIONAL",
+    "category": "Random OPTIONAL",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/developedBy> ?o . OPTIONAL { ?o <http://example.org/locatedIn> ?z } }"
+  },
+  {
+    "id": 591,
+    "template": "RND_JOIN",
+    "category": "Random Join",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/fundedBy> ?o . ?o <http://example.org/fundedBy> ?z }"
+  },
+  {
+    "id": 592,
+    "template": "RND_UNION",
+    "category": "Random UNION",
+    "query": "SELECT ?s ?o WHERE { { ?s <http://example.org/collaboratesWith> ?o } UNION { ?s <http://example.org/manages> ?o } }"
+  },
+  {
+    "id": 593,
+    "template": "RND_OPTIONAL",
+    "category": "Random OPTIONAL",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://www.w3.org/2000/01/rdf-schema#label> ?o . OPTIONAL { ?o <http://example.org/manages> ?z } }"
+  },
+  {
+    "id": 594,
+    "template": "RND_OPTIONAL",
+    "category": "Random OPTIONAL",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/collaboratesWith> ?o . OPTIONAL { ?o <http://example.org/developedBy> ?z } }"
+  },
+  {
+    "id": 595,
+    "template": "RND_JOIN",
+    "category": "Random Join",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/knows> ?o . ?o <http://example.org/collaboratesWith> ?z }"
+  },
+  {
+    "id": 596,
+    "template": "RND_UNION",
+    "category": "Random UNION",
+    "query": "SELECT ?s ?o WHERE { { ?s <http://example.org/collaboratesWith> ?o } UNION { ?s <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> ?o } }"
+  },
+  {
+    "id": 597,
+    "template": "RND_JOIN",
+    "category": "Random Join",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/locatedIn> ?o . ?o <http://example.org/developedBy> ?z }"
+  },
+  {
+    "id": 598,
+    "template": "RND_UNION",
+    "category": "Random UNION",
+    "query": "SELECT ?s ?o WHERE { { ?s <http://example.org/reportsTo> ?o } UNION { ?s <http://example.org/locatedIn> ?o } }"
+  },
+  {
+    "id": 599,
+    "template": "RND_JOIN",
+    "category": "Random Join",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/fundedBy> ?o . ?o <http://example.org/collaboratesWith> ?z }"
+  },
+  {
+    "id": 600,
+    "template": "RND_JOIN",
+    "category": "Random Join",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/contains> ?o . ?o <http://www.w3.org/2000/01/rdf-schema#label> ?z }"
+  },
+  {
+    "id": 601,
+    "template": "RND_UNION",
+    "category": "Random UNION",
+    "query": "SELECT ?s ?o WHERE { { ?s <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> ?o } UNION { ?s <http://example.org/fundedBy> ?o } }"
+  },
+  {
+    "id": 602,
+    "template": "RND_JOIN",
+    "category": "Random Join",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/knows> ?o . ?o <http://example.org/contains> ?z }"
+  },
+  {
+    "id": 603,
+    "template": "RND_JOIN",
+    "category": "Random Join",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/collaboratesWith> ?o . ?o <http://example.org/collaboratesWith> ?z }"
+  },
+  {
+    "id": 604,
+    "template": "RND_JOIN",
+    "category": "Random Join",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> ?o . ?o <http://example.org/developedBy> ?z }"
+  },
+  {
+    "id": 605,
+    "template": "RND_JOIN",
+    "category": "Random Join",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/developedBy> ?o . ?o <http://example.org/fundedBy> ?z }"
+  },
+  {
+    "id": 606,
+    "template": "RND_OPTIONAL",
+    "category": "Random OPTIONAL",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/reportsTo> ?o . OPTIONAL { ?o <http://example.org/contains> ?z } }"
+  },
+  {
+    "id": 607,
+    "template": "RND_JOIN",
+    "category": "Random Join",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/worksFor> ?o . ?o <http://example.org/manages> ?z }"
+  },
+  {
+    "id": 608,
+    "template": "RND_UNION",
+    "category": "Random UNION",
+    "query": "SELECT ?s ?o WHERE { { ?s <http://example.org/reportsTo> ?o } UNION { ?s <http://example.org/developedBy> ?o } }"
+  },
+  {
+    "id": 609,
+    "template": "RND_UNION",
+    "category": "Random UNION",
+    "query": "SELECT ?s ?o WHERE { { ?s <http://example.org/developedBy> ?o } UNION { ?s <http://example.org/fundedBy> ?o } }"
+  },
+  {
+    "id": 610,
+    "template": "RND_OPTIONAL",
+    "category": "Random OPTIONAL",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/developedBy> ?o . OPTIONAL { ?o <http://example.org/fundedBy> ?z } }"
+  },
+  {
+    "id": 611,
+    "template": "RND_UNION",
+    "category": "Random UNION",
+    "query": "SELECT ?s ?o WHERE { { ?s <http://www.w3.org/2000/01/rdf-schema#label> ?o } UNION { ?s <http://example.org/worksFor> ?o } }"
+  },
+  {
+    "id": 612,
+    "template": "RND_JOIN",
+    "category": "Random Join",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/fundedBy> ?o . ?o <http://example.org/knows> ?z }"
+  },
+  {
+    "id": 613,
+    "template": "RND_OPTIONAL",
+    "category": "Random OPTIONAL",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/developedBy> ?o . OPTIONAL { ?o <http://example.org/worksFor> ?z } }"
+  },
+  {
+    "id": 614,
+    "template": "RND_UNION",
+    "category": "Random UNION",
+    "query": "SELECT ?s ?o WHERE { { ?s <http://example.org/collaboratesWith> ?o } UNION { ?s <http://example.org/contains> ?o } }"
+  },
+  {
+    "id": 615,
+    "template": "RND_OPTIONAL",
+    "category": "Random OPTIONAL",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> ?o . OPTIONAL { ?o <http://example.org/contains> ?z } }"
+  },
+  {
+    "id": 616,
+    "template": "RND_OPTIONAL",
+    "category": "Random OPTIONAL",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/collaboratesWith> ?o . OPTIONAL { ?o <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> ?z } }"
+  },
+  {
+    "id": 617,
+    "template": "RND_JOIN",
+    "category": "Random Join",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/collaboratesWith> ?o . ?o <http://www.w3.org/2000/01/rdf-schema#label> ?z }"
+  },
+  {
+    "id": 618,
+    "template": "RND_JOIN",
+    "category": "Random Join",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/reportsTo> ?o . ?o <http://www.w3.org/2000/01/rdf-schema#label> ?z }"
+  },
+  {
+    "id": 619,
+    "template": "RND_JOIN",
+    "category": "Random Join",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/contains> ?o . ?o <http://example.org/collaboratesWith> ?z }"
+  },
+  {
+    "id": 620,
+    "template": "RND_JOIN",
+    "category": "Random Join",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/developedBy> ?o . ?o <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> ?z }"
+  },
+  {
+    "id": 621,
+    "template": "RND_JOIN",
+    "category": "Random Join",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/worksFor> ?o . ?o <http://example.org/fundedBy> ?z }"
+  },
+  {
+    "id": 622,
+    "template": "RND_OPTIONAL",
+    "category": "Random OPTIONAL",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/worksFor> ?o . OPTIONAL { ?o <http://example.org/collaboratesWith> ?z } }"
+  },
+  {
+    "id": 623,
+    "template": "RND_OPTIONAL",
+    "category": "Random OPTIONAL",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/contains> ?o . OPTIONAL { ?o <http://example.org/locatedIn> ?z } }"
+  },
+  {
+    "id": 624,
+    "template": "RND_JOIN",
+    "category": "Random Join",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://www.w3.org/2000/01/rdf-schema#label> ?o . ?o <http://www.w3.org/2000/01/rdf-schema#label> ?z }"
+  },
+  {
+    "id": 625,
+    "template": "RND_JOIN",
+    "category": "Random Join",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/manages> ?o . ?o <http://www.w3.org/2000/01/rdf-schema#label> ?z }"
+  },
+  {
+    "id": 626,
+    "template": "RND_UNION",
+    "category": "Random UNION",
+    "query": "SELECT ?s ?o WHERE { { ?s <http://example.org/manages> ?o } UNION { ?s <http://example.org/fundedBy> ?o } }"
+  },
+  {
+    "id": 627,
+    "template": "RND_OPTIONAL",
+    "category": "Random OPTIONAL",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://www.w3.org/2000/01/rdf-schema#label> ?o . OPTIONAL { ?o <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> ?z } }"
+  },
+  {
+    "id": 628,
+    "template": "RND_OPTIONAL",
+    "category": "Random OPTIONAL",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/reportsTo> ?o . OPTIONAL { ?o <http://example.org/locatedIn> ?z } }"
+  },
+  {
+    "id": 629,
+    "template": "RND_JOIN",
+    "category": "Random Join",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/memberOf> ?o . ?o <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> ?z }"
+  },
+  {
+    "id": 630,
+    "template": "RND_UNION",
+    "category": "Random UNION",
+    "query": "SELECT ?s ?o WHERE { { ?s <http://www.w3.org/2000/01/rdf-schema#label> ?o } UNION { ?s <http://example.org/developedBy> ?o } }"
+  },
+  {
+    "id": 631,
+    "template": "RND_UNION",
+    "category": "Random UNION",
+    "query": "SELECT ?s ?o WHERE { { ?s <http://example.org/locatedIn> ?o } UNION { ?s <http://example.org/worksFor> ?o } }"
+  },
+  {
+    "id": 632,
+    "template": "RND_JOIN",
+    "category": "Random Join",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/locatedIn> ?o . ?o <http://www.w3.org/2000/01/rdf-schema#label> ?z }"
+  },
+  {
+    "id": 633,
+    "template": "RND_OPTIONAL",
+    "category": "Random OPTIONAL",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/knows> ?o . OPTIONAL { ?o <http://example.org/contains> ?z } }"
+  },
+  {
+    "id": 634,
+    "template": "RND_UNION",
+    "category": "Random UNION",
+    "query": "SELECT ?s ?o WHERE { { ?s <http://example.org/memberOf> ?o } UNION { ?s <http://example.org/knows> ?o } }"
+  },
+  {
+    "id": 635,
+    "template": "RND_OPTIONAL",
+    "category": "Random OPTIONAL",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/collaboratesWith> ?o . OPTIONAL { ?o <http://example.org/worksFor> ?z } }"
+  },
+  {
+    "id": 636,
+    "template": "RND_UNION",
+    "category": "Random UNION",
+    "query": "SELECT ?s ?o WHERE { { ?s <http://example.org/collaboratesWith> ?o } UNION { ?s <http://example.org/memberOf> ?o } }"
+  },
+  {
+    "id": 637,
+    "template": "RND_UNION",
+    "category": "Random UNION",
+    "query": "SELECT ?s ?o WHERE { { ?s <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> ?o } UNION { ?s <http://example.org/reportsTo> ?o } }"
+  },
+  {
+    "id": 638,
+    "template": "RND_UNION",
+    "category": "Random UNION",
+    "query": "SELECT ?s ?o WHERE { { ?s <http://example.org/reportsTo> ?o } UNION { ?s <http://example.org/knows> ?o } }"
+  },
+  {
+    "id": 639,
+    "template": "RND_OPTIONAL",
+    "category": "Random OPTIONAL",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/collaboratesWith> ?o . OPTIONAL { ?o <http://example.org/contains> ?z } }"
+  },
+  {
+    "id": 640,
+    "template": "RND_UNION",
+    "category": "Random UNION",
+    "query": "SELECT ?s ?o WHERE { { ?s <http://example.org/knows> ?o } UNION { ?s <http://example.org/collaboratesWith> ?o } }"
+  },
+  {
+    "id": 641,
+    "template": "RND_JOIN",
+    "category": "Random Join",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/manages> ?o . ?o <http://example.org/worksFor> ?z }"
+  },
+  {
+    "id": 642,
+    "template": "RND_OPTIONAL",
+    "category": "Random OPTIONAL",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/developedBy> ?o . OPTIONAL { ?o <http://example.org/collaboratesWith> ?z } }"
+  },
+  {
+    "id": 643,
+    "template": "RND_UNION",
+    "category": "Random UNION",
+    "query": "SELECT ?s ?o WHERE { { ?s <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> ?o } UNION { ?s <http://example.org/manages> ?o } }"
+  },
+  {
+    "id": 644,
+    "template": "RND_OPTIONAL",
+    "category": "Random OPTIONAL",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://www.w3.org/2000/01/rdf-schema#label> ?o . OPTIONAL { ?o <http://example.org/contains> ?z } }"
+  },
+  {
+    "id": 645,
+    "template": "RND_JOIN",
+    "category": "Random Join",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/knows> ?o . ?o <http://www.w3.org/2000/01/rdf-schema#label> ?z }"
+  },
+  {
+    "id": 646,
+    "template": "RND_JOIN",
+    "category": "Random Join",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/memberOf> ?o . ?o <http://example.org/developedBy> ?z }"
+  },
+  {
+    "id": 647,
+    "template": "RND_JOIN",
+    "category": "Random Join",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/memberOf> ?o . ?o <http://example.org/fundedBy> ?z }"
+  },
+  {
+    "id": 648,
+    "template": "RND_JOIN",
+    "category": "Random Join",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/memberOf> ?o . ?o <http://example.org/manages> ?z }"
+  },
+  {
+    "id": 649,
+    "template": "RND_UNION",
+    "category": "Random UNION",
+    "query": "SELECT ?s ?o WHERE { { ?s <http://example.org/memberOf> ?o } UNION { ?s <http://example.org/contains> ?o } }"
+  },
+  {
+    "id": 650,
+    "template": "RND_OPTIONAL",
+    "category": "Random OPTIONAL",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/reportsTo> ?o . OPTIONAL { ?o <http://example.org/worksFor> ?z } }"
+  },
+  {
+    "id": 651,
+    "template": "RND_OPTIONAL",
+    "category": "Random OPTIONAL",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/locatedIn> ?o . OPTIONAL { ?o <http://example.org/reportsTo> ?z } }"
+  },
+  {
+    "id": 652,
+    "template": "RND_OPTIONAL",
+    "category": "Random OPTIONAL",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/fundedBy> ?o . OPTIONAL { ?o <http://example.org/memberOf> ?z } }"
+  },
+  {
+    "id": 653,
+    "template": "RND_JOIN",
+    "category": "Random Join",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/fundedBy> ?o . ?o <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> ?z }"
+  },
+  {
+    "id": 654,
+    "template": "RND_OPTIONAL",
+    "category": "Random OPTIONAL",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> ?o . OPTIONAL { ?o <http://example.org/knows> ?z } }"
+  },
+  {
+    "id": 655,
+    "template": "RND_UNION",
+    "category": "Random UNION",
+    "query": "SELECT ?s ?o WHERE { { ?s <http://example.org/developedBy> ?o } UNION { ?s <http://example.org/reportsTo> ?o } }"
+  },
+  {
+    "id": 656,
+    "template": "RND_OPTIONAL",
+    "category": "Random OPTIONAL",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/knows> ?o . OPTIONAL { ?o <http://example.org/knows> ?z } }"
+  },
+  {
+    "id": 657,
+    "template": "RND_JOIN",
+    "category": "Random Join",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/manages> ?o . ?o <http://example.org/fundedBy> ?z }"
+  },
+  {
+    "id": 658,
+    "template": "RND_JOIN",
+    "category": "Random Join",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/knows> ?o . ?o <http://example.org/fundedBy> ?z }"
+  },
+  {
+    "id": 659,
+    "template": "RND_OPTIONAL",
+    "category": "Random OPTIONAL",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/worksFor> ?o . OPTIONAL { ?o <http://example.org/developedBy> ?z } }"
+  },
+  {
+    "id": 660,
+    "template": "RND_JOIN",
+    "category": "Random Join",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/locatedIn> ?o . ?o <http://example.org/fundedBy> ?z }"
+  },
+  {
+    "id": 661,
+    "template": "RND_JOIN",
+    "category": "Random Join",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/knows> ?o . ?o <http://example.org/reportsTo> ?z }"
+  },
+  {
+    "id": 662,
+    "template": "RND_OPTIONAL",
+    "category": "Random OPTIONAL",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/locatedIn> ?o . OPTIONAL { ?o <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> ?z } }"
+  },
+  {
+    "id": 663,
+    "template": "RND_UNION",
+    "category": "Random UNION",
+    "query": "SELECT ?s ?o WHERE { { ?s <http://www.w3.org/2000/01/rdf-schema#label> ?o } UNION { ?s <http://example.org/knows> ?o } }"
+  },
+  {
+    "id": 664,
+    "template": "RND_OPTIONAL",
+    "category": "Random OPTIONAL",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> ?o . OPTIONAL { ?o <http://example.org/memberOf> ?z } }"
+  },
+  {
+    "id": 665,
+    "template": "RND_OPTIONAL",
+    "category": "Random OPTIONAL",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/contains> ?o . OPTIONAL { ?o <http://www.w3.org/2000/01/rdf-schema#label> ?z } }"
+  }
+]

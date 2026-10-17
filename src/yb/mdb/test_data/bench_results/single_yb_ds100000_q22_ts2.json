@@ -1,0 +1,200 @@
+{
+  "db": "yb",
+  "dataset": "ds100000",
+  "num_queries": 22,
+  "tservers": 2,
+  "import_time_s": 818.7071063518524,
+  "times_ms": [
+    144878.12995910645,
+    140890.69175720215,
+    150276.9136428833,
+    143792.58370399475,
+    151113.6817932129,
+    148015.13242721558,
+    152966.7775630951,
+    149319.9427127838,
+    146238.32201957703,
+    151602.67448425293,
+    159633.14962387085,
+    147044.5010662079,
+    167050.17161369324,
+    161918.053150177,
+    158837.6979827881,
+    160619.61436271667,
+    179562.42609024048,
+    164818.52555274963,
+    161696.5503692627,
+    161711.35902404785,
+    162745.16558647156,
+    160669.7542667389
+  ],
+  "errors": [],
+  "row_counts": [
+    496,
+    1,
+    525,
+    516,
+    10000,
+    10000,
+    20000,
+    525,
+    500,
+    467,
+    974,
+    948,
+    520,
+    475,
+    507,
+    481,
+    489,
+    5,
+    5,
+    100000,
+    250000,
+    10
+  ],
+  "details": [
+    {
+      "id": 1,
+      "template": "RND_BGP",
+      "category": "Random BGP",
+      "time_ms": 144878.12995910645
+    },
+    {
+      "id": 2,
+      "template": "RND_JOIN",
+      "category": "Random Join",
+      "time_ms": 140890.69175720215
+    },
+    {
+      "id": 3,
+      "template": "RND_FILTER_isIRI",
+      "category": "Random FILTER",
+      "time_ms": 150276.9136428833
+    },
+    {
+      "id": 4,
+      "template": "RND_FILTER_BOUND",
+      "category": "Random FILTER",
+      "time_ms": 143792.58370399475
+    },
+    {
+      "id": 5,
+      "template": "RND_FILTER_REGEX",
+      "category": "Random FILTER",
+      "time_ms": 151113.6817932129
+    },
+    {
+      "id": 6,
+      "template": "RND_FILTER_STRSTARTS",
+      "category": "Random FILTER",
+      "time_ms": 148015.13242721558
+    },
+    {
+      "id": 7,
+      "template": "RND_FILTER_CONTAINS",
+      "category": "Random FILTER",
+      "time_ms": 152966.7775630951
+    },
+    {
+      "id": 8,
+      "template": "RND_FILTER_eq",
+      "category": "Random FILTER",
+      "time_ms": 149319.9427127838
+    },
+    {
+      "id": 9,
+      "template": "RND_FILTER_sameTerm",
+      "category": "Random FILTER",
+      "time_ms": 146238.32201957703
+    },
+    {
+      "id": 10,
+      "template": "RND_OPTIONAL",
+      "category": "Random OPTIONAL",
+      "time_ms": 151602.67448425293
+    },
+    {
+      "id": 11,
+      "template": "RND_UNION",
+      "category": "Random UNION",
+      "time_ms": 159633.14962387085
+    },
+    {
+      "id": 12,
+      "template": "RND_PATH_star",
+      "category": "Random Path",
+      "time_ms": 147044.5010662079
+    },
+    {
+      "id": 13,
+      "template": "RND_PATH_plus",
+      "category": "Random Path",
+      "time_ms": 167050.17161369324
+    },
+    {
+      "id": 14,
+      "template": "RND_PATH_inverse",
+      "category": "Random Path",
+      "time_ms": 161918.053150177
+    },
+    {
+      "id": 15,
+      "template": "RND_ORDER_ASC",
+      "category": "Random ORDER",
+      "time_ms": 158837.6979827881
+    },
+    {
+      "id": 16,
+      "template": "RND_ORDER_DESC",
+      "category": "Random ORDER",
+      "time_ms": 160619.61436271667
+    },
+    {
+      "id": 17,
+      "template": "RND_DISTINCT",
+      "category": "Random DISTINCT",
+      "time_ms": 179562.42609024048
+    },
+    {
+      "id": 18,
+      "template": "RND_LIMIT",
+      "category": "Random LIMIT",
+      "time_ms": 164818.52555274963
+    },
+    {
+      "id": 19,
+      "template": "RND_LIMIT_OFFSET",
+      "category": "Random LIMIT",
+      "time_ms": 161696.5503692627
+    },
+    {
+      "id": 20,
+      "template": "RND_RDF_TYPE",
+      "category": "Random BGP",
+      "time_ms": 161711.35902404785
+    },
+    {
+      "id": 21,
+      "template": "RND_ASK",
+      "category": "Random ASK",
+      "time_ms": 162745.16558647156
+    },
+    {
+      "id": 22,
+      "template": "RND_SELECT_ALL",
+      "category": "Random SELECT",
+      "time_ms": 160669.7542667389
+    }
+  ],
+  "stats": {
+    "count": 22,
+    "min": 140890.69175720215,
+    "max": 179562.42609024048,
+    "mean": 155700.0826705586,
+    "p50": 155902.2377729416,
+    "p90": 164611.18955612183,
+    "p95": 166938.58931064606,
+    "p99": 176934.85265016556
+  }
+}

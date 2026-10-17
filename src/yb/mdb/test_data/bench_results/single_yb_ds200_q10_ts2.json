@@ -1,0 +1,104 @@
+{
+  "db": "yb",
+  "dataset": "ds200",
+  "num_queries": 10,
+  "tservers": 2,
+  "import_time_s": 1.7205049991607666,
+  "times_ms": [
+    176.44381523132324,
+    178.94649505615234,
+    188.9958381652832,
+    180.19795417785645,
+    179.2898178100586,
+    166.8102741241455,
+    170.1943874359131,
+    178.18236351013184,
+    172.6207733154297,
+    172.58954048156738
+  ],
+  "errors": [],
+  "row_counts": [
+    19,
+    8,
+    0,
+    15,
+    200,
+    20,
+    11,
+    8,
+    24,
+    10
+  ],
+  "details": [
+    {
+      "id": 655,
+      "template": "RND_UNION",
+      "category": "Random UNION",
+      "time_ms": 176.44381523132324
+    },
+    {
+      "id": 115,
+      "template": "RND_LIMIT",
+      "category": "Random LIMIT",
+      "time_ms": 178.94649505615234
+    },
+    {
+      "id": 26,
+      "template": "RND_JOIN",
+      "category": "Random Join",
+      "time_ms": 188.9958381652832
+    },
+    {
+      "id": 282,
+      "template": "RND_LIMIT",
+      "category": "Random LIMIT",
+      "time_ms": 180.19795417785645
+    },
+    {
+      "id": 251,
+      "template": "RND_ORDER_DESC",
+      "category": "Random ORDER",
+      "time_ms": 179.2898178100586
+    },
+    {
+      "id": 229,
+      "template": "RND_UNION",
+      "category": "Random UNION",
+      "time_ms": 166.8102741241455
+    },
+    {
+      "id": 143,
+      "template": "RND_FILTER_sameTerm",
+      "category": "Random FILTER",
+      "time_ms": 170.1943874359131
+    },
+    {
+      "id": 105,
+      "template": "RND_FILTER_eq",
+      "category": "Random FILTER",
+      "time_ms": 178.18236351013184
+    },
+    {
+      "id": 559,
+      "template": "RND_UNION",
+      "category": "Random UNION",
+      "time_ms": 172.6207733154297
+    },
+    {
+      "id": 90,
+      "template": "RND_PATH_inverse",
+      "category": "Random Path",
+      "time_ms": 172.58954048156738
+    }
+  ],
+  "stats": {
+    "count": 10,
+    "min": 166.8102741241455,
+    "max": 188.9958381652832,
+    "mean": 176.42712593078613,
+    "p50": 177.31308937072754,
+    "p90": 181.07774257659912,
+    "p95": 185.03679037094116,
+    "p99": 188.2040286064148
+  }
+}

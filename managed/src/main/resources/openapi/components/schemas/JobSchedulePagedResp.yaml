@@ -1,0 +1,5 @@
+title: JobSchedulePagedResp
+description: Paged API query response for job schedule.
+type: object
+x-data-container: PaginationResp
+x-data-item: JobSchedule

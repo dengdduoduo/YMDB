@@ -1,0 +1,10 @@
+title: UniverseQueryLogsExporterConfig
+type: object
+description: |
+  UniverseQueryLogsExporterConfig
+
+  Universe Logs Exporter Config. Part of QueryLogConfig.
+allOf:
+  - $ref: "./UniverseExporterConfig.yaml"
+  - $ref: "./BatchedExporterConfig.yaml"
+  - $ref: "./MemoryLimitedExporterConfig.yaml"

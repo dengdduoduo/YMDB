@@ -1,0 +1,1624 @@
+{
+  "db": "yb",
+  "dataset": "ds100",
+  "num_queries": 200,
+  "tservers": 2,
+  "import_time_s": 1.129805326461792,
+  "times_ms": [
+    158.02574157714844,
+    255.97143173217773,
+    169.80481147766113,
+    162.97173500061035,
+    166.02373123168945,
+    179.9941062927246,
+    184.50593948364258,
+    192.98696517944336,
+    234.45367813110352,
+    187.1049404144287,
+    173.3992099761963,
+    194.79703903198242,
+    185.20498275756836,
+    175.99916458129883,
+    186.24329566955566,
+    184.5262050628662,
+    181.6568374633789,
+    183.9289665222168,
+    166.6262149810791,
+    174.6540069580078,
+    179.28528785705566,
+    177.76870727539062,
+    167.10758209228516,
+    182.8460693359375,
+    180.0532341003418,
+    170.63665390014648,
+    179.84294891357422,
+    191.40076637268066,
+    163.7442111968994,
+    157.71770477294922,
+    156.92925453186035,
+    149.6272087097168,
+    167.46139526367188,
+    180.81998825073242,
+    164.7660732269287,
+    155.1196575164795,
+    151.2773036956787,
+    155.24601936340332,
+    167.20056533813477,
+    155.75385093688965,
+    162.01519966125488,
+    151.72219276428223,
+    155.60007095336914,
+    148.42915534973145,
+    151.2002944946289,
+    155.52616119384766,
+    155.9886932373047,
+    164.56222534179688,
+    154.1590690612793,
+    149.2929458618164,
+    173.2487678527832,
+    154.04558181762695,
+    175.9192943572998,
+    164.69335556030273,
+    153.1660556793213,
+    164.54076766967773,
+    161.9548797607422,
+    160.9969139099121,
+    153.30243110656738,
+    153.31125259399414,
+    160.77446937561035,
+    167.7379608154297,
+    156.33511543273926,
+    154.42395210266113,
+    168.13397407531738,
+    154.07180786132812,
+    151.1979103088379,
+    159.6698760986328,
+    158.07628631591797,
+    164.21079635620117,
+    153.95855903625488,
+    152.68898010253906,
+    159.0273380279541,
+    163.0685329437256,
+    167.10209846496582,
+    175.25386810302734,
+    167.42944717407227,
+    160.36629676818848,
+    155.28345108032227,
+    153.2905101776123,
+    152.51660346984863,
+    151.23486518859863,
+    164.60275650024414,
+    155.53784370422363,
+    163.19990158081055,
+    151.6423225402832,
+    155.1671028137207,
+    152.79412269592285,
+    165.01641273498535,
+    167.95921325683594,
+    160.43448448181152,
+    151.98707580566406,
+    160.75825691223145,
+    149.90973472595215,
+    149.72591400146484,
+    164.0455722808838,
+    151.4749526977539,
+    158.77795219421387,
+    150.01773834228516,
+    157.1207046508789,
+    151.3373851776123,
+    161.84139251708984,
+    169.33226585388184,
+    201.0962963104248,
+    163.0399227142334,
+    166.0618782043457,
+    161.6992950439453,
+    153.80287170410156,
+    153.84554862976074,
+    158.44440460205078,
+    162.13297843933105,
+    172.49274253845215,
+    153.65839004516602,
+    148.25105667114258,
+    157.17673301696777,
+    149.93524551391602,
+    164.3838882446289,
+    159.89375114440918,
+    150.18868446350098,
+    153.5327434539795,
+    167.63734817504883,
+    147.80187606811523,
+    153.05304527282715,
+    162.8103256225586,
+    158.97011756896973,
+    154.44159507751465,
+    169.2516803741455,
+    150.2382755279541,
+    160.59303283691406,
+    159.66796875,
+    170.82929611206055,
+    157.41467475891113,
+    237.80202865600586,
+    161.86952590942383,
+    165.69018363952637,
+    154.1311740875244,
+    159.437894821167,
+    156.965970993042,
+    163.710355758667,
+    162.72926330566406,
+    155.58099746704102,
+    157.09710121154785,
+    156.55040740966797,
+    174.11041259765625,
+    160.39204597473145,
+    169.56686973571777,
+    146.90589904785156,
+    154.2990207672119,
+    156.05950355529785,
+    152.7094841003418,
+    161.10658645629883,
+    163.15746307373047,
+    158.67853164672852,
+    157.6852798461914,
+    149.19734001159668,
+    158.35881233215332,
+    153.20420265197754,
+    164.87765312194824,
+    155.29823303222656,
+    166.13316535949707,
+    154.21080589294434,
+    146.78502082824707,
+    150.0227451324463,
+    154.95014190673828,
+    151.08036994934082,
+    157.83262252807617,
+    160.00699996948242,
+    191.4823055267334,
+    164.80183601379395,
+    153.92136573791504,
+    156.7375659942627,
+    165.34709930419922,
+    157.58109092712402,
+    174.23176765441895,
+    156.7552089691162,
+    148.68521690368652,
+    159.81245040893555,
+    155.41625022888184,
+    150.42686462402344,
+    151.4565944671631,
+    176.1188507080078,
+    152.66752243041992,
+    155.81369400024414,
+    156.4791202545166,
+    163.76996040344238,
+    176.62763595581055,
+    167.4478054046631,
+    168.45011711120605,
+    162.80150413513184,
+    158.8423252105713,
+    157.48047828674316,
+    159.20257568359375,
+    154.00362014770508,
+    154.98089790344238,
+    170.75681686401367,
+    159.2578887939453,
+    153.3982753753662,
+    156.27360343933105,
+    153.50008010864258,
+    154.79063987731934
+  ],
+  "errors": [],
+  "row_counts": [
+    10,
+    100,
+    20,
+    0,
+    10,
+    20,
+    5,
+    13,
+    10,
+    0,
+    11,
+    10,
+    5,
+    10,
+    10,
+    5,
+    10,
+    13,
+    0,
+    10,
+    10,
+    0,
+    11,
+    100,
+    10,
+    13,
+    10,
+    6,
+    10,
+    100,
+    100,
+    24,
+    111,
+    100,
+    10,
+    10,
+    6,
+    12,
+    13,
+    110,
+    10,
+    100,
+    100,
+    200,
+    5,
+    10,
+    200,
+    100,
+    10,
+    10,
+    10,
+    1,
+    0,
+    1,
+    10,
+    5,
+    0,
+    100,
+    0,
+    17,
+    1,
+    10,
+    10,
+    110,
+    6,
+    22,
+    10,
+    13,
+    10,
+    50,
+    11,
+    10,
+    26,
+    10,
+    6,
+    10,
+    100,
+    113,
+    10,
+    113,
+    100,
+    16,
+    0,
+    100,
+    11,
+    10,
+    11,
+    13,
+    100,
+    0,
+    100,
+    20,
+    11,
+    106,
+    5,
+    5,
+    10,
+    22,
+    26,
+    106,
+    21,
+    23,
+    111,
+    10,
+    20,
+    2,
+    10,
+    2,
+    6,
+    0,
+    10,
+    100,
+    5,
+    1,
+    13,
+    6,
+    10,
+    20,
+    11,
+    113,
+    23,
+    5,
+    100,
+    10,
+    11,
+    110,
+    10,
+    0,
+    6,
+    10,
+    10,
+    1,
+    10,
+    10,
+    10,
+    13,
+    6,
+    13,
+    3,
+    17,
+    13,
+    100,
+    10,
+    6,
+    111,
+    21,
+    10,
+    20,
+    13,
+    106,
+    10,
+    110,
+    11,
+    106,
+    6,
+    3,
+    19,
+    100,
+    11,
+    7,
+    6,
+    0,
+    13,
+    6,
+    20,
+    10,
+    10,
+    6,
+    1,
+    0,
+    2,
+    2,
+    0,
+    11,
+    10,
+    2,
+    110,
+    1,
+    6,
+    10,
+    10,
+    5,
+    200,
+    100,
+    11,
+    6,
+    11,
+    10,
+    10,
+    50,
+    1,
+    10,
+    1,
+    100,
+    5,
+    0,
+    16,
+    2,
+    10,
+    20
+  ],
+  "details": [
+    {
+      "id": 58,
+      "template": "RND_LIMIT",
+      "category": "Random LIMIT",
+      "time_ms": 158.02574157714844
+    },
+    {
+      "id": 13,
+      "template": "RND_BGP",
+      "category": "Random BGP",
+      "time_ms": 255.97143173217773
+    },
+    {
+      "id": 141,
+      "template": "RND_FILTER_CONTAINS",
+      "category": "Random FILTER",
+      "time_ms": 169.80481147766113
+    },
+    {
+      "id": 126,
+      "template": "RND_FILTER_CONTAINS",
+      "category": "Random FILTER",
+      "time_ms": 162.97173500061035
+    },
+    {
+      "id": 115,
+      "template": "RND_FILTER_REGEX",
+      "category": "Random FILTER",
+      "time_ms": 166.02373123168945
+    },
+    {
+      "id": 72,
+      "template": "RND_FILTER_CONTAINS",
+      "category": "Random FILTER",
+      "time_ms": 179.9941062927246
+    },
+    {
+      "id": 53,
+      "template": "RND_LIMIT_OFFSET",
+      "category": "Random LIMIT",
+      "time_ms": 184.50593948364258
+    },
+    {
+      "id": 280,
+      "template": "RND_OPTIONAL",
+      "category": "Random OPTIONAL",
+      "time_ms": 192.98696517944336
+    },
+    {
+      "id": 45,
+      "template": "RND_FILTER_REGEX",
+      "category": "Random FILTER",
+      "time_ms": 234.45367813110352
+    },
+    {
+      "id": 217,
+      "template": "RND_JOIN",
+      "category": "Random Join",
+      "time_ms": 187.1049404144287
+    },
+    {
+      "id": 17,
+      "template": "RND_PATH_plus",
+      "category": "Random Path",
+      "time_ms": 173.3992099761963
+    },
+    {
+      "id": 16,
+      "template": "RND_FILTER_CONTAINS",
+      "category": "Random FILTER",
+      "time_ms": 194.79703903198242
+    },
+    {
+      "id": 48,
+      "template": "RND_LIMIT",
+      "category": "Random LIMIT",
+      "time_ms": 185.20498275756836
+    },
+    {
+      "id": 112,
+      "template": "RND_BGP",
+      "category": "Random BGP",
+      "time_ms": 175.99916458129883
+    },
+    {
+      "id": 120,
+      "template": "RND_FILTER_STRSTARTS",
+      "category": "Random FILTER",
+      "time_ms": 186.24329566955566
+    },
+    {
+      "id": 259,
+      "template": "RND_LIMIT_OFFSET",
+      "category": "Random LIMIT",
+      "time_ms": 184.5262050628662
+    },
+    {
+      "id": 14,
+      "template": "RND_FILTER_STRSTARTS",
+      "category": "Random FILTER",
+      "time_ms": 181.6568374633789
+    },
+    {
+      "id": 102,
+      "template": "RND_ORDER_ASC",
+      "category": "Random ORDER",
+      "time_ms": 183.9289665222168
+    },
+    {
+      "id": 297,
+      "template": "RND_JOIN",
+      "category": "Random Join",
+      "time_ms": 166.6262149810791
+    },
+    {
+      "id": 215,
+      "template": "RND_LIMIT",
+      "category": "Random LIMIT",
+      "time_ms": 174.6540069580078
+    },
+    {
+      "id": 113,
+      "template": "RND_FILTER_REGEX",
+      "category": "Random FILTER",
+      "time_ms": 179.28528785705566
+    },
+    {
+      "id": 230,
+      "template": "RND_JOIN",
+      "category": "Random Join",
+      "time_ms": 177.76870727539062
+    },
+    {
+      "id": 143,
+      "template": "RND_ORDER_ASC",
+      "category": "Random ORDER",
+      "time_ms": 167.10758209228516
+    },
+    {
+      "id": 4,
+      "template": "RND_FILTER_BOUND",
+      "category": "Random FILTER",
+      "time_ms": 182.8460693359375
+    },
+    {
+      "id": 82,
+      "template": "RND_PATH_inverse",
+      "category": "Random Path",
+      "time_ms": 180.0532341003418
+    },
+    {
+      "id": 295,
+      "template": "RND_OPTIONAL",
+      "category": "Random OPTIONAL",
+      "time_ms": 170.63665390014648
+    },
+    {
+      "id": 175,
+      "template": "RND_FILTER_REGEX",
+      "category": "Random FILTER",
+      "time_ms": 179.84294891357422
+    },
+    {
+      "id": 282,
+      "template": "RND_JOIN",
+      "category": "Random Join",
+      "time_ms": 191.40076637268066
+    },
+    {
+      "id": 80,
+      "template": "RND_FILTER_eq",
+      "category": "Random FILTER",
+      "time_ms": 163.7442111968994
+    },
+    {
+      "id": 111,
+      "template": "RND_PATH_inverse",
+      "category": "Random Path",
+      "time_ms": 157.71770477294922
+    },
+    {
+      "id": 173,
+      "template": "RND_ORDER_DESC",
+      "category": "Random ORDER",
+      "time_ms": 156.92925453186035
+    },
+    {
+      "id": 298,
+      "template": "RND_UNION",
+      "category": "Random UNION",
+      "time_ms": 149.6272087097168
+    },
+    {
+      "id": 292,
+      "template": "RND_UNION",
+      "category": "Random UNION",
+      "time_ms": 167.46139526367188
+    },
+    {
+      "id": 195,
+      "template": "RND_OPTIONAL",
+      "category": "Random OPTIONAL",
+      "time_ms": 180.81998825073242
+    },
+    {
+      "id": 50,
+      "template": "RND_FILTER_REGEX",
+      "category": "Random FILTER",
+      "time_ms": 164.7660732269287
+    },
+    {
+      "id": 184,
+      "template": "RND_FILTER_CONTAINS",
+      "category": "Random FILTER",
+      "time_ms": 155.1196575164795
+    },
+    {
+      "id": 177,
+      "template": "RND_OPTIONAL",
+      "category": "Random OPTIONAL",
+      "time_ms": 151.2773036956787
+    },
+    {
+      "id": 136,
+      "template": "RND_UNION",
+      "category": "Random UNION",
+      "time_ms": 155.24601936340332
+    },
+    {
+      "id": 23,
+      "template": "RND_FILTER_isIRI",
+      "category": "Random FILTER",
+      "time_ms": 167.20056533813477
+    },
+    {
+      "id": 236,
+      "template": "RND_UNION",
+      "category": "Random UNION",
+      "time_ms": 155.75385093688965
+    },
+    {
+      "id": 64,
+      "template": "RND_OPTIONAL",
+      "category": "Random OPTIONAL",
+      "time_ms": 162.01519966125488
+    },
+    {
+      "id": 194,
+      "template": "RND_OPTIONAL",
+      "category": "Random OPTIONAL",
+      "time_ms": 151.72219276428223
+    },
+    {
+      "id": 41,
+      "template": "RND_RDF_TYPE",
+      "category": "Random BGP",
+      "time_ms": 155.60007095336914
+    },
+    {
+      "id": 151,
+      "template": "RND_UNION",
+      "category": "Random UNION",
+      "time_ms": 148.42915534973145
+    },
+    {
+      "id": 186,
+      "template": "RND_LIMIT",
+      "category": "Random LIMIT",
+      "time_ms": 151.2002944946289
+    },
+    {
+      "id": 99,
+      "template": "RND_LIMIT",
+      "category": "Random LIMIT",
+      "time_ms": 155.52616119384766
+    },
+    {
+      "id": 36,
+      "template": "RND_UNION",
+      "category": "Random UNION",
+      "time_ms": 155.9886932373047
+    },
+    {
+      "id": 24,
+      "template": "RND_OPTIONAL",
+      "category": "Random OPTIONAL",
+      "time_ms": 164.56222534179688
+    },
+    {
+      "id": 117,
+      "template": "RND_OPTIONAL",
+      "category": "Random OPTIONAL",
+      "time_ms": 154.1590690612793
+    },
+    {
+      "id": 198,
+      "template": "RND_LIMIT",
+      "category": "Random LIMIT",
+      "time_ms": 149.2929458618164
+    },
+    {
+      "id": 75,
+      "template": "RND_FILTER_isIRI",
+      "category": "Random FILTER",
+      "time_ms": 173.2487678527832
+    },
+    {
+      "id": 253,
+      "template": "RND_JOIN",
+      "category": "Random Join",
+      "time_ms": 154.04558181762695
+    },
+    {
+      "id": 21,
+      "template": "RND_JOIN",
+      "category": "Random Join",
+      "time_ms": 175.9192943572998
+    },
+    {
+      "id": 219,
+      "template": "RND_JOIN",
+      "category": "Random Join",
+      "time_ms": 164.69335556030273
+    },
+    {
+      "id": 60,
+      "template": "RND_LIMIT",
+      "category": "Random LIMIT",
+      "time_ms": 153.1660556793213
+    },
+    {
+      "id": 222,
+      "template": "RND_LIMIT",
+      "category": "Random LIMIT",
+      "time_ms": 164.54076766967773
+    },
+    {
+      "id": 26,
+      "template": "RND_JOIN",
+      "category": "Random Join",
+      "time_ms": 161.9548797607422
+    },
+    {
+      "id": 98,
+      "template": "RND_PATH_inverse",
+      "category": "Random Path",
+      "time_ms": 160.9969139099121
+    },
+    {
+      "id": 299,
+      "template": "RND_JOIN",
+      "category": "Random Join",
+      "time_ms": 153.30243110656738
+    },
+    {
+      "id": 256,
+      "template": "RND_UNION",
+      "category": "Random UNION",
+      "time_ms": 153.31125259399414
+    },
+    {
+      "id": 163,
+      "template": "RND_JOIN",
+      "category": "Random Join",
+      "time_ms": 160.77446937561035
+    },
+    {
+      "id": 214,
+      "template": "RND_LIMIT",
+      "category": "Random LIMIT",
+      "time_ms": 167.7379608154297
+    },
+    {
+      "id": 94,
+      "template": "RND_LIMIT",
+      "category": "Random LIMIT",
+      "time_ms": 156.33511543273926
+    },
+    {
+      "id": 42,
+      "template": "RND_UNION",
+      "category": "Random UNION",
+      "time_ms": 154.42395210266113
+    },
+    {
+      "id": 95,
+      "template": "RND_FILTER_eq",
+      "category": "Random FILTER",
+      "time_ms": 168.13397407531738
+    },
+    {
+      "id": 91,
+      "template": "RND_UNION",
+      "category": "Random UNION",
+      "time_ms": 154.07180786132812
+    },
+    {
+      "id": 54,
+      "template": "RND_LIMIT_OFFSET",
+      "category": "Random LIMIT",
+      "time_ms": 151.1979103088379
+    },
+    {
+      "id": 172,
+      "template": "RND_JOIN",
+      "category": "Random Join",
+      "time_ms": 159.6698760986328
+    },
+    {
+      "id": 69,
+      "template": "RND_FILTER_REGEX",
+      "category": "Random FILTER",
+      "time_ms": 158.07628631591797
+    },
+    {
+      "id": 180,
+      "template": "RND_LIMIT",
+      "category": "Random LIMIT",
+      "time_ms": 164.21079635620117
+    },
+    {
+      "id": 278,
+      "template": "RND_JOIN",
+      "category": "Random Join",
+      "time_ms": 153.95855903625488
+    },
+    {
+      "id": 166,
+      "template": "RND_ORDER_ASC",
+      "category": "Random ORDER",
+      "time_ms": 152.68898010253906
+    },
+    {
+      "id": 19,
+      "template": "RND_PATH_star",
+      "category": "Random Path",
+      "time_ms": 159.0273380279541
+    },
+    {
+      "id": 156,
+      "template": "RND_FILTER_STRSTARTS",
+      "category": "Random FILTER",
+      "time_ms": 163.0685329437256
+    },
+    {
+      "id": 244,
+      "template": "RND_OPTIONAL",
+      "category": "Random OPTIONAL",
+      "time_ms": 167.10209846496582
+    },
+    {
+      "id": 44,
+      "template": "RND_ORDER_DESC",
+      "category": "Random ORDER",
+      "time_ms": 175.25386810302734
+    },
+    {
+      "id": 137,
+      "template": "RND_ORDER_ASC",
+      "category": "Random ORDER",
+      "time_ms": 167.42944717407227
+    },
+    {
+      "id": 187,
+      "template": "RND_UNION",
+      "category": "Random UNION",
+      "time_ms": 160.36629676818848
+    },
+    {
+      "id": 63,
+      "template": "RND_FILTER_BOUND",
+      "category": "Random FILTER",
+      "time_ms": 155.28345108032227
+    },
+    {
+      "id": 241,
+      "template": "RND_UNION",
+      "category": "Random UNION",
+      "time_ms": 153.2905101776123
+    },
+    {
+      "id": 119,
+      "template": "RND_FILTER_eq",
+      "category": "Random FILTER",
+      "time_ms": 152.51660346984863
+    },
+    {
+      "id": 247,
+      "template": "RND_UNION",
+      "category": "Random UNION",
+      "time_ms": 151.23486518859863
+    },
+    {
+      "id": 70,
+      "template": "RND_LIMIT_OFFSET",
+      "category": "Random LIMIT",
+      "time_ms": 164.60275650024414
+    },
+    {
+      "id": 164,
+      "template": "RND_OPTIONAL",
+      "category": "Random OPTIONAL",
+      "time_ms": 155.53784370422363
+    },
+    {
+      "id": 268,
+      "template": "RND_OPTIONAL",
+      "category": "Random OPTIONAL",
+      "time_ms": 163.19990158081055
+    },
+    {
+      "id": 277,
+      "template": "RND_OPTIONAL",
+      "category": "Random OPTIONAL",
+      "time_ms": 151.6423225402832
+    },
+    {
+      "id": 57,
+      "template": "RND_ORDER_DESC",
+      "category": "Random ORDER",
+      "time_ms": 155.1671028137207
+    },
+    {
+      "id": 176,
+      "template": "RND_OPTIONAL",
+      "category": "Random OPTIONAL",
+      "time_ms": 152.79412269592285
+    },
+    {
+      "id": 84,
+      "template": "RND_ORDER_ASC",
+      "category": "Random ORDER",
+      "time_ms": 165.01641273498535
+    },
+    {
+      "id": 197,
+      "template": "RND_LIMIT_OFFSET",
+      "category": "Random LIMIT",
+      "time_ms": 167.95921325683594
+    },
+    {
+      "id": 199,
+      "template": "RND_OPTIONAL",
+      "category": "Random OPTIONAL",
+      "time_ms": 160.43448448181152
+    },
+    {
+      "id": 15,
+      "template": "RND_UNION",
+      "category": "Random UNION",
+      "time_ms": 151.98707580566406
+    },
+    {
+      "id": 59,
+      "template": "RND_LIMIT",
+      "category": "Random LIMIT",
+      "time_ms": 160.75825691223145
+    },
+    {
+      "id": 211,
+      "template": "RND_UNION",
+      "category": "Random UNION",
+      "time_ms": 149.90973472595215
+    },
+    {
+      "id": 9,
+      "template": "RND_LIMIT",
+      "category": "Random LIMIT",
+      "time_ms": 149.72591400146484
+    },
+    {
+      "id": 207,
+      "template": "RND_LIMIT",
+      "category": "Random LIMIT",
+      "time_ms": 164.0455722808838
+    },
+    {
+      "id": 81,
+      "template": "RND_DISTINCT",
+      "category": "Random DISTINCT",
+      "time_ms": 151.4749526977539
+    },
+    {
+      "id": 103,
+      "template": "RND_PATH_star",
+      "category": "Random Path",
+      "time_ms": 158.77795219421387
+    },
+    {
+      "id": 265,
+      "template": "RND_UNION",
+      "category": "Random UNION",
+      "time_ms": 150.01773834228516
+    },
+    {
+      "id": 294,
+      "template": "RND_UNION",
+      "category": "Random UNION",
+      "time_ms": 157.1207046508789
+    },
+    {
+      "id": 55,
+      "template": "RND_UNION",
+      "category": "Random UNION",
+      "time_ms": 151.3373851776123
+    },
+    {
+      "id": 146,
+      "template": "RND_UNION",
+      "category": "Random UNION",
+      "time_ms": 161.84139251708984
+    },
+    {
+      "id": 269,
+      "template": "RND_UNION",
+      "category": "Random UNION",
+      "time_ms": 169.33226585388184
+    },
+    {
+      "id": 208,
+      "template": "RND_LIMIT",
+      "category": "Random LIMIT",
+      "time_ms": 201.0962963104248
+    },
+    {
+      "id": 204,
+      "template": "RND_UNION",
+      "category": "Random UNION",
+      "time_ms": 163.0399227142334
+    },
+    {
+      "id": 168,
+      "template": "RND_JOIN",
+      "category": "Random Join",
+      "time_ms": 166.0618782043457
+    },
+    {
+      "id": 128,
+      "template": "RND_FILTER_sameTerm",
+      "category": "Random FILTER",
+      "time_ms": 161.6992950439453
+    },
+    {
+      "id": 287,
+      "template": "RND_JOIN",
+      "category": "Random Join",
+      "time_ms": 153.80287170410156
+    },
+    {
+      "id": 165,
+      "template": "RND_OPTIONAL",
+      "category": "Random OPTIONAL",
+      "time_ms": 153.84554862976074
+    },
+    {
+      "id": 118,
+      "template": "RND_JOIN",
+      "category": "Random Join",
+      "time_ms": 158.44440460205078
+    },
+    {
+      "id": 37,
+      "template": "RND_JOIN",
+      "category": "Random Join",
+      "time_ms": 162.13297843933105
+    },
+    {
+      "id": 68,
+      "template": "RND_FILTER_isIRI",
+      "category": "Random FILTER",
+      "time_ms": 172.49274253845215
+    },
+    {
+      "id": 258,
+      "template": "RND_LIMIT_OFFSET",
+      "category": "Random LIMIT",
+      "time_ms": 153.65839004516602
+    },
+    {
+      "id": 264,
+      "template": "RND_JOIN",
+      "category": "Random Join",
+      "time_ms": 148.25105667114258
+    },
+    {
+      "id": 144,
+      "template": "RND_LIMIT",
+      "category": "Random LIMIT",
+      "time_ms": 157.17673301696777
+    },
+    {
+      "id": 138,
+      "template": "RND_LIMIT",
+      "category": "Random LIMIT",
+      "time_ms": 149.93524551391602
+    },
+    {
+      "id": 193,
+      "template": "RND_OPTIONAL",
+      "category": "Random OPTIONAL",
+      "time_ms": 164.3838882446289
+    },
+    {
+      "id": 150,
+      "template": "RND_LIMIT_OFFSET",
+      "category": "Random LIMIT",
+      "time_ms": 159.89375114440918
+    },
+    {
+      "id": 110,
+      "template": "RND_JOIN",
+      "category": "Random Join",
+      "time_ms": 150.18868446350098
+    },
+    {
+      "id": 227,
+      "template": "RND_UNION",
+      "category": "Random UNION",
+      "time_ms": 153.5327434539795
+    },
+    {
+      "id": 209,
+      "template": "RND_UNION",
+      "category": "Random UNION",
+      "time_ms": 167.63734817504883
+    },
+    {
+      "id": 93,
+      "template": "RND_LIMIT",
+      "category": "Random LIMIT",
+      "time_ms": 147.80187606811523
+    },
+    {
+      "id": 218,
+      "template": "RND_OPTIONAL",
+      "category": "Random OPTIONAL",
+      "time_ms": 153.05304527282715
+    },
+    {
+      "id": 192,
+      "template": "RND_OPTIONAL",
+      "category": "Random OPTIONAL",
+      "time_ms": 162.8103256225586
+    },
+    {
+      "id": 131,
+      "template": "RND_LIMIT",
+      "category": "Random LIMIT",
+      "time_ms": 158.97011756896973
+    },
+    {
+      "id": 127,
+      "template": "RND_UNION",
+      "category": "Random UNION",
+      "time_ms": 154.44159507751465
+    },
+    {
+      "id": 257,
+      "template": "RND_OPTIONAL",
+      "category": "Random OPTIONAL",
+      "time_ms": 169.2516803741455
+    },
+    {
+      "id": 303,
+      "template": "RND_JOIN",
+      "category": "Random Join",
+      "time_ms": 150.2382755279541
+    },
+    {
+      "id": 29,
+      "template": "RND_FILTER_BOUND",
+      "category": "Random FILTER",
+      "time_ms": 160.59303283691406
+    },
+    {
+      "id": 40,
+      "template": "RND_FILTER_isIRI",
+      "category": "Random FILTER",
+      "time_ms": 159.66796875
+    },
+    {
+      "id": 161,
+      "template": "RND_FILTER_STRSTARTS",
+      "category": "Random FILTER",
+      "time_ms": 170.82929611206055
+    },
+    {
+      "id": 262,
+      "template": "RND_JOIN",
+      "category": "Random Join",
+      "time_ms": 157.41467475891113
+    },
+    {
+      "id": 109,
+      "template": "RND_DISTINCT",
+      "category": "Random DISTINCT",
+      "time_ms": 237.80202865600586
+    },
+    {
+      "id": 153,
+      "template": "RND_ORDER_ASC",
+      "category": "Random ORDER",
+      "time_ms": 161.86952590942383
+    },
+    {
+      "id": 205,
+      "template": "RND_BGP",
+      "category": "Random BGP",
+      "time_ms": 165.69018363952637
+    },
+    {
+      "id": 289,
+      "template": "RND_JOIN",
+      "category": "Random Join",
+      "time_ms": 154.1311740875244
+    },
+    {
+      "id": 223,
+      "template": "RND_ORDER_ASC",
+      "category": "Random ORDER",
+      "time_ms": 159.437894821167
+    },
+    {
+      "id": 171,
+      "template": "RND_OPTIONAL",
+      "category": "Random OPTIONAL",
+      "time_ms": 156.965970993042
+    },
+    {
+      "id": 290,
+      "template": "RND_JOIN",
+      "category": "Random Join",
+      "time_ms": 163.710355758667
+    },
+    {
+      "id": 267,
+      "template": "RND_UNION",
+      "category": "Random UNION",
+      "time_ms": 162.72926330566406
+    },
+    {
+      "id": 65,
+      "template": "RND_FILTER_eq",
+      "category": "Random FILTER",
+      "time_ms": 155.58099746704102
+    },
+    {
+      "id": 142,
+      "template": "RND_FILTER_BOUND",
+      "category": "Random FILTER",
+      "time_ms": 157.09710121154785
+    },
+    {
+      "id": 3,
+      "template": "RND_FILTER_eq",
+      "category": "Random FILTER",
+      "time_ms": 156.55040740966797
+    },
+    {
+      "id": 30,
+      "template": "RND_FILTER_sameTerm",
+      "category": "Random FILTER",
+      "time_ms": 174.11041259765625
+    },
+    {
+      "id": 189,
+      "template": "RND_UNION",
+      "category": "Random UNION",
+      "time_ms": 160.39204597473145
+    },
+    {
+      "id": 206,
+      "template": "RND_UNION",
+      "category": "Random UNION",
+      "time_ms": 169.56686973571777
+    },
+    {
+      "id": 88,
+      "template": "RND_ORDER_DESC",
+      "category": "Random ORDER",
+      "time_ms": 146.90589904785156
+    },
+    {
+      "id": 279,
+      "template": "RND_LIMIT",
+      "category": "Random LIMIT",
+      "time_ms": 154.2990207672119
+    },
+    {
+      "id": 76,
+      "template": "RND_BGP",
+      "category": "Random BGP",
+      "time_ms": 156.05950355529785
+    },
+    {
+      "id": 291,
+      "template": "RND_UNION",
+      "category": "Random UNION",
+      "time_ms": 152.7094841003418
+    },
+    {
+      "id": 274,
+      "template": "RND_OPTIONAL",
+      "category": "Random OPTIONAL",
+      "time_ms": 161.10658645629883
+    },
+    {
+      "id": 245,
+      "template": "RND_UNION",
+      "category": "Random UNION",
+      "time_ms": 163.15746307373047
+    },
+    {
+      "id": 1,
+      "template": "RND_FILTER_BOUND",
+      "category": "Random FILTER",
+      "time_ms": 158.67853164672852
+    },
+    {
+      "id": 188,
+      "template": "RND_UNION",
+      "category": "Random UNION",
+      "time_ms": 157.6852798461914
+    },
+    {
+      "id": 129,
+      "template": "RND_LIMIT",
+      "category": "Random LIMIT",
+      "time_ms": 149.19734001159668
+    },
+    {
+      "id": 46,
+      "template": "RND_LIMIT_OFFSET",
+      "category": "Random LIMIT",
+      "time_ms": 158.35881233215332
+    },
+    {
+      "id": 130,
+      "template": "RND_UNION",
+      "category": "Random UNION",
+      "time_ms": 153.20420265197754
+    },
+    {
+      "id": 28,
+      "template": "RND_FILTER_eq",
+      "category": "Random FILTER",
+      "time_ms": 164.87765312194824
+    },
+    {
+      "id": 77,
+      "template": "RND_FILTER_eq",
+      "category": "Random FILTER",
+      "time_ms": 155.29823303222656
+    },
+    {
+      "id": 148,
+      "template": "RND_PATH_plus",
+      "category": "Random Path",
+      "time_ms": 166.13316535949707
+    },
+    {
+      "id": 51,
+      "template": "RND_FILTER_isIRI",
+      "category": "Random FILTER",
+      "time_ms": 154.21080589294434
+    },
+    {
+      "id": 234,
+      "template": "RND_JOIN",
+      "category": "Random Join",
+      "time_ms": 146.78502082824707
+    },
+    {
+      "id": 96,
+      "template": "RND_FILTER_BOUND",
+      "category": "Random FILTER",
+      "time_ms": 150.0227451324463
+    },
+    {
+      "id": 225,
+      "template": "RND_JOIN",
+      "category": "Random Join",
+      "time_ms": 154.95014190673828
+    },
+    {
+      "id": 139,
+      "template": "RND_LIMIT",
+      "category": "Random LIMIT",
+      "time_ms": 151.08036994934082
+    },
+    {
+      "id": 196,
+      "template": "RND_OPTIONAL",
+      "category": "Random OPTIONAL",
+      "time_ms": 157.83262252807617
+    },
+    {
+      "id": 152,
+      "template": "RND_FILTER_REGEX",
+      "category": "Random FILTER",
+      "time_ms": 160.00699996948242
+    },
+    {
+      "id": 83,
+      "template": "RND_PATH_inverse",
+      "category": "Random Path",
+      "time_ms": 191.4823055267334
+    },
+    {
+      "id": 301,
+      "template": "RND_JOIN",
+      "category": "Random Join",
+      "time_ms": 164.80183601379395
+    },
+    {
+      "id": 5,
+      "template": "RND_LIMIT_OFFSET",
+      "category": "Random LIMIT",
+      "time_ms": 153.92136573791504
+    },
+    {
+      "id": 157,
+      "template": "RND_JOIN",
+      "category": "Random Join",
+      "time_ms": 156.7375659942627
+    },
+    {
+      "id": 183,
+      "template": "RND_JOIN",
+      "category": "Random Join",
+      "time_ms": 165.34709930419922
+    },
+    {
+      "id": 79,
+      "template": "RND_JOIN",
+      "category": "Random Join",
+      "time_ms": 157.58109092712402
+    },
+    {
+      "id": 62,
+      "template": "RND_DISTINCT",
+      "category": "Random DISTINCT",
+      "time_ms": 174.23176765441895
+    },
+    {
+      "id": 213,
+      "template": "RND_OPTIONAL",
+      "category": "Random OPTIONAL",
+      "time_ms": 156.7552089691162
+    },
+    {
+      "id": 235,
+      "template": "RND_JOIN",
+      "category": "Random Join",
+      "time_ms": 148.68521690368652
+    },
+    {
+      "id": 252,
+      "template": "RND_UNION",
+      "category": "Random UNION",
+      "time_ms": 159.81245040893555
+    },
+    {
+      "id": 11,
+      "template": "RND_LIMIT_OFFSET",
+      "category": "Random LIMIT",
+      "time_ms": 155.41625022888184
+    },
+    {
+      "id": 242,
+      "template": "RND_OPTIONAL",
+      "category": "Random OPTIONAL",
+      "time_ms": 150.42686462402344
+    },
+    {
+      "id": 226,
+      "template": "RND_FILTER_STRSTARTS",
+      "category": "Random FILTER",
+      "time_ms": 151.4565944671631
+    },
+    {
+      "id": 105,
+      "template": "RND_LIMIT_OFFSET",
+      "category": "Random LIMIT",
+      "time_ms": 176.1188507080078
+    },
+    {
+      "id": 210,
+      "template": "RND_LIMIT_OFFSET",
+      "category": "Random LIMIT",
+      "time_ms": 152.66752243041992
+    },
+    {
+      "id": 243,
+      "template": "RND_UNION",
+      "category": "Random UNION",
+      "time_ms": 155.81369400024414
+    },
+    {
+      "id": 159,
+      "template": "RND_DISTINCT",
+      "category": "Random DISTINCT",
+      "time_ms": 156.4791202545166
+    },
+    {
+      "id": 169,
+      "template": "RND_OPTIONAL",
+      "category": "Random OPTIONAL",
+      "time_ms": 163.76996040344238
+    },
+    {
+      "id": 170,
+      "template": "RND_LIMIT",
+      "category": "Random LIMIT",
+      "time_ms": 176.62763595581055
+    },
+    {
+      "id": 224,
+      "template": "RND_OPTIONAL",
+      "category": "Random OPTIONAL",
+      "time_ms": 167.4478054046631
+    },
+    {
+      "id": 85,
+      "template": "RND_FILTER_BOUND",
+      "category": "Random FILTER",
+      "time_ms": 168.45011711120605
+    },
+    {
+      "id": 61,
+      "template": "RND_FILTER_REGEX",
+      "category": "Random FILTER",
+      "time_ms": 162.80150413513184
+    },
+    {
+      "id": 71,
+      "template": "RND_LIMIT",
+      "category": "Random LIMIT",
+      "time_ms": 158.8423252105713
+    },
+    {
+      "id": 22,
+      "template": "RND_LIMIT_OFFSET",
+      "category": "Random LIMIT",
+      "time_ms": 157.48047828674316
+    },
+    {
+      "id": 34,
+      "template": "RND_FILTER_STRSTARTS",
+      "category": "Random FILTER",
+      "time_ms": 159.20257568359375
+    },
+    {
+      "id": 261,
+      "template": "RND_JOIN",
+      "category": "Random Join",
+      "time_ms": 154.00362014770508
+    },
+    {
+      "id": 78,
+      "template": "RND_FILTER_isIRI",
+      "category": "Random FILTER",
+      "time_ms": 154.98089790344238
+    },
+    {
+      "id": 200,
+      "template": "RND_LIMIT_OFFSET",
+      "category": "Random LIMIT",
+      "time_ms": 170.75681686401367
+    },
+    {
+      "id": 147,
+      "template": "RND_LIMIT_OFFSET",
+      "category": "Random LIMIT",
+      "time_ms": 159.2578887939453
+    },
+    {
+      "id": 249,
+      "template": "RND_UNION",
+      "category": "Random UNION",
+      "time_ms": 153.3982753753662
+    },
+    {
+      "id": 97,
+      "template": "RND_JOIN",
+      "category": "Random Join",
+      "time_ms": 156.27360343933105
+    },
+    {
+      "id": 140,
+      "template": "RND_OPTIONAL",
+      "category": "Random OPTIONAL",
+      "time_ms": 153.50008010864258
+    },
+    {
+      "id": 89,
+      "template": "RND_LIMIT_OFFSET",
+      "category": "Random LIMIT",
+      "time_ms": 154.79063987731934
+    }
+  ],
+  "stats": {
+    "count": 200,
+    "min": 146.78502082824707,
+    "max": 255.97143173217773,
+    "mean": 162.92776703834534,
+    "p50": 159.23023223876953,
+    "p90": 179.34105396270752,
+    "p95": 185.2568984031677,
+    "p99": 234.4871616363525
+  }
+}

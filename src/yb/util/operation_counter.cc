@@ -1,0 +1,332 @@
+// Copyright (c) YugabyteDB, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
+// in compliance with the License.  You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software distributed under the License
+// is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express
+// or implied.  See the License for the specific language governing permissions and limitations
+// under the License.
+//
+
+#include "yb/util/operation_counter.h"
+
+#include <thread>
+
+#include "yb/gutil/strings/substitute.h"
+
+#include "yb/util/debug-util.h"
+#include "yb/util/debug/long_operation_tracker.h"
+#include "yb/util/logging.h"
+#include "yb/util/status_format.h"
+#include "yb/util/status_log.h"
+#include "yb/util/trace.h"
+#include "yb/util/tsan_util.h"
+
+using namespace std::literals;
+
+namespace yb {
+
+OperationCounter::OperationCounter(const std::string& log_prefix) : log_prefix_(log_prefix) {
+}
+
+void OperationCounter::Shutdown() {
+  auto wait_start = CoarseMonoClock::now();
+  auto last_report = wait_start;
+  for (;;) {
+    auto value = value_.load(std::memory_order_acquire);
+    if (value == 0) {
+      break;
+    }
+    auto now = CoarseMonoClock::now();
+    if (now > last_report + std::chrono::seconds(10)) {
+      LOG_WITH_PREFIX(WARNING)
+          << "Long wait for scope counter shutdown " << value << ": " << AsString(now - wait_start);
+      last_report = now;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  }
+}
+
+void OperationCounter::Release() {
+  value_.fetch_sub(1, std::memory_order_acq_rel);
+}
+
+void OperationCounter::Acquire() {
+  value_.fetch_add(1, std::memory_order_acq_rel);
+}
+
+ScopedOperation::ScopedOperation(OperationCounter* counter) : counter_(counter) {
+  counter->Acquire();
+}
+
+namespace {
+
+// Using upper bits of counter as special flags.
+constexpr uint64_t kStopDelta = 1ull << 63u;
+constexpr auto kOpCounterBits = 48u;
+constexpr uint64_t kDisabledDelta = 1ull << kOpCounterBits;
+constexpr uint64_t kOpCounterMask = kDisabledDelta - 1;
+constexpr uint64_t kDisabledCounterMask = ~kOpCounterMask;
+
+}
+
+uint64_t RWOperationCounterLock::Update(uint64_t delta) {
+  uint64_t result = counters_.fetch_add(delta, std::memory_order::acq_rel) + delta;
+  VLOG(2) << "[" << this << "] Update(" << static_cast<int64_t>(delta) << "), result = " << result;
+  LOG_IF(DFATAL, (result & (kStopDelta >> 1u)) != 0) << "Disable counter underflow: " << result;
+  LOG_IF(DFATAL, (result & (kDisabledDelta >> 1u)) != 0)
+      << "Pending operations counter underflow: " << result;
+  return result;
+}
+
+bool RWOperationCounterLock::Stopped() const {
+  return (counters_.load(std::memory_order_acquire) & kStopDelta) != 0;
+}
+
+uint64_t RWOperationCounterLock::GetOpCounter() const {
+  return Get() & kOpCounterMask;
+}
+
+uint64_t RWOperationCounterLock::TEST_GetDisableCount() const {
+  return Get() >> kOpCounterBits;
+}
+
+bool RWOperationCounterLock::TEST_IsStopped() const {
+  return Get() & kStopDelta;
+}
+
+bool RWOperationCounterLock::Increment() {
+  if (Update(1) & kDisabledCounterMask) {
+    Update(-1);
+    return false;
+  }
+
+  return true;
+}
+
+void RWOperationCounterLock::Decrement() {
+  Update(-1);
+}
+
+bool RWOperationCounterLock::Lock(const CoarseTimePoint& deadline) {
+  std::unique_lock<std::mutex> lock(mutex_);
+  if (!condition_variable_.wait_until(lock, deadline, [this] { return !is_locked_; })) {
+    return false;
+  }
+  is_locked_ = true;
+  return true;
+}
+
+void RWOperationCounterLock::unlock() {
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    is_locked_ = false;
+  }
+  condition_variable_.notify_all();
+}
+
+uint64_t RWOperationCounterLock::Disable(Stop stop) {
+  uint64_t result = Update(stop ? kStopDelta : kDisabledDelta);
+  if (stop) {
+    // Wake operations waiting in WaitMutexAndIncrement so they observe the stop bit and bail out
+    // with kStopped, instead of blocking on the exclusive lock until this (terminal) pause is
+    // released. See issue #32211.
+    std::lock_guard<std::mutex> lock(mutex_);
+    condition_variable_.notify_all();
+  }
+  return result;
+}
+
+void RWOperationCounterLock::Enable(Unlock unlock, Stop was_stop) {
+  Update(-(was_stop ? kStopDelta : kDisabledDelta));
+  if (unlock) {
+    this->unlock();
+  }
+}
+
+RWOperationCounterLock::IncrementResult RWOperationCounterLock::WaitMutexAndIncrement(
+    CoarseTimePoint deadline) {
+  if (deadline == CoarseTimePoint()) {
+    deadline = CoarseMonoClock::now() + 10ms * kTimeMultiplier;
+  } else if (deadline == CoarseTimePoint::min()) {
+    return IncrementResult::kFailed;
+  }
+  for (;;) {
+    {
+      // Acquire the exclusive lock, but bail out with kStopped if the resource is (or becomes)
+      // stopped. DisableAndWaitForOps keeps this lock held for the entire lifetime of a stop pause
+      // (until the storages are destroyed), so without the stop-aware wait an operation with a
+      // distant deadline would block on the lock for the whole shutdown -- wedging the RPC worker
+      // whose threadpool the shutdown later joins. See issue #32211.
+      std::unique_lock<std::mutex> lock(mutex_);
+      if (!condition_variable_.wait_until(
+              lock, deadline, [this] { return !is_locked_ || Stopped(); })) {
+        return Stopped() ? IncrementResult::kStopped : IncrementResult::kFailed;
+      }
+      if (Stopped()) {
+        return IncrementResult::kStopped;
+      }
+      is_locked_ = true;
+    }
+
+    const bool incremented = Increment();
+    unlock();
+    if (incremented) {
+      return IncrementResult::kSuccess;
+    }
+
+    if (Stopped()) {
+      return IncrementResult::kStopped;
+    }
+    // A non-stop disable slipped in between the lock and the increment; retry.
+  }
+}
+
+Status RWOperationCounter::DisableAndWaitForOps(const CoarseTimePoint& deadline, Stop stop) {
+  LongOperationTracker long_operation_tracker(__func__, 1s);
+
+  const auto start_time = CoarseMonoClock::now();
+  if (!lock_.Lock(deadline)) {
+    return STATUS(TimedOut, "Timed out waiting to disable the resource exclusively");
+  }
+
+  const uint64_t previous_value = lock_.Disable(stop);
+  LOG_IF(DFATAL, stop && (previous_value & kStopDelta) == 0) << "Counter already stopped";
+
+  auto status = WaitForOpsToFinish(start_time, deadline);
+  if (!status.ok()) {
+    // We hold the exclusive lock; remove the just-added disable/stop bit and release it.
+    lock_.Enable(Unlock::kTrue, stop);
+    return status;
+  }
+
+  // Keep the exclusive lock held; it is released later via Enable / UnlockExclusiveOpMutex.
+  return Status::OK();
+}
+
+// The implementation is based on OperationTracker::WaitForAllToFinish.
+Status RWOperationCounter::WaitForOpsToFinish(
+    const CoarseTimePoint& start_time, const CoarseTimePoint& deadline) {
+  const auto complain_interval = 1s;
+  int64_t num_pending_ops = 0;
+  int num_complaints = 0;
+  auto wait_time = 250us;
+
+  while ((num_pending_ops = GetOpCounter()) > 0) {
+    auto now = CoarseMonoClock::now();
+    auto waited_time = now - start_time;
+    if (now > deadline) {
+      return STATUS_FORMAT(
+          TimedOut,
+          "$0: Timed out waiting for all pending operations to complete. "
+              "$1 transactions pending. Waited for $2",
+          resource_name_, num_pending_ops, waited_time);
+    }
+    if (waited_time > num_complaints * complain_interval) {
+      LOG(WARNING) << Format("Waiting for $0 pending operations to complete now for $1",
+                             num_pending_ops, waited_time);
+      num_complaints++;
+    }
+    std::this_thread::sleep_until(std::min(deadline, now + wait_time));
+    wait_time = std::min(wait_time * 5 / 4, 1000000us);
+  }
+
+  return Status::OK();
+}
+
+ScopedRWOperation::ScopedRWOperation(
+    RWOperationCounter* counter, const CoarseTimePoint& deadline)
+    : data_{
+        .counter_ = counter,
+        .resource_name_ = ""
+#ifndef NDEBUG
+        , .long_operation_tracker_ = counter
+            ? LongOperationTracker("ScopedRWOperation", 1s) : LongOperationTracker()
+#endif
+      } {
+  if (counter != nullptr) {
+    // The race condition between IsReady() and Increment() is OK, because we are checking if
+    // anyone has started an exclusive operation since we did the increment, and don't proceed
+    // with this shared-ownership operation in that case.
+    VTRACE(1, "$0 $1", __func__, resource_name());
+    if (!counter->Increment()) {
+      auto result = counter->WaitMutexAndIncrement(deadline);
+      if (result != RWOperationCounter::IncrementResult::kSuccess) {
+        data_.counter_ = nullptr;
+        data_.resource_name_ = counter->resource_name();
+        data_.stopped_ = result == RWOperationCounter::IncrementResult::kStopped;
+      }
+    }
+  }
+}
+
+ScopedRWOperation::~ScopedRWOperation() {
+  Reset();
+}
+
+void ScopedRWOperation::Reset() {
+  VTRACE(1, "$0 $1", __func__, resource_name());
+  if (data_.counter_ != nullptr) {
+    data_.counter_->Decrement();
+    data_.counter_ = nullptr;
+  }
+}
+
+std::string ScopedRWOperation::resource_name() const {
+  if (data_.counter_) {
+    return data_.counter_->resource_name();
+  }
+  if (!data_.resource_name_.empty()) {
+    return data_.resource_name_;
+  }
+  return "null";
+}
+
+ScopedRWOperationPause::ScopedRWOperationPause(
+    RWOperationCounter* counter, const CoarseTimePoint& deadline, Stop stop) {
+  VTRACE(1, "$0 $1", __func__, resource_name());
+  if (counter != nullptr) {
+    data_.status_ = counter->DisableAndWaitForOps(deadline, stop);
+    if (data_.status_.ok()) {
+      data_.counter_ = counter;
+    }
+  }
+  data_.was_stop_ = stop;
+}
+
+ScopedRWOperationPause::~ScopedRWOperationPause() {
+  VTRACE(1, "$0 $1", __func__, resource_name());
+  Reset();
+}
+
+void ScopedRWOperationPause::Reset() {
+  if (data_.counter_ != nullptr) {
+    data_.counter_->Enable(Unlock(data_.status_.ok()), data_.was_stop_);
+    // Prevent from the destructor calling Enable again.
+    data_.counter_ = nullptr;
+  }
+}
+
+void ScopedRWOperationPause::ReleaseMutexButKeepDisabled() {
+  CHECK_OK(data_.status_);
+  CHECK_NOTNULL(data_.counter_);
+  CHECK(data_.was_stop_);
+  data_.counter_->UnlockExclusiveOpMutex();
+  // Make sure the destructor has no effect when it runs.
+  data_.counter_ = nullptr;
+}
+
+Status ScopedRWOperation::CreateStatus() const {
+  if (ok()) {
+    return Status::OK();
+  }
+  if (stopped()) {
+    return STATUS_FORMAT(ShutdownInProgress, "$0 is shutting down", resource_name());
+  }
+  return STATUS_FORMAT(TryAgain, "Resource unavailable: $0", resource_name());
+}
+
+}  // namespace yb

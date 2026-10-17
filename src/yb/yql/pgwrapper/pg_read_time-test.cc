@@ -1,0 +1,2071 @@
+// Copyright (c) YugabyteDB, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
+// in compliance with the License.  You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software distributed under the License
+// is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express
+// or implied.  See the License for the specific language governing permissions and limitations
+// under the License.
+
+#include <atomic>
+#include <fstream>
+#include <functional>
+#include <memory>
+#include <ranges>
+#include <string>
+#include <string_view>
+#include <tuple>
+
+#include <gtest/gtest.h>
+
+#include "yb/tablet/tablet.h"
+#include "yb/tablet/tablet_peer.h"
+#include "yb/tserver/mini_tablet_server.h"
+#include "yb/tserver/tablet_server.h"
+#include "yb/tserver/ts_tablet_manager.h"
+#include "yb/util/status.h"
+#include "yb/util/string_util.h"
+#include "yb/util/strongly_typed_bool.h"
+#include "yb/util/test_macros.h"
+#include "yb/util/test_thread_holder.h"
+#include "yb/util/tsan_util.h"
+#include "yb/yql/pgwrapper/libpq_utils.h"
+#include "yb/yql/pgwrapper/pg_mini_test_base.h"
+#include "yb/yql/pgwrapper/pg_test_utils.h"
+#include "yb/tools/tools_test_utils.h"
+
+DECLARE_bool(enable_wait_queues);
+DECLARE_bool(yb_enable_read_committed_isolation);
+DECLARE_bool(ysql_enable_write_pipelining);
+DECLARE_bool(ysql_enable_auto_analyze);
+DECLARE_string(ysql_pg_conf_csv);
+DECLARE_bool(ysql_disable_index_backfill);
+DECLARE_bool(enable_object_locking_for_table_locks);
+DECLARE_bool(ysql_enable_concurrent_ddl);
+DECLARE_bool(ysql_yb_ddl_transaction_block_enabled);
+
+METRIC_DECLARE_counter(picked_read_time_on_docdb);
+
+namespace yb::pgwrapper {
+
+using namespace std::literals;
+
+namespace {
+
+YB_STRONGLY_TYPED_BOOL(ConcurrentDdl);
+
+using ReadTimeTestParam = std::tuple<IsolationLevel, ConcurrentDdl>;
+
+std::string ReadTimeParamName(const testing::TestParamInfo<ReadTimeTestParam>& info) {
+  std::string name;
+  switch (std::get<0>(info.param)) {
+    case IsolationLevel::READ_COMMITTED: name = "ReadCommitted"; break;
+    case IsolationLevel::SNAPSHOT_ISOLATION: name = "Snapshot"; break;
+    case IsolationLevel::SERIALIZABLE_ISOLATION: name = "Serializable"; break;
+    default: name = "Unknown"; break;
+  }
+  return name + (std::get<1>(info.param) ? "ConcurrentDdl" : "NoConcurrentDdl");
+}
+
+template <class Duration, class Body>
+void RunFor(Duration duration, Body&& body) {
+  const auto deadline = CoarseMonoClock::now() + duration;
+  while (CoarseMonoClock::now() < deadline && !testing::Test::HasFatalFailure()) {
+    body();
+  }
+}
+
+template <class Body>
+void LoopUntilStop(const std::atomic<bool>& stop, Body&& body) {
+  while (!stop.load(std::memory_order_acquire)) {
+    body();
+  }
+}
+
+class PgReadTimeTest : public PgMiniTestBase {
+ protected:
+  using StmtExecutor = std::function<void()>;
+
+  void SetUp() override {
+    ANNOTATE_UNPROTECTED_WRITE(FLAGS_yb_enable_read_committed_isolation) = true;
+    ANNOTATE_UNPROTECTED_WRITE(FLAGS_enable_wait_queues) = true;
+    // Disable auto analyze because it introduces flakiness to
+    // metric: METRIC_picked_read_time_on_docdb.
+    ANNOTATE_UNPROTECTED_WRITE(FLAGS_ysql_enable_auto_analyze) = false;
+
+    // TODO: Remove yb_lock_pk_single_rpc once it becomes the default.
+    // yb_max_query_layer_retries is required for TestConflictRetriesOnDocdb
+    // Turn off yb_enable_new_relation_fastpath_write because this test is not testing
+    // skip intents, it's testing read time picking. When we skip intents we also clear
+    // the read time to avoid restart read error. If read time is cleared then it will
+    // be picked by DocDB, causing num_pick_read_time_on_docdb > 0.
+    ANNOTATE_UNPROTECTED_WRITE(FLAGS_ysql_pg_conf_csv) =
+        "yb_lock_pk_single_rpc=true," + MaxQueryLayerRetriesConf(0) +
+        ",yb_enable_new_relation_fastpath_write=false";
+
+    PgMiniTestBase::SetUp();
+  }
+
+  uint64_t GetNumPickedReadTimeOnDocDb() {
+    uint64_t num_pick_read_time_on_docdb = 0;
+    for (const auto& mini_tablet_server : cluster_->mini_tablet_servers()) {
+      auto peers = mini_tablet_server->server()->tablet_manager()->GetTabletPeers();
+      for (const auto& peer : peers) {
+        auto tablet = peer->shared_tablet_maybe_null();
+        if (!tablet) {
+          continue;
+        }
+        auto counter =
+            METRIC_picked_read_time_on_docdb.Instantiate(tablet->GetTabletMetricsEntity());
+        num_pick_read_time_on_docdb += counter->value();
+      }
+    }
+    return num_pick_read_time_on_docdb;
+  }
+
+  void CheckReadTimePickedOnDocdb(
+      const StmtExecutor& stmt_executor,
+      uint64_t expected_num_picked_read_time_on_doc_db_metric = 1) {
+    CheckReadTimePickingLocation(stmt_executor, expected_num_picked_read_time_on_doc_db_metric);
+  }
+
+  void CheckReadTimeProvidedToDocdb(const StmtExecutor& stmt_executor) {
+    CheckReadTimePickingLocation(
+        stmt_executor, 0 /* expected_num_picked_read_time_on_doc_db_metric */);
+  }
+
+  static Status ExecuteCopyFromCSV(
+      PGConn& conn, const std::string_view& table, const std::string_view& file_name) {
+    return conn.ExecuteFormat("COPY $0 FROM '$1' WITH (FORMAT CSV, HEADER)", table, file_name);
+  }
+
+ private:
+  void CheckReadTimePickingLocation(
+      const StmtExecutor& stmt_executor, uint64_t expected_num_picked_read_time_on_doc_db_metric) {
+    const auto initial = GetNumPickedReadTimeOnDocDb();
+    stmt_executor();
+    const auto diff = GetNumPickedReadTimeOnDocDb() - initial;
+    ASSERT_EQ(diff, expected_num_picked_read_time_on_doc_db_metric);
+  }
+};
+
+inline Status SetHighMaxBatchSize(PGConn* conn) {
+  return SetMaxBatchSize(conn, 1024);
+}
+
+inline Status ResetMaxBatchSize(PGConn* conn) {
+  return SetMaxBatchSize(conn, 0);
+}
+
+} // namespace
+
+TEST_F(PgReadTimeTest, TestConflictRetriesOnDocdb) {
+  auto conn = ASSERT_RESULT(Connect());
+  const std::string kTable = "test";
+  ASSERT_OK(conn.ExecuteFormat("CREATE TABLE $0 (k INT PRIMARY KEY, v INT)", kTable));
+  ASSERT_OK(conn.ExecuteFormat("INSERT INTO $0 SELECT generate_series(1, 100), 0", kTable));
+
+  auto conn_2 = ASSERT_RESULT(Connect());
+  TestThreadHolder thread_holder;
+  thread_holder.AddThreadFunctor(
+      [&stop = thread_holder.stop_flag(), &conn_2]() {
+        while (!stop.load(std::memory_order_acquire)) {
+          ASSERT_OK(conn_2.Execute("UPDATE test SET v=0 WHERE k=1"));
+          // Use a distributed transaction scenario as well.
+          ASSERT_OK(conn_2.StartTransaction(IsolationLevel::READ_COMMITTED));
+          ASSERT_OK(conn_2.Execute("UPDATE test SET v=0 WHERE k=1"));
+          ASSERT_OK(conn_2.CommitTransaction());
+        }
+      });
+
+  size_t kNumIterations = 100;
+  for (size_t i = 0; i < kNumIterations; ++i) {
+    // Docdb is able to retry kConflict errors in this case because the read time is not picked on
+    // the query layer for the below SELECT FOR UPDATE.
+    //
+    // If there were no retries for kConflict on docdb, then the following statement would fail
+    // because yb_max_query_layer_retries=0 and so there are no query layer retries.
+    ASSERT_OK(conn.StartTransaction(IsolationLevel::SNAPSHOT_ISOLATION));
+    ASSERT_OK(conn.Fetch("SELECT * FROM test WHERE k=1 FOR UPDATE"));
+    ASSERT_OK(conn.CommitTransaction());
+  }
+
+  bool serialization_error_seen = false;
+  for (size_t i = 0; i < kNumIterations; ++i) {
+    // In the below case, we expect some kConflict errors since the read time is already picked on
+    // the first select.
+    ASSERT_OK(conn.StartTransaction(IsolationLevel::SNAPSHOT_ISOLATION));
+    ASSERT_OK(conn.Fetch("SELECT * FROM test WHERE k=1"));
+    auto res = conn.Fetch("SELECT * FROM test WHERE k=1 FOR UPDATE");
+    if (!res.ok()) {
+      // ERRCODE_T_R_SERIALIZATION_FAILURE
+      const auto& status = res.status();
+      ASSERT_TRUE(HasSubstring(status.ToString(), "pgsql error 40001")) << status.ToString();
+      serialization_error_seen = true;
+      ASSERT_OK(conn.RollbackTransaction());
+      continue;
+    }
+    ASSERT_OK(conn.CommitTransaction());
+  }
+  ASSERT_TRUE(serialization_error_seen);
+}
+
+TEST_F(PgReadTimeTest, CheckReadTimePickingLocation) {
+  auto conn = ASSERT_RESULT(Connect());
+  ASSERT_OK(conn.Execute("SET DEFAULT_TRANSACTION_ISOLATION TO \"REPEATABLE READ\""));
+  constexpr auto kTable = "test"sv;
+  constexpr auto kSingleTabletTable = "test_with_single_tablet"sv;
+  ASSERT_OK(conn.ExecuteFormat("CREATE TABLE $0 (k INT PRIMARY KEY, v INT)", kTable));
+  ASSERT_OK(conn.ExecuteFormat(
+      "CREATE TABLE $0 (k INT PRIMARY KEY, v INT) SPLIT INTO 1 TABLETS", kSingleTabletTable));
+
+  for (const auto& table_name : {kTable, kSingleTabletTable}) {
+    ASSERT_OK(conn.ExecuteFormat(
+        "INSERT INTO $0 SELECT generate_series(1, 100), 0", table_name));
+    ASSERT_OK(conn.ExecuteFormat(
+      "CREATE OR REPLACE PROCEDURE insert_rows_$0(first integer, last integer) "
+      "LANGUAGE plpgsql "
+      "as $$body$$ "
+      "BEGIN "
+      "  FOR i in first..last LOOP "
+      "    INSERT INTO $0 VALUES (i, i); "
+      "  END LOOP; "
+      "END; "
+      "$$body$$", table_name));
+  }
+
+  // Cases to test:
+  // --------------
+  //
+  // 1. Batches of operations sent by YSQL to docdb (each is a Perform rpc) might arrive in 2 ways:
+  //    Pipeline or not-pipelined (i.e., new one is sent after response is received).
+  //
+  // 2. Within both cases, the first rpc i.e., batch of operations from YSQL might have:
+  //   i) single operation,
+  //   ii) multiple operations to various tablets, or
+  //   iii) multiple operations but to the same tablet
+  //
+  // 3. The first batch might start a new distributed transaction or not need one yet.
+  //
+  // The above result in 12 cases totally, but we have only 9 cases because today there is no case
+  // with pipelined operations that don't start a distributed transaction (hence minus those 3
+  // cases).
+  //
+  // The below tests check if the first batch of operations pick a read time on docdb instead of the
+  // query layer where applicable.
+
+  // 1. no pipeline, single operation in first batch, no distributed txn
+  for (const auto& table_name : {kTable, kSingleTabletTable}) {
+    CheckReadTimePickedOnDocdb(
+        [&conn, table_name]() {
+          ASSERT_OK(conn.FetchFormat("SELECT * FROM $0 WHERE k=1", table_name));
+        });
+
+    CheckReadTimePickedOnDocdb(
+        [&conn, table_name]() {
+          ASSERT_OK(conn.ExecuteFormat("UPDATE $0 SET v=1 WHERE k=1", table_name));
+        });
+
+    CheckReadTimePickedOnDocdb(
+        [&conn, table_name]() {
+          ASSERT_OK(conn.ExecuteFormat("INSERT INTO $0 VALUES (1000, 1000)", table_name));
+        });
+
+    CheckReadTimePickedOnDocdb(
+        [&conn, table_name]() {
+          ASSERT_OK(conn.ExecuteFormat("DELETE FROM $0 WHERE k=1000", table_name));
+        });
+  }
+
+  // 2. no pipeline, multiple operations to various tablets in first batch, no distributed txn
+  CheckReadTimeProvidedToDocdb(
+      [&conn, kTable]() {
+        ASSERT_OK(conn.FetchFormat("SELECT COUNT(*) FROM $0", kTable));
+      });
+
+  // 3. no pipeline, multiple operations to the same tablet in first batch, no distributed txn
+  CheckReadTimePickedOnDocdb(
+      [&conn, kSingleTabletTable]() {
+        ASSERT_OK(conn.FetchFormat("SELECT COUNT(*) FROM $0", kSingleTabletTable));
+      });
+
+  // 4. no pipeline, single operation in first batch, starts a distributed transation
+  //
+  // expected_num_picked_read_time_on_doc_db_metric is set because in case of a SELECT FOR UPDATE,
+  // a read time is picked in read_query.cc, but an extra picking is done in write_query.cc just
+  // after conflict resolution is done (see DoTransactionalConflictsResolved()).
+  CheckReadTimePickedOnDocdb(
+      [&conn, kTable]() {
+        ASSERT_OK(conn.StartTransaction(IsolationLevel::SNAPSHOT_ISOLATION));
+        ASSERT_OK(conn.FetchFormat("SELECT * FROM $0 WHERE k=1 FOR UPDATE", kTable));
+        ASSERT_OK(conn.CommitTransaction());
+      }, 2 /* expected_num_picked_read_time_on_doc_db_metric */);
+
+  // 5. no pipeline, multiple operations to various tablets in first batch, starts a distributed
+  //    transation
+  ASSERT_OK(SetHighMaxBatchSize(&conn));
+  CheckReadTimeProvidedToDocdb(
+      [&conn, kTable]() {
+        ASSERT_OK(conn.ExecuteFormat("CALL insert_rows_$0(101, 110)", kTable));
+      });
+  ASSERT_OK(ResetMaxBatchSize(&conn));
+
+  // 6. no pipeline, multiple operations to the same tablet in first batch, starts a distributed
+  //    transation
+  ASSERT_OK(SetHighMaxBatchSize(&conn));
+  CheckReadTimeProvidedToDocdb(
+      [&conn, kSingleTabletTable]() {
+        ASSERT_OK(conn.ExecuteFormat("CALL insert_rows_$0(101, 110)", kSingleTabletTable));
+      });
+  ASSERT_OK(ResetMaxBatchSize(&conn));
+
+  // 7. Pipeline, single operation in first batch, starts a distributed transation
+  ASSERT_OK(SetMaxBatchSize(&conn, 1));
+  CheckReadTimeProvidedToDocdb(
+      [&conn, kTable]() {
+        ASSERT_OK(conn.ExecuteFormat("CALL insert_rows_$0(111, 120)", kTable));
+      });
+  ASSERT_OK(ResetMaxBatchSize(&conn));
+
+  // 8. Pipeline, multiple operations to various tablets in first batch, starts a distributed
+  //    transation
+  ASSERT_OK(SetMaxBatchSize(&conn, 10));
+  CheckReadTimeProvidedToDocdb(
+      [&conn, kTable]() {
+        ASSERT_OK(conn.ExecuteFormat("CALL insert_rows_$0(121, 150)", kTable));
+      });
+  ASSERT_OK(ResetMaxBatchSize(&conn));
+
+  // 9. Pipeline, multiple operations to the same tablet in first batch, starts a distributed
+  //    transation
+  ASSERT_OK(SetMaxBatchSize(&conn, 10));
+  CheckReadTimeProvidedToDocdb(
+      [&conn, kSingleTabletTable]() {
+        ASSERT_OK(conn.ExecuteFormat("CALL insert_rows_$0(121, 150)", kSingleTabletTable));
+      });
+  ASSERT_OK(ResetMaxBatchSize(&conn));
+
+  // Test cases in a read committed txn block (in this isolation level each statement uses a new
+  // latest read point). For each statement, if the new read time for that statement can be picked
+  // on docdb, ensure it is.
+  ASSERT_OK(conn.StartTransaction(IsolationLevel::READ_COMMITTED));
+  // Disable async writes, since the metrics are only updated after the entire write query including
+  // the quorum commit completes. The client conn wont wait for these until the final commit.
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_ysql_enable_write_pipelining) = false;
+  CheckReadTimePickedOnDocdb(
+      [&conn, kTable]() {
+        ASSERT_OK(conn.FetchFormat("SELECT * FROM $0 WHERE k=1", kTable));
+      });
+
+  CheckReadTimePickedOnDocdb(
+      [&conn, kTable]() {
+        ASSERT_OK(conn.ExecuteFormat("UPDATE $0 SET v=1 WHERE k=1", kTable));
+      });
+
+  CheckReadTimeProvidedToDocdb(
+      [&conn, kTable]() {
+        ASSERT_OK(conn.FetchFormat("SELECT COUNT(*) FROM $0", kTable));
+      });
+
+  CheckReadTimePickedOnDocdb(
+      [&conn, kSingleTabletTable]() {
+        ASSERT_OK(conn.FetchFormat("SELECT COUNT(*) FROM $0", kSingleTabletTable));
+      });
+
+  CheckReadTimePickedOnDocdb(
+      [&conn, kTable]() {
+        ASSERT_OK(conn.FetchFormat("SELECT * FROM $0 WHERE k=1 FOR UPDATE", kTable));
+      }, 2 /* expected_num_picked_read_time_on_doc_db_metric */);
+
+  ASSERT_OK(conn.CommitTransaction());
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_ysql_enable_write_pipelining) = true;
+
+  // 10. Pipeline, copy a file to a table by fast-path transation. Only single tserver is involved
+  // during copy.
+  // (1) Copy single row to table with multiple tserver
+  ASSERT_OK(SetMaxBatchSize(&conn, 1024));
+  ASSERT_OK(conn.Execute("SET yb_disable_transactional_writes = 1"));
+  const auto csv_filename = GetTestPath("pg_read_time-test-fastpath-copy.csv");
+  GenerateCSVFileForCopy(csv_filename, 1);
+  CheckReadTimePickedOnDocdb(
+      [&conn, kTable, &csv_filename] {
+        ASSERT_OK(ExecuteCopyFromCSV(conn, kTable, csv_filename));
+      }, 1);
+
+  // (2) Copy multiple rows to table with single tserver
+  GenerateCSVFileForCopy(csv_filename, 100, 2 /* num_columns */, 10000 /* offset */);
+  ASSERT_OK(conn.Execute("SET yb_disable_transactional_writes = 1"));
+  CheckReadTimePickedOnDocdb(
+      [&conn, kSingleTabletTable, &csv_filename]() {
+        ASSERT_OK(ExecuteCopyFromCSV(conn, kSingleTabletTable, csv_filename));
+      }, 1);
+
+  ASSERT_OK(conn.Execute("RESET yb_disable_transactional_writes"));
+  ASSERT_OK(ResetMaxBatchSize(&conn));
+
+  // (3) Copy to colocated table with index. Batch size is 10, so 20 batches will be sent to docdb.
+  constexpr auto dbName = "colo_db";
+  constexpr auto kColocatedTable = "test_with_colocated_tablet";
+  ASSERT_OK(conn.ExecuteFormat("CREATE DATABASE $0 WITH COLOCATION = true", dbName));
+  auto conn_colo = ASSERT_RESULT(ConnectToDB(dbName));
+  ASSERT_OK(SetMaxBatchSize(&conn_colo, 10));
+  ASSERT_OK(conn_colo.ExecuteFormat("CREATE TABLE $0 (k INT PRIMARY KEY, v INT)", kColocatedTable));
+  ASSERT_OK(conn_colo.ExecuteFormat(
+      "CREATE INDEX $0_index ON $1(v)", kColocatedTable, kColocatedTable));
+  ASSERT_OK(conn_colo.Execute("SET yb_fast_path_for_colocated_copy = 1"));
+  CheckReadTimePickedOnDocdb(
+      [&conn_colo, &csv_filename]() {
+        ASSERT_OK(ExecuteCopyFromCSV(conn_colo, kColocatedTable, csv_filename));
+      }, 20);
+  ASSERT_OK(conn_colo.Execute("RESET yb_fast_path_for_colocated_copy"));
+  ASSERT_OK(ResetMaxBatchSize(&conn_colo));
+
+  // 11. For index backfill, read time is set by postgres, so should never set read time in docdb
+  // (1) create an index on tables which already have some data
+  CheckReadTimeProvidedToDocdb(
+      [&conn, kTable]() {
+        ASSERT_OK(conn.ExecuteFormat("CREATE INDEX $0_index ON $0(v)", kTable));
+      });
+  CheckReadTimeProvidedToDocdb(
+      [&conn, kSingleTabletTable]() {
+        ASSERT_OK(conn.ExecuteFormat("CREATE INDEX $0_index ON $0(v)", kSingleTabletTable));
+      });
+  // (2) Drop index on tables  which already have some data
+  CheckReadTimeProvidedToDocdb(
+      [&conn, kTable]() {
+        ASSERT_OK(conn.ExecuteFormat("DROP INDEX $0_index", kTable));
+      });
+  CheckReadTimeProvidedToDocdb(
+      [&conn, kSingleTabletTable]() {
+        ASSERT_OK(conn.ExecuteFormat("DROP INDEX $0_index", kSingleTabletTable));
+      });
+}
+
+TEST_F(PgReadTimeTest, TestFastPathCopyDuplicateKeyOnColocated) {
+  constexpr auto dbName = "colo_db";
+  constexpr auto kColocatedTable = "test_fast_path_copy_colocated";
+  auto conn = ASSERT_RESULT(Connect());
+  ASSERT_OK(conn.ExecuteFormat("CREATE DATABASE $0 WITH COLOCATION = true", dbName));
+  const auto csv_filename = GetTestPath("pg_read_time-test-fastpath-copy.csv");
+  GenerateCSVFileForCopy(csv_filename, 200000);
+  auto conn_colo = ASSERT_RESULT(ConnectToDB(dbName));
+  ASSERT_OK(SetMaxBatchSize(&conn_colo, 2));
+  ASSERT_OK(conn_colo.ExecuteFormat("CREATE TABLE $0 (k INT PRIMARY KEY, v INT)", kColocatedTable));
+  ASSERT_OK(conn_colo.Execute("SET yb_fast_path_for_colocated_copy = 1"));
+
+  auto conn2 = ASSERT_RESULT(ConnectToDB(dbName));
+  TestThreadHolder thread_holder;
+  thread_holder.AddThreadFunctor(
+      [&conn2, kColocatedTable]() {
+        // wait 1s for copy to start
+        SleepFor(1s);
+        LOG(INFO) << "insert started";
+        ASSERT_OK(conn2.StartTransaction(IsolationLevel::SNAPSHOT_ISOLATION));
+        ASSERT_OK(
+            conn2.ExecuteFormat("INSERT INTO $0 (k, v) VALUES (199999, 1)", kColocatedTable));
+        ASSERT_OK(conn2.CommitTransaction());
+        LOG(INFO) << "insert done";
+      });
+
+  LOG(INFO) << "copy started";
+  const auto start = MonoTime::Now();
+  const auto update_status = ExecuteCopyFromCSV(conn_colo, kColocatedTable, csv_filename);
+  ASSERT_NOK(update_status);
+  LOG(INFO) << "update_status.ToString=" << update_status.ToString();
+  ASSERT_STR_CONTAINS(
+    update_status.ToString(), "duplicate key value violates unique constraint");
+  LOG(INFO) << "copy took " << (MonoTime::Now() - start).ToMilliseconds() << " ms";
+  auto val = ASSERT_RESULT(conn_colo.FetchRow<int32_t>(Format(
+      "SELECT v FROM $0 WHERE k = 199999", kColocatedTable)));
+  // the value should not be changed by copy
+  CHECK_EQ(val, 1);
+  ASSERT_OK(conn_colo.Execute("RESET yb_fast_path_for_colocated_copy"));
+  ASSERT_OK(ResetMaxBatchSize(&conn_colo));
+}
+
+// Test the session configuration parameter yb_read_time which reads the data as of a point in time
+// in the past.
+// 1. Create a table t and insert 10 rows.
+// 2. Mark the current time t1.
+// 3. Delete 4 rows.
+// 4. Check "SELECT count(*) from t" is equal to 6 (as of current time).
+// 5. SET yb_read_time TO t1
+// 6. Check "SELECT count(*) from t" is equal to 10 (as of t1).
+// 7. SET yb_read_time TO 0
+// 8. Check "SELECT count(*) from t" is equal to 6 (as of current time).
+// 9. Get the value of t1 as a HybridTime (t2)
+// 10. SET yb_read_time TO 't2 ht'
+// 11. Check "SELECT count(*) from t" is equal to 10 (as of t2=t1).
+// 12. SET yb_read_time TO '0ht'
+// 13. Check "SELECT count(*) from t" is equal to 2 (as of current time).
+// 14. Repeat steps 10 to 13 with some variations in unit syntax.
+// 15. Negative test case. Invalid unit.
+TEST_F(PgMiniTestBase, CheckReadingDataAsOfPastTime) {
+  auto conn = ASSERT_RESULT(Connect());
+  ASSERT_OK(conn.Execute("CREATE TABLE t (k INT, v INT)"));
+  LOG(INFO) << "Inserting 10 rows into table t";
+  ASSERT_OK(conn.Execute("INSERT INTO t (k,v) SELECT i,i FROM generate_series(1,10) AS i"));
+  auto count = ASSERT_RESULT(conn.FetchRow<PGUint64>("SELECT count(*) FROM t"));
+  ASSERT_EQ(count, 10);
+  auto t1 = ASSERT_RESULT(conn.FetchRow<PGUint64>(
+      Format("SELECT ((EXTRACT (EPOCH FROM CURRENT_TIMESTAMP))*1000000)::bigint")));
+  LOG(INFO) << "Deleting 4 rows from table t";
+  ASSERT_OK(conn.Execute("DELETE FROM t WHERE k>6"));
+  count = ASSERT_RESULT(conn.FetchRow<PGUint64>(Format("SELECT count(*) FROM t")));
+  ASSERT_EQ(count, 6);
+  LOG(INFO) << "Setting yb_read_time to " << t1;
+  ASSERT_OK(conn.ExecuteFormat("SET yb_read_time TO $0", t1));
+  count = ASSERT_RESULT(conn.FetchRow<PGUint64>(Format("SELECT count(*) FROM t")));
+  ASSERT_EQ(count, 10);
+  LOG(INFO) << "Setting yb_read_time to 0";
+  ASSERT_OK(conn.Execute("SET yb_read_time TO 0"));
+  count = ASSERT_RESULT(conn.FetchRow<PGUint64>(Format("SELECT count(*) FROM t")));
+  ASSERT_EQ(count, 6);
+
+  LOG(INFO) << "Get the value of t1 as a HybridTime";
+  auto t2 = t1 << 12;
+
+  LOG(INFO) << "Setting yb_read_time to '" << t2 << " ht'";
+  ASSERT_OK(conn.ExecuteFormat("SET yb_read_time TO '$0 ht'", t2));
+  count = ASSERT_RESULT(conn.FetchRow<PGUint64>(Format("SELECT count(*) FROM t")));
+  ASSERT_EQ(count, 10);
+  LOG(INFO) << "Setting yb_read_time to '0ht'";
+  ASSERT_OK(conn.Execute("SET yb_read_time TO '0ht'"));
+  count = ASSERT_RESULT(conn.FetchRow<PGUint64>(Format("SELECT count(*) FROM t")));
+  ASSERT_EQ(count, 6);
+
+  LOG(INFO) << "Testing variations in specifying the unit";
+  LOG(INFO) << "Setting yb_read_time to '  " << t2 << "   ht   '";
+  ASSERT_OK(conn.ExecuteFormat("SET yb_read_time TO '  $0   ht   '", t2));
+  count = ASSERT_RESULT(conn.FetchRow<PGUint64>(Format("SELECT count(*) FROM t")));
+  ASSERT_EQ(count, 10);
+  LOG(INFO) << "Setting yb_read_time to '0'";
+  ASSERT_OK(conn.Execute("SET yb_read_time TO '0'"));
+  count = ASSERT_RESULT(conn.FetchRow<PGUint64>(Format("SELECT count(*) FROM t")));
+  ASSERT_EQ(count, 6);
+
+  LOG(INFO) <<"Negative test case. Invalid unit";
+  ASSERT_NOK(conn.ExecuteFormat("SET yb_read_time TO '$0 ms'", t2));
+}
+
+// Test that write DMLs are disallowed in a pg session when yb_read_time is set to non-zero.
+TEST_F(PgMiniTestBase, DisallowWriteDMLsWithYbReadTime) {
+  auto conn = ASSERT_RESULT(Connect());
+  ASSERT_OK(conn.Execute("CREATE TABLE t (k INT, v INT)"));
+  LOG(INFO) << "Inserting 4 rows into table t";
+  ASSERT_OK(conn.Execute("INSERT INTO t (k,v) SELECT i,i FROM generate_series(1,4) AS i"));
+  auto count = ASSERT_RESULT(conn.FetchRow<PGUint64>("SELECT count(*) FROM t"));
+  ASSERT_EQ(count, 4);
+  auto t1 = ASSERT_RESULT(conn.FetchRow<PGUint64>(
+      Format("SELECT ((EXTRACT (EPOCH FROM CURRENT_TIMESTAMP))*1000000)::bigint")));
+  LOG(INFO) << "Deleting 2 rows from table t";
+  ASSERT_OK(conn.Execute("DELETE FROM t WHERE k>2"));
+  count = ASSERT_RESULT(conn.FetchRow<PGUint64>(Format("SELECT count(*) FROM t")));
+  ASSERT_EQ(count, 2);
+  LOG(INFO) << "Setting yb_read_time to " << t1;
+  ASSERT_OK(conn.ExecuteFormat("SET yb_read_time TO $0", t1));
+  count = ASSERT_RESULT(conn.FetchRow<PGUint64>(Format("SELECT count(*) FROM t")));
+  ASSERT_EQ(count, 4);
+  LOG(INFO) << "Trying to Insert rows when yb_read_time is set to: " << t1;
+  ASSERT_NOK(conn.Execute("INSERT INTO t (k,v) SELECT i,i FROM generate_series(11,20) AS i"));
+  LOG(INFO) << "Trying to update rows when yb_read_time is set to: " << t1;
+  ASSERT_NOK(conn.Execute("UPDATE t SET v=99 WHERE k=2"));
+  LOG(INFO) << "Trying to delete rows when yb_read_time is set to: " << t1;
+  ASSERT_NOK(conn.Execute("DELETE FROM t WHERE k=2"));
+  LOG(INFO) << "Trying to select rows for update when yb_read_time is set to: " << t1;
+  ASSERT_NOK(conn.Execute("SELECT * FROM t FOR UPDATE"));
+  LOG(INFO) << "Trying to select rows for share when yb_read_time is set to: " << t1;
+  ASSERT_NOK(conn.Execute("SELECT * FROM t FOR SHARE"));
+  LOG(INFO) << "Trying to select rows in serializable isolation when yb_read_time is set to: "
+            << t1;
+  ASSERT_OK(conn.Execute("BEGIN ISOLATION LEVEL SERIALIZABLE"));
+  ASSERT_NOK(conn.Execute("SELECT * FROM t"));
+  ASSERT_OK(conn.Execute("ROLLBACK"));
+  LOG(INFO) << "Trying to select rows in serializable isolation read only transaction when "
+               "yb_read_time is set to: "
+            << t1;
+  ASSERT_OK(conn.Execute("BEGIN ISOLATION LEVEL SERIALIZABLE READ ONLY"));
+  count = ASSERT_RESULT(conn.FetchRow<PGUint64>(Format("SELECT count(*) FROM t")));
+  ASSERT_OK(conn.Execute("COMMIT"));
+  t1 = 0;
+  LOG(INFO) << "Setting yb_read_time to " << t1;
+  ASSERT_OK(conn.ExecuteFormat("SET yb_read_time TO $0", t1));
+  count = ASSERT_RESULT(conn.FetchRow<PGUint64>(Format("SELECT count(*) FROM t")));
+  ASSERT_EQ(count, 2);
+  // Check that we are able to perform write DMls after resetting yb_read_time to 0.
+  LOG(INFO) << "Trying to Insert rows when yb_read_time is set to: " << t1;
+  ASSERT_OK(conn.Execute("INSERT INTO t (k,v) SELECT i,i FROM generate_series(5,6) AS i"));
+  LOG(INFO) << "Trying to update rows when yb_read_time is set to: " << t1;
+  ASSERT_OK(conn.Execute("UPDATE t SET v=99 WHERE k=2"));
+  LOG(INFO) << "Trying to delete rows when yb_read_time is set to: " << t1;
+  ASSERT_OK(conn.Execute("DELETE FROM t WHERE k=1"));
+}
+
+// Test that yb_read_time can only be set at the session level and not from inside a transaction
+// block. Setting it mid-transaction resets the backend's local catalog version, which is not
+// re-fetched while a transaction is already open, so a subsequent read would otherwise fail with a
+// misleading "Catalog Version Mismatch" error.
+TEST_F(PgMiniTestBase, DisallowSettingYbReadTimeInTransactionBlock) {
+  auto conn = ASSERT_RESULT(Connect());
+  ASSERT_OK(conn.Execute("CREATE TABLE t (k INT, v INT)"));
+  ASSERT_OK(conn.Execute("INSERT INTO t (k,v) SELECT i,i FROM generate_series(1,4) AS i"));
+  const auto t1 = ASSERT_RESULT(conn.FetchRow<PGUint64>(
+      "SELECT ((EXTRACT (EPOCH FROM CURRENT_TIMESTAMP))*1000000)::bigint"));
+
+  const std::string in_txn_error = "yb_read_time cannot be set inside a transaction block";
+
+  LOG(INFO) << "Setting a non-zero yb_read_time inside a transaction block should be rejected";
+  ASSERT_OK(conn.Execute("BEGIN READ ONLY"));
+  auto status = conn.ExecuteFormat("SET yb_read_time TO $0", t1);
+  ASSERT_NOK(status);
+  ASSERT_STR_CONTAINS(status.ToString(), in_txn_error);
+  ASSERT_OK(conn.Execute("ROLLBACK"));
+
+  LOG(INFO) << "SET LOCAL yb_read_time inside a transaction block should also be rejected";
+  ASSERT_OK(conn.Execute("BEGIN READ ONLY"));
+  status = conn.ExecuteFormat("SET LOCAL yb_read_time TO $0", t1);
+  ASSERT_NOK(status);
+  ASSERT_STR_CONTAINS(status.ToString(), in_txn_error);
+  ASSERT_OK(conn.Execute("ROLLBACK"));
+
+  LOG(INFO) << "Even setting yb_read_time to 0 inside a transaction block should be rejected";
+  ASSERT_OK(conn.Execute("BEGIN READ ONLY"));
+  status = conn.Execute("SET yb_read_time TO 0");
+  ASSERT_NOK(status);
+  ASSERT_STR_CONTAINS(status.ToString(), in_txn_error);
+  ASSERT_OK(conn.Execute("ROLLBACK"));
+
+  LOG(INFO) << "Setting yb_read_time at the session level (outside a transaction) is allowed";
+  ASSERT_OK(conn.ExecuteFormat("SET yb_read_time TO $0", t1));
+  auto count = ASSERT_RESULT(conn.FetchRow<PGUint64>("SELECT count(*) FROM t"));
+  ASSERT_EQ(count, 4);
+  ASSERT_OK(conn.Execute("SET yb_read_time TO 0"));
+
+  LOG(INFO) << "Setting yb_read_time inside a transaction is allowed once the catalog version "
+               "check is disabled";
+  ASSERT_OK(conn.Execute("BEGIN READ ONLY"));
+  ASSERT_OK(conn.Execute("SET yb_disable_catalog_version_check TO true"));
+  ASSERT_OK(conn.ExecuteFormat("SET yb_read_time TO $0", t1));
+  count = ASSERT_RESULT(conn.FetchRow<PGUint64>("SELECT count(*) FROM t"));
+  ASSERT_EQ(count, 4);
+  ASSERT_OK(conn.Execute("ROLLBACK"));
+}
+
+// Test that nextval and setval on sequences are disallowed in a time travel session
+// (when yb_read_time is set to non-zero).
+TEST_F(PgMiniTestBase, DisallowSequenceWritesWithYbReadTime) {
+  auto conn = ASSERT_RESULT(Connect());
+  ASSERT_OK(conn.Execute("CREATE SEQUENCE test_seq"));
+
+  LOG(INFO) << "Calling nextval to advance the sequence";
+  auto val = ASSERT_RESULT(conn.FetchRow<int64_t>("SELECT nextval('test_seq')"));
+  LOG(INFO) << "nextval returned: " << val;
+
+  auto t1 = ASSERT_RESULT(conn.FetchRow<PGUint64>(
+      "SELECT ((EXTRACT (EPOCH FROM CURRENT_TIMESTAMP))*1000000)::bigint"));
+  LOG(INFO) << "Current timestamp in micros: " << t1;
+
+  LOG(INFO) << "Calling nextval again before setting yb_read_time";
+  val = ASSERT_RESULT(conn.FetchRow<int64_t>("SELECT nextval('test_seq')"));
+  LOG(INFO) << "nextval returned: " << val;
+
+  LOG(INFO) << "Setting yb_read_time to " << t1;
+  ASSERT_OK(conn.ExecuteFormat("SET yb_read_time TO $0", t1));
+
+  LOG(INFO) << "Trying nextval when yb_read_time is set (should fail)";
+  ASSERT_NOK(conn.Execute("SELECT nextval('test_seq')"));
+
+  LOG(INFO) << "Trying setval when yb_read_time is set (should fail)";
+  ASSERT_NOK(conn.FetchRow<int64_t>("SELECT setval('test_seq', 100)"));
+
+  LOG(INFO) << "Resetting yb_read_time to 0";
+  ASSERT_OK(conn.Execute("SET yb_read_time TO 0"));
+
+  LOG(INFO) << "Trying nextval after resetting yb_read_time (should succeed)";
+  val = ASSERT_RESULT(conn.FetchRow<int64_t>("SELECT nextval('test_seq')"));
+  LOG(INFO) << "nextval returned: " << val;
+
+  LOG(INFO) << "Trying setval after resetting yb_read_time (should succeed)";
+  ASSERT_RESULT(conn.FetchRow<int64_t>("SELECT setval('test_seq', 200)"));
+  val = ASSERT_RESULT(conn.FetchRow<int64_t>("SELECT nextval('test_seq')"));
+  ASSERT_EQ(val, 201);
+}
+
+// Test that advisory lock acquisition is disallowed when yb_read_time is set to non-zero.
+TEST_F(PgMiniTestBase, DisallowAdvisoryLocksWithYbReadTime) {
+  auto conn = ASSERT_RESULT(Connect());
+  ASSERT_OK(conn.Execute("CREATE TABLE t (k INT, v INT)"));
+  ASSERT_OK(conn.Execute("INSERT INTO t (k,v) SELECT i,i FROM generate_series(1,4) AS i"));
+
+  auto t1 = ASSERT_RESULT(conn.FetchRow<PGUint64>(
+      "SELECT ((EXTRACT (EPOCH FROM CURRENT_TIMESTAMP))*1000000)::bigint"));
+  LOG(INFO) << "Setting yb_read_time to " << t1;
+  ASSERT_OK(conn.ExecuteFormat("SET yb_read_time TO $0", t1));
+
+  LOG(INFO) << "Trying pg_advisory_lock when yb_read_time is set (should fail)";
+  ASSERT_NOK(conn.Execute("SELECT pg_advisory_lock(12345)"));
+
+  LOG(INFO) << "Trying pg_try_advisory_lock when yb_read_time is set (should fail)";
+  ASSERT_NOK(conn.Fetch("SELECT pg_try_advisory_lock(12345)"));
+
+  LOG(INFO) << "Trying pg_advisory_xact_lock when yb_read_time is set (should fail)";
+  ASSERT_NOK(conn.Execute("SELECT pg_advisory_xact_lock(12345)"));
+
+  LOG(INFO) << "Trying pg_try_advisory_xact_lock when yb_read_time is set (should fail)";
+  ASSERT_NOK(conn.Fetch("SELECT pg_try_advisory_xact_lock(12345)"));
+
+  LOG(INFO) << "Trying pg_advisory_lock with two int4 keys when yb_read_time is set (should fail)";
+  ASSERT_NOK(conn.Execute("SELECT pg_advisory_lock(1, 2)"));
+
+  LOG(INFO) << "Trying shared advisory lock when yb_read_time is set (should fail)";
+  ASSERT_NOK(conn.Execute("SELECT pg_advisory_lock_shared(12345)"));
+
+  LOG(INFO) << "Resetting yb_read_time to 0";
+  ASSERT_OK(conn.Execute("SET yb_read_time TO 0"));
+
+  LOG(INFO) << "Trying pg_advisory_lock after resetting yb_read_time (should succeed)";
+  ASSERT_OK(conn.Fetch("SELECT pg_advisory_lock(12345)"));
+
+  LOG(INFO) << "Releasing the advisory lock";
+  ASSERT_OK(conn.Fetch("SELECT pg_advisory_unlock(12345)"));
+}
+
+// Test that yb_read_time cannot be set at the database or role level via ALTER DATABASE SET or
+// ALTER ROLE SET. It is inherently a per-session GUC; persisting it as a database or role default
+// causes MISMATCHED_SCHEMA errors for all subsequent connections.
+TEST_F(PgMiniTestBase, DisallowYbReadTimeOnDatabaseAndRoleLevel) {
+  auto conn = ASSERT_RESULT(Connect());
+
+  // Session-level SET should still work.
+  auto t1 = ASSERT_RESULT(
+      conn.FetchRow<PGUint64>("SELECT ((EXTRACT (EPOCH FROM CURRENT_TIMESTAMP))*1000000)::bigint"));
+  ASSERT_OK(conn.ExecuteFormat("SET yb_read_time TO $0", t1));
+  ASSERT_OK(conn.Execute("SET yb_read_time TO 0"));
+
+  // ALTER DATABASE SET yb_read_time should be blocked.
+  ASSERT_NOK_STR_CONTAINS(
+      conn.ExecuteFormat("ALTER DATABASE yugabyte SET yb_read_time = '$0'", t1),
+      "yb_read_time can only be set at the session level");
+
+  // ALTER ROLE SET yb_read_time should be blocked.
+  ASSERT_OK(conn.Execute("CREATE ROLE test_role_yb_read_time WITH LOGIN SUPERUSER"));
+  ASSERT_NOK_STR_CONTAINS(
+      conn.ExecuteFormat("ALTER ROLE test_role_yb_read_time SET yb_read_time = '$0'", t1),
+      "yb_read_time can only be set at the session level");
+}
+
+// Test the read-time flag of ysql_dump to generate the schema of the database as of a timestamp t
+// 1- Create two tables
+// 2- Get the current timestamp t
+// 3- Run ysql_dump to capture the schema as ground truth for comparison
+// 4- Create one more table
+// 5- Run ysql_dump --readtime=t to generate the schema as of timestamp t
+// 6- Compare the schema of step 5 with the ground truth (should be the same)
+TEST_F(PgMiniTestBase, YB_DISABLE_TEST_IN_SANITIZERS(TestYSQLDumpAsOfTime)) {
+  auto conn = ASSERT_RESULT(Connect());
+  // Step 1
+  LOG(INFO) << "Create table t1";
+  ASSERT_OK(conn.Execute("CREATE TABLE t1 (k1 INT, v1 INT);"));
+  LOG(INFO) << "Create table t2";
+  ASSERT_OK(conn.Execute("CREATE TABLE t2 (k2 INT primary key, v2 text);"));
+  //  Step 2
+  auto t1 = ASSERT_RESULT(conn.FetchRow<PGUint64>(
+      Format("SELECT ((EXTRACT (EPOCH FROM CURRENT_TIMESTAMP))*1000000)::bigint")));
+  LOG(INFO) << "Current timestamp t=" << std::to_string(t1);
+  // Step 3
+  auto hostport = pg_host_port();
+  std::string kHostFlag = "--host=" + hostport.host();
+  std::string kPortFlag = "--port=" + std::to_string(hostport.port());
+  std::vector<std::string> args = {
+      GetPgToolPath("ysql_dump"),
+      kHostFlag,
+      kPortFlag,
+      "--schema-only",
+      "--include-yb-metadata",
+      "yugabyte"  // Database name
+  };
+  LOG(INFO) << "Run tool: " << AsString(args);
+  std::string ground_truth;
+  ASSERT_OK(Subprocess::Call(args, &ground_truth));
+  LOG(INFO) << "Tool output: " << ground_truth;
+
+  // Step 4
+  LOG(INFO) << "Create table t3";
+  ASSERT_OK(conn.Execute("CREATE TABLE t3 (k INT, f INT);"));
+  // Step 5
+  std::string timestamp_flag = "--read-time=" + std::to_string(t1);
+  args = {
+      GetPgToolPath("ysql_dump"),
+      kHostFlag,
+      kPortFlag,
+      "--schema-only",
+      timestamp_flag,
+      "--include-yb-metadata",
+      "yugabyte"  // database name
+  };
+  LOG(INFO) << "Run tool: " << AsString(args);
+  std::string dump_as_of_time;
+  ASSERT_OK(Subprocess::Call(args, &dump_as_of_time));
+  LOG(INFO) << "Tool output: " << dump_as_of_time;
+  // Step 6
+  ASSERT_STR_EQ(ground_truth, dump_as_of_time);
+}
+
+// Mimics the CheckReadTimePickingLocation test for the relaxed
+// yb_read_after_commit_visibility case.
+//
+// There are two primary effects of relaxed yb_read_after_commit_visibility:
+// - SELECTs now always pick their read time on local proxy.
+// - The read time is clamped whenever it is picked this way (not relevant for this test).
+//
+// This implies the following changes compared to the vanilla test
+// - Case 1: no pipeline, single operation in first batch, no distributed txn.
+//           Read time is picked on proxy for plain SELECTs.
+// - Case 2: no pipeline, multiple operations to the same tablet in first batch, no distributed txn.
+//           Read time is picked on proxy.
+TEST_F(PgReadTimeTest, CheckRelaxedReadAfterCommitVisibility) {
+  auto conn = ASSERT_RESULT(Connect());
+  ASSERT_OK(conn.Execute("SET DEFAULT_TRANSACTION_ISOLATION TO \"REPEATABLE READ\""));
+  constexpr auto kTable = "test"sv;
+  constexpr auto kSingleTabletTable = "test_with_single_tablet"sv;
+  ASSERT_OK(conn.ExecuteFormat("CREATE TABLE $0 (k INT PRIMARY KEY, v INT)", kTable));
+  ASSERT_OK(conn.ExecuteFormat(
+      "CREATE TABLE $0 (k INT PRIMARY KEY, v INT) SPLIT INTO 1 TABLETS", kSingleTabletTable));
+
+  for (const auto& table_name : {kTable, kSingleTabletTable}) {
+    ASSERT_OK(conn.ExecuteFormat(
+        "INSERT INTO $0 SELECT generate_series(1, 100), 0", table_name));
+    ASSERT_OK(conn.ExecuteFormat(
+      "CREATE OR REPLACE PROCEDURE insert_rows_$0(first integer, last integer) "
+      "LANGUAGE plpgsql "
+      "as $$body$$ "
+      "BEGIN "
+      "  FOR i in first..last LOOP "
+      "    INSERT INTO $0 VALUES (i, i); "
+      "  END LOOP; "
+      "END; "
+      "$$body$$", table_name));
+  }
+
+  // Relax read-after-commit-visiblity guarantee.
+  ASSERT_OK(conn.Execute("SET yb_read_after_commit_visibility TO relaxed"));
+  ASSERT_OK(conn.Execute("SET log_statement = 'all'"));
+
+  // 1. no pipeline, single operation in first batch, no distributed txn
+  for (const auto& table_name : {kTable, kSingleTabletTable}) {
+    // TODO(#30357): Clamp uncertainty window in the storage layer.
+    CheckReadTimeProvidedToDocdb(
+        [&conn, table_name]() {
+          ASSERT_OK(conn.FetchFormat("SELECT * FROM $0 WHERE k=1", table_name));
+        });
+
+    // fast path unaffected
+    CheckReadTimePickedOnDocdb(
+        [&conn, table_name]() {
+          ASSERT_OK(conn.ExecuteFormat("UPDATE $0 SET v=1 WHERE k=1", table_name));
+        });
+
+    // fast path
+    CheckReadTimePickedOnDocdb(
+        [&conn, table_name]() {
+          ASSERT_OK(conn.ExecuteFormat("INSERT INTO $0 VALUES (1000, 1000)", table_name));
+        });
+
+    // fast path
+    CheckReadTimePickedOnDocdb(
+        [&conn, table_name]() {
+          ASSERT_OK(conn.ExecuteFormat("DELETE FROM $0 WHERE k=1000", table_name));
+        });
+  }
+
+  // 2. no pipeline, multiple operations to various tablets in first batch, no distributed txn
+  CheckReadTimeProvidedToDocdb(
+      [&conn, kTable]() {
+        ASSERT_OK(conn.FetchFormat("SELECT COUNT(*) FROM $0", kTable));
+      });
+
+  // 3. no pipeline, multiple operations to the same tablet in first batch, no distributed txn
+  CheckReadTimeProvidedToDocdb(
+      [&conn, kSingleTabletTable]() {
+        ASSERT_OK(conn.FetchFormat("SELECT COUNT(*) FROM $0", kSingleTabletTable));
+      });
+
+  // 4. no pipeline, single operation in first batch, starts a distributed transation
+  //
+  // relaxed yb_read_after_commit_visibility now clamps the read time for FOR UPDATE queries.
+  CheckReadTimeProvidedToDocdb(
+      [&conn, kTable]() {
+        ASSERT_OK(conn.StartTransaction(IsolationLevel::SNAPSHOT_ISOLATION));
+        ASSERT_OK(conn.FetchFormat("SELECT * FROM $0 WHERE k=1 FOR UPDATE", kTable));
+        ASSERT_OK(conn.CommitTransaction());
+      });
+
+  // 5. no pipeline, multiple operations to various tablets in first batch, starts a distributed
+  //    transation
+  ASSERT_OK(SetHighMaxBatchSize(&conn));
+  CheckReadTimeProvidedToDocdb(
+      [&conn, kTable]() {
+        ASSERT_OK(conn.ExecuteFormat("CALL insert_rows_$0(101, 110)", kTable));
+      });
+  ASSERT_OK(ResetMaxBatchSize(&conn));
+
+  // 6. no pipeline, multiple operations to the same tablet in first batch, starts a distributed
+  //    transation
+  ASSERT_OK(SetHighMaxBatchSize(&conn));
+  CheckReadTimeProvidedToDocdb(
+      [&conn, kSingleTabletTable]() {
+        ASSERT_OK(conn.ExecuteFormat("CALL insert_rows_$0(101, 110)", kSingleTabletTable));
+      });
+  ASSERT_OK(ResetMaxBatchSize(&conn));
+
+  // 7. Pipeline, single operation in first batch, starts a distributed transation
+  ASSERT_OK(SetMaxBatchSize(&conn, 1));
+  CheckReadTimeProvidedToDocdb(
+      [&conn, kTable]() {
+        ASSERT_OK(conn.ExecuteFormat("CALL insert_rows_$0(111, 120)", kTable));
+      });
+  ASSERT_OK(ResetMaxBatchSize(&conn));
+
+  // 8. Pipeline, multiple operations to various tablets in first batch, starts a distributed
+  //    transation
+  ASSERT_OK(SetMaxBatchSize(&conn, 10));
+  CheckReadTimeProvidedToDocdb(
+      [&conn, kTable]() {
+        ASSERT_OK(conn.ExecuteFormat("CALL insert_rows_$0(121, 150)", kTable));
+      });
+  ASSERT_OK(ResetMaxBatchSize(&conn));
+
+  // 9. Pipeline, multiple operations to the same tablet in first batch, starts a distributed
+  //    transation
+  ASSERT_OK(SetMaxBatchSize(&conn, 10));
+  CheckReadTimeProvidedToDocdb(
+      [&conn, kSingleTabletTable]() {
+        ASSERT_OK(conn.ExecuteFormat("CALL insert_rows_$0(121, 150)", kSingleTabletTable));
+      });
+  ASSERT_OK(ResetMaxBatchSize(&conn));
+}
+
+TEST_F(PgReadTimeTest, CheckDeferredReadAfterCommitVisibility) {
+  auto conn = ASSERT_RESULT(Connect());
+  ASSERT_OK(conn.Execute("SET DEFAULT_TRANSACTION_ISOLATION TO \"REPEATABLE READ\""));
+  constexpr auto kTable = "test"sv;
+  constexpr auto kSingleTabletTable = "test_with_single_tablet"sv;
+  ASSERT_OK(conn.ExecuteFormat("CREATE TABLE $0 (k INT PRIMARY KEY, v INT)", kTable));
+  ASSERT_OK(conn.ExecuteFormat(
+      "CREATE TABLE $0 (k INT PRIMARY KEY, v INT) SPLIT INTO 1 TABLETS", kSingleTabletTable));
+
+  for (const auto& table_name : {kTable, kSingleTabletTable}) {
+    ASSERT_OK(conn.ExecuteFormat(
+        "INSERT INTO $0 SELECT generate_series(1, 100), 0", table_name));
+    ASSERT_OK(conn.ExecuteFormat(
+      "CREATE OR REPLACE PROCEDURE insert_rows_$0(first integer, last integer) "
+      "LANGUAGE plpgsql "
+      "as $$body$$ "
+      "BEGIN "
+      "  FOR i in first..last LOOP "
+      "    INSERT INTO $0 VALUES (i, i); "
+      "  END LOOP; "
+      "END; "
+      "$$body$$", table_name));
+  }
+
+  // Defer read-after-commit-visiblity guarantee.
+  ASSERT_OK(conn.Execute("SET yb_read_after_commit_visibility TO deferred"));
+  ASSERT_OK(conn.Execute("SET log_statement = 'all'"));
+
+  // 1. no pipeline, single operation in first batch, no distributed txn
+  for (const auto& table_name : {kTable, kSingleTabletTable}) {
+    CheckReadTimeProvidedToDocdb(
+        [&conn, table_name]() {
+          ASSERT_OK(conn.FetchFormat("SELECT * FROM $0 WHERE k=1", table_name));
+        });
+
+    CheckReadTimePickedOnDocdb(
+        [&conn, table_name]() {
+          ASSERT_OK(conn.ExecuteFormat("UPDATE $0 SET v=1 WHERE k=1", table_name));
+        });
+
+    CheckReadTimePickedOnDocdb(
+        [&conn, table_name]() {
+          ASSERT_OK(conn.ExecuteFormat("INSERT INTO $0 VALUES (1000, 1000)", table_name));
+        });
+
+    CheckReadTimePickedOnDocdb(
+        [&conn, table_name]() {
+          ASSERT_OK(conn.ExecuteFormat("DELETE FROM $0 WHERE k=1000", table_name));
+        });
+
+    // Not a fast path write.
+    CheckReadTimeProvidedToDocdb(
+        [&conn, table_name]() {
+          ASSERT_OK(conn.ExecuteFormat("UPDATE $0 SET k=2000 WHERE k=1", table_name));
+        });
+  }
+
+  // 2. no pipeline, multiple operations to various tablets in first batch, no distributed txn
+  CheckReadTimeProvidedToDocdb(
+      [&conn, kTable]() {
+        ASSERT_OK(conn.FetchFormat("SELECT COUNT(*) FROM $0", kTable));
+      });
+
+  // 3. no pipeline, multiple operations to the same tablet in first batch, no distributed txn
+  CheckReadTimeProvidedToDocdb(
+      [&conn, kSingleTabletTable]() {
+        ASSERT_OK(conn.FetchFormat("SELECT COUNT(*) FROM $0", kSingleTabletTable));
+      });
+
+  // 4. no pipeline, single operation in first batch, starts a distributed transation
+  //
+  // expected_num_picked_read_time_on_doc_db_metric is set because in case of a SELECT FOR UPDATE,
+  // a read time is picked in read_query.cc, but an extra picking is done in write_query.cc just
+  // after conflict resolution is done (see DoTransactionalConflictsResolved()).
+  //
+  // deferred yb_read_after_commit_visibility picks read time at pg client even
+  // for SELECT FOR UPDATE queries.
+  CheckReadTimeProvidedToDocdb(
+      [&conn, kTable]() {
+        ASSERT_OK(conn.StartTransaction(IsolationLevel::SNAPSHOT_ISOLATION));
+        ASSERT_OK(conn.FetchFormat("SELECT * FROM $0 WHERE k=1 FOR UPDATE", kTable));
+        ASSERT_OK(conn.CommitTransaction());
+      });
+
+  // 5. no pipeline, multiple operations to various tablets in first batch, starts a distributed
+  //    transation
+  ASSERT_OK(SetHighMaxBatchSize(&conn));
+  CheckReadTimeProvidedToDocdb(
+      [&conn, kTable]() {
+        ASSERT_OK(conn.ExecuteFormat("CALL insert_rows_$0(101, 110)", kTable));
+      });
+  ASSERT_OK(ResetMaxBatchSize(&conn));
+
+  // 6. no pipeline, multiple operations to the same tablet in first batch, starts a distributed
+  //    transation
+  ASSERT_OK(SetHighMaxBatchSize(&conn));
+  CheckReadTimeProvidedToDocdb(
+      [&conn, kSingleTabletTable]() {
+        ASSERT_OK(conn.ExecuteFormat("CALL insert_rows_$0(101, 110)", kSingleTabletTable));
+      });
+  ASSERT_OK(ResetMaxBatchSize(&conn));
+
+  // 7. Pipeline, single operation in first batch, starts a distributed transation
+  ASSERT_OK(SetMaxBatchSize(&conn, 1));
+  CheckReadTimeProvidedToDocdb(
+      [&conn, kTable]() {
+        ASSERT_OK(conn.ExecuteFormat("CALL insert_rows_$0(111, 120)", kTable));
+      });
+  ASSERT_OK(ResetMaxBatchSize(&conn));
+
+  // 8. Pipeline, multiple operations to various tablets in first batch, starts a distributed
+  //    transation
+  ASSERT_OK(SetMaxBatchSize(&conn, 10));
+  CheckReadTimeProvidedToDocdb(
+      [&conn, kTable]() {
+        ASSERT_OK(conn.ExecuteFormat("CALL insert_rows_$0(121, 150)", kTable));
+      });
+  ASSERT_OK(ResetMaxBatchSize(&conn));
+
+  // 9. Pipeline, multiple operations to the same tablet in first batch, starts a distributed
+  //    transation
+  ASSERT_OK(SetMaxBatchSize(&conn, 10));
+  CheckReadTimeProvidedToDocdb(
+      [&conn, kSingleTabletTable]() {
+        ASSERT_OK(conn.ExecuteFormat("CALL insert_rows_$0(121, 150)", kSingleTabletTable));
+      });
+  ASSERT_OK(ResetMaxBatchSize(&conn));
+}
+
+TEST_F(PgReadTimeTest, ReadTimeAfterParallelExecution) {
+  auto conn = ASSERT_RESULT(Connect());
+  constexpr auto kTable = "par_test"sv;
+  ASSERT_OK(conn.ExecuteFormat(
+      "CREATE TABLE $0 (k INT PRIMARY KEY, v INT) SPLIT INTO 5 TABLETS", kTable));
+  ASSERT_OK(conn.ExecuteFormat(
+      "INSERT INTO $0 SELECT generate_series(1, 1000), 0", kTable));
+
+  ASSERT_OK(conn.Execute("SET max_parallel_workers_per_gather = 2"));
+  ASSERT_OK(conn.Execute("SET parallel_setup_cost = 0"));
+  ASSERT_OK(conn.Execute("SET parallel_tuple_cost = 0"));
+  ASSERT_OK(conn.Execute("SET yb_parallel_range_rows = 1"));
+  ASSERT_OK(conn.Execute("SET yb_enable_cbo = on"));
+  // Zeroing the parallel costs above does not reliably force a parallel plan, so force it
+  // explicitly.
+  ASSERT_OK(conn.Execute("SET yb_test_force_parallel = force"));
+  ASSERT_OK(conn.ExecuteFormat("ANALYZE $0", kTable));
+
+  // Verifies a serial read picks its read time on docdb. Since the session forces parallelism
+  // above, the verification read must disable it (max_parallel_workers_per_gather = 0): a parallel
+  // read would pick its read time on the query layer instead and the metric would not increment.
+  const auto check_serial_read_picks_read_time_on_docdb = [this, &conn, kTable]() {
+    ASSERT_OK(conn.Execute("SET max_parallel_workers_per_gather = 0"));
+    CheckReadTimePickedOnDocdb([&conn, kTable]() {
+      ASSERT_OK(conn.FetchFormat("SELECT * FROM $0 WHERE k = 1", kTable));
+    });
+    ASSERT_OK(conn.Execute("SET max_parallel_workers_per_gather = 2"));
+  };
+
+  {
+    // Test to ensure that after parallel execution ends, the next non-parallel read in the
+    // same transaction picks a read time on docdb. Not picking on docdb would lead to a
+    // performance penalty.
+
+    // Verify a parallel plan is used for the COUNT query.
+    auto explain = ASSERT_RESULT(
+        conn.FetchAllAsString(Format("EXPLAIN SELECT count(*) FROM $0", kTable)));
+    ASSERT_TRUE(HasSubstring(explain, "Gather")) << "Expected parallel plan, got: " << explain;
+
+    ASSERT_OK(conn.StartTransaction(IsolationLevel::READ_COMMITTED));
+    ASSERT_OK(conn.FetchFormat("SELECT count(*) FROM $0", kTable));
+
+    check_serial_read_picks_read_time_on_docdb();
+
+    ASSERT_OK(conn.CommitTransaction());
+  }
+
+  {
+    // Test to ensure that after a parallel execution fails and the transaction aborts, the next
+    // non-parallel read as part of a new transaction picks a read time on docdb. Not picking
+    // on docdb would lead to a performance penalty.
+
+    ASSERT_OK(conn.Execute(
+      "CREATE OR REPLACE FUNCTION par_fail_fn(n INT) RETURNS INT AS $$ "
+      "BEGIN "
+      "  IF n > 500 THEN RAISE EXCEPTION 'deliberate error'; END IF; "
+      "  RETURN n; "
+      "END; $$ LANGUAGE plpgsql"));
+    ASSERT_OK(conn.Execute("ALTER FUNCTION par_fail_fn(int) PARALLEL SAFE"));
+
+    auto explain = ASSERT_RESULT(conn.FetchAllAsString(
+        Format("EXPLAIN SELECT count(*) FROM $0 WHERE par_fail_fn(k) = k", kTable)));
+    ASSERT_TRUE(HasSubstring(explain, "Gather")) << "Expected parallel plan, got: " << explain;
+
+    ASSERT_OK(conn.StartTransaction(IsolationLevel::READ_COMMITTED));
+
+    // Run a parallel query that will fail due to the function raising an error inside a worker.
+    auto status = conn.FetchFormat("SELECT count(*) FROM $0 WHERE par_fail_fn(k) = k", kTable);
+    ASSERT_NOK(status);
+
+    ASSERT_OK(conn.RollbackTransaction());
+
+    // After the failed parallel execution, verify the next read still picks read time on docdb.
+    check_serial_read_picks_read_time_on_docdb();
+
+    // Same test as above, but the failing parallel query runs after SAVEPOINT; rolling back to the
+    // savepoint recovers the transaction. The next read should still pick read time on docdb.
+    ASSERT_OK(conn.StartTransaction(IsolationLevel::READ_COMMITTED));
+    ASSERT_OK(conn.Execute("SAVEPOINT sp_par_fail"));
+
+    status = conn.FetchFormat(
+        "SELECT count(*) FROM $0 WHERE par_fail_fn(k) = k", kTable);
+    ASSERT_NOK(status);
+
+    ASSERT_OK(conn.Execute("ROLLBACK TO SAVEPOINT sp_par_fail"));
+
+    check_serial_read_picks_read_time_on_docdb();
+
+    ASSERT_OK(conn.CommitTransaction());
+  }
+}
+
+// Test for #29283
+TEST_F(PgReadTimeTest, InFlightDMLWritesWithTxnalDDL) {
+  auto conn = ASSERT_RESULT(Connect());
+  auto kTable = "test";
+  auto kTable2 = "test2";
+  ASSERT_OK(conn.ExecuteFormat(
+      "CREATE TABLE $0 (k INT PRIMARY KEY, v INT) SPLIT INTO 1 TABLETS", kTable));
+  ASSERT_OK(conn.ExecuteFormat("CREATE TABLE $0 (k INT PRIMARY KEY, v INT)", kTable2));
+  ASSERT_OK(SetMaxBatchSize(&conn, 10));
+  ASSERT_OK(conn.Execute("SET yb_debug_log_snapshot_mgmt=true;"));
+
+  // Test case that would earlier fail because the writes from PG to local tserver proxy
+  // would be batched and each batch is sent without waiting for the previous batch's response.
+  // Each batch would earlier pick a different read time on docdb of the remote tserver hosting
+  // the tablet. But the expectation is for all batches to use the same read time.
+  ASSERT_OK(conn.Execute("BEGIN TRANSACTION ISOLATION LEVEL READ COMMITTED"));
+  ASSERT_OK(conn.ExecuteFormat("ALTER TABLE $0 ADD COLUMN v2 INT", kTable2));
+
+  // Run an INSERT first to ensure that catalog cache misses don't occur for the next INSERT
+  // that writes to a single tablet in a pipelined manner. If this is not done, the catalog reads
+  // would set the read time and hence not surface the issue. This happens because in a
+  // transaction (either autonomous DDL or a regular transaction block which has executed a DDL
+  // earlier), catalog reads use the kDDL/ kPlain session and perform reads based on the transaction
+  // snapshot.
+  //
+  // NOTE: If yb_enable_concurrent_ddl was true, i.e., if we use the new mode for
+  // catalog reads, then doing this INSERT first wouldn't be required because catalog reads would
+  // use a catalog snapshot and not interfere with the transaction snapshot used for writes via
+  // INSERT.
+  ASSERT_OK(conn.ExecuteFormat("INSERT INTO $0 SELECT generate_series(0,1), 0", kTable));
+
+  // Ensure that the read time is picked on the local tserver proxy on the first batch so that
+  // all batches use the same read time.
+  CheckReadTimeProvidedToDocdb(
+    [&conn, kTable]() {
+      ASSERT_OK(conn.ExecuteFormat("INSERT INTO $0 SELECT generate_series(2,100), 0", kTable));
+    });
+  ASSERT_OK(conn.Execute("ROLLBACK"));
+
+  ASSERT_OK(ResetMaxBatchSize(&conn));
+}
+
+namespace {
+
+constexpr int kWriterStartKey = 1'000'000;
+constexpr int kSeedRows = 20'000;
+constexpr int kStalenessMs = 4000;
+
+Status SetFollowerReadStaleness(PGConn& conn) {
+  return conn.ExecuteFormat("SET yb_follower_read_staleness_ms = $0", kStalenessMs);
+}
+
+Status SwitchToFollowerReads(PGConn& conn) {
+  RETURN_NOT_OK(conn.Execute("SET yb_read_from_followers = true"));
+  return conn.Execute("SET default_transaction_read_only = true");
+}
+
+Status EnableFollowerReads(PGConn& conn) {
+  RETURN_NOT_OK(SetFollowerReadStaleness(conn));
+  return SwitchToFollowerReads(conn);
+}
+
+} // namespace
+
+// Test
+// - various read time selection options (see pggate/README)
+// - across all 3 isolation levels
+// - with and without concurrent DDL.
+//
+// A read's read time is governed by one of the modes below. From
+// PgClientSession's view they are mutually exclusive. This is because
+// pggate resolves a single read time option for PgClientSession.
+//
+// 1. Passed read time
+//    a. yb_read_time (PgYbReadTimeTest), no SERIALIZABLE
+//       x ConflictsWithResetReadPoint          - reset read point
+//       x ConflictsWithSerializableIsolation   - serializable isolation
+//       x PrecedesCatalogReadTime              - catalog read time
+//       x ConflictsWithCrossTxnSnapshot        - cross txn snapshot read time
+//       x PrecedesFollowerReads                - follower reads
+//       x ConflictsWithRestartRead             - restart read
+//       x PrecedesClampDefer                   - clamp / defer
+//       x PrecedesEnsureReadTime               - ensure read time is set
+//    b. backfill_read_time (PgBackfillReadTimeTest), no SERIALIZABLE
+//       x PrecedesClampDefer                   - clamp / defer
+// 2. Reset read point, read_time_action = RESET (PgFastPathWriteTest)
+//    x PrecedesCatalogReadTime              - catalog read time
+//    x ConflictsWithCrossTxnSnapshot        - cross txn snapshot read time
+//    x ConflictsWithFollowerReads           - follower reads
+//    x ConflictsWithRestartRead             - restart read
+//    x PrecedesClampDefer                   - clamp / defer
+// 3. Serializable isolation
+// 4. Catalog read time (PgCatalogReadTimeTest), no SERIALIZABLE
+//    x PrecedesCrossTxnSnapshot             - cross txn snapshot read time
+//    x PrecedesFollowerReads                - follower reads
+//    x ConflictsWithRestartRead             - restart read
+//    x PrecedesClampDefer                   - clamp / defer
+//    x PrecedesEnsureReadTime               - ensure read time is set
+// 5. Cross txn snapshot read time (PgCrossTxnSnapshotTest), SNAPSHOT only
+//    x ConflictsWithFollowerReads           - follower reads
+//    x ConflictsWithRestartRead             - restart read
+//    x ConflictsWithClampDefer              - clamp / defer
+//    x PrecedesEnsureReadTime               - ensure read time is set
+// 6. Follower reads (PgFollowerReadTest), no SERIALIZABLE
+//    x ConflictsWithRestartRead             - restart read
+//    x PrecedesClampDefer                   - clamp / defer
+//    x PrecedesEnsureReadTime               - ensure read time is set
+// 7. Restart read (PgRestartReadTest)
+//    x ConflictsWithClampDefer              - clamp / defer
+//    x PrecedesEnsureReadTime               - ensure read time is set
+// 8. Clamp / defer (PgClampDeferReadTest)
+//    x PrecedesEnsureReadTime               - ensure read time is set
+// 9. Ensure read time is set: no additional requirements.
+// 10. Catch-all: no additional requirements.
+class PgReadTimeBaseTest
+    : public PgReadTimeTest,
+      public ::testing::WithParamInterface<ReadTimeTestParam> {
+ protected:
+  static constexpr int kChurnBatch = 1000;
+
+  IsolationLevel isolation() const { return std::get<0>(GetParam()); }
+
+  ConcurrentDdl IsConcurrentDdl() const { return std::get<1>(GetParam()); }
+
+  void SetUp() override {
+    const auto concurrent_ddl = IsConcurrentDdl();
+    ANNOTATE_UNPROTECTED_WRITE(FLAGS_ysql_yb_ddl_transaction_block_enabled) = concurrent_ddl;
+    ANNOTATE_UNPROTECTED_WRITE(FLAGS_enable_object_locking_for_table_locks) = concurrent_ddl;
+    ANNOTATE_UNPROTECTED_WRITE(FLAGS_ysql_enable_concurrent_ddl) = concurrent_ddl;
+    PgReadTimeTest::SetUp();
+  }
+
+  void SetSessionIsolation(PGConn* conn) {
+    const auto* level =
+        isolation() == IsolationLevel::READ_COMMITTED       ? "read committed"
+        : isolation() == IsolationLevel::SNAPSHOT_ISOLATION ? "repeatable read"
+                                                            : "serializable";
+    ASSERT_OK(conn->ExecuteFormat("SET default_transaction_isolation = '$0'", level));
+  }
+
+  // To generate read restart errors on conflicting reads.
+  void StartConcurrentInserts(
+      TestThreadHolder* threads, const std::string& table, int start_key) {
+    threads->AddThreadFunctor([this, &stop = threads->stop_flag(), table, start_key] {
+      auto conn = ASSERT_RESULT(Connect());
+      LoopUntilStop(stop, [&conn, table, start_key] {
+        for (int k = start_key; k < start_key + kChurnBatch; ++k) {
+          (void)conn.ExecuteFormat("INSERT INTO $0 VALUES ($1, 1)", table, k);
+        }
+        (void)conn.ExecuteFormat("DELETE FROM $0 WHERE k >= $1", table, start_key);
+      });
+    });
+  }
+
+  static constexpr auto kWaitPastUncertaintyWindow = 1s;
+
+  static Result<std::string> ExportSnapshot(PGConn& conn) {
+    return conn.FetchRow<std::string>("SELECT pg_export_snapshot()");
+  }
+
+  static Status ImportSnapshot(PGConn& conn, const std::string& snapshot_id) {
+    return conn.ExecuteFormat("SET TRANSACTION SNAPSHOT '$0'", snapshot_id);
+  }
+
+  Result<PGConn> ConnectAtIsolation() {
+    auto conn = VERIFY_RESULT(Connect());
+    SetSessionIsolation(&conn);
+    return conn;
+  }
+
+  static Result<uint64_t> NowMicros(PGConn* conn) {
+    return conn->FetchRow<PGUint64>(
+        "SELECT (EXTRACT(EPOCH FROM CURRENT_TIMESTAMP) * 1000000)::bigint");
+  }
+};
+
+class PgYbReadTimeTest : public PgReadTimeBaseTest {};
+
+INSTANTIATE_TEST_CASE_P(
+    Isolation, PgYbReadTimeTest,
+    ::testing::Combine(
+        ::testing::Values(IsolationLevel::READ_COMMITTED, IsolationLevel::SNAPSHOT_ISOLATION),
+        ::testing::ValuesIn(ConcurrentDdl::kValues)),
+    ReadTimeParamName);
+
+TEST_P(PgYbReadTimeTest, ConflictsWithResetReadPoint) {
+  auto conn = ASSERT_RESULT(Connect());
+  ASSERT_NO_FATALS(SetSessionIsolation(&conn));
+  ASSERT_OK(conn.Execute("CREATE TABLE t (k INT PRIMARY KEY, v INT)"));
+  ASSERT_OK(conn.Execute("INSERT INTO t VALUES (1, 1)"));
+  const auto t1 = ASSERT_RESULT(NowMicros(&conn));
+
+  ASSERT_OK(conn.Execute("SET yb_disable_transactional_writes = 1"));
+  ASSERT_OK(conn.ExecuteFormat("SET yb_read_time TO $0", t1));
+  const auto status = conn.Execute("INSERT INTO t VALUES (2, 2)");
+  ASSERT_NOK(status);
+  ASSERT_STR_CONTAINS(
+      status.ToString(),
+      "Write DML operation can not be performed while yb_read_time is set to nonzero");
+}
+
+TEST_P(PgYbReadTimeTest, ConflictsWithSerializableIsolation) {
+  auto conn = ASSERT_RESULT(Connect());
+  ASSERT_OK(conn.Execute("CREATE TABLE t (k INT PRIMARY KEY, v INT)"));
+  ASSERT_OK(conn.Execute("INSERT INTO t VALUES (1, 1)"));
+  const auto t1 = ASSERT_RESULT(NowMicros(&conn));
+
+  ASSERT_OK(conn.Execute("SET default_transaction_isolation = 'serializable'"));
+  ASSERT_OK(conn.ExecuteFormat("SET yb_read_time TO $0", t1));
+  const auto status = conn.Fetch("SELECT * FROM t");
+  ASSERT_NOK(status);
+  ASSERT_STR_CONTAINS(
+      status.status().ToString(),
+      "Transactions with serializable isolation can not be performed while yb_read_time is "
+      "set to nonzero");
+}
+
+TEST_P(PgYbReadTimeTest, PrecedesCatalogReadTime) {
+  auto conn = ASSERT_RESULT(Connect());
+  ASSERT_NO_FATALS(SetSessionIsolation(&conn));
+  ASSERT_OK(conn.Execute("CREATE TABLE foo (k INT PRIMARY KEY, v INT)"));
+  ASSERT_OK(conn.Execute("INSERT INTO foo VALUES (1, 10)"));
+  const auto t1 = ASSERT_RESULT(NowMicros(&conn));
+  ASSERT_OK(conn.Execute("ALTER TABLE foo ADD COLUMN w INT DEFAULT 7"));
+  ASSERT_EQ(ASSERT_RESULT(conn.FetchRow<int32_t>("SELECT w FROM foo")), 7);
+
+  ASSERT_OK(conn.ExecuteFormat("SET yb_read_time TO $0", t1));
+  // Reads catalog at old time => w not in the schema yet.
+  ASSERT_NOK(conn.Fetch("SELECT w FROM foo"));
+  ASSERT_EQ(ASSERT_RESULT(conn.FetchRow<int32_t>("SELECT v FROM foo WHERE k = 1")), 10);
+
+  // Disables yb_read_time => sees the latest catalog => sees w in the schema.
+  ASSERT_OK(conn.Execute("SET yb_read_time TO 0"));
+  ASSERT_EQ(ASSERT_RESULT(conn.FetchRow<int32_t>("SELECT w FROM foo")), 7);
+}
+
+TEST_P(PgYbReadTimeTest, ConflictsWithCrossTxnSnapshot) {
+  if (isolation() != IsolationLevel::SNAPSHOT_ISOLATION) {
+    // Export / Import snapshot only works with REPEATABLE READ
+    return;
+  }
+
+  auto exporter = ASSERT_RESULT(ConnectAtIsolation());
+  ASSERT_OK(exporter.Execute("CREATE TABLE t (k INT PRIMARY KEY, v INT)"));
+  ASSERT_OK(exporter.Execute("INSERT INTO t VALUES (1, 1)"));
+  const auto t1 = ASSERT_RESULT(NowMicros(&exporter));
+
+  ASSERT_OK(exporter.Execute("BEGIN"));
+  const auto snapshot_id = ASSERT_RESULT(ExportSnapshot(exporter));
+
+  auto importer = ASSERT_RESULT(ConnectAtIsolation());
+  ASSERT_OK(importer.ExecuteFormat("SET yb_read_time TO $0", t1));
+  ASSERT_OK(importer.Execute("BEGIN"));
+
+  const auto status = ImportSnapshot(importer, snapshot_id);
+  ASSERT_NOK(status);
+  ASSERT_STR_CONTAINS(
+      status.ToString(), "Cannot set both 'transaction snapshot' and 'yb_read_time'");
+
+  ASSERT_OK(importer.Execute("ROLLBACK"));
+  ASSERT_OK(exporter.Execute("COMMIT"));
+}
+
+TEST_P(PgYbReadTimeTest, PrecedesFollowerReads) {
+  auto conn = ASSERT_RESULT(Connect());
+  ASSERT_OK(conn.Execute("CREATE TABLE t (k INT PRIMARY KEY, v INT)"));
+  ASSERT_OK(conn.Execute("INSERT INTO t SELECT i, i FROM generate_series(1, 6) i"));
+  const auto t1 = ASSERT_RESULT(NowMicros(&conn));
+  ASSERT_OK(conn.Execute("INSERT INTO t SELECT i, i FROM generate_series(7, 10) i"));
+
+  SleepFor(kStalenessMs * 1ms);
+
+  auto reader = ASSERT_RESULT(Connect());
+  ASSERT_NO_FATALS(SetSessionIsolation(&reader));
+  ASSERT_OK(EnableFollowerReads(reader));
+  ASSERT_OK(reader.ExecuteFormat("SET yb_read_time TO $0", t1));
+  // Read occurs at yb_read_time snapshot and not with follower reads staleness.
+  ASSERT_EQ(ASSERT_RESULT(reader.FetchRow<PGUint64>("SELECT count(*) FROM t")), 6);
+}
+
+// No read restart expected.
+TEST_P(PgYbReadTimeTest, ConflictsWithRestartRead) {
+  auto setup = ASSERT_RESULT(Connect());
+  ASSERT_OK(setup.Execute("CREATE TABLE t (k INT PRIMARY KEY, v INT)"));
+  ASSERT_OK(setup.Execute("INSERT INTO t SELECT i, 0 FROM generate_series(1, 2000) i"));
+  const auto t1 = ASSERT_RESULT(NowMicros(&setup));
+
+  TestThreadHolder threads;
+  StartConcurrentInserts(&threads, "t", 2001);
+
+  auto reader = ASSERT_RESULT(Connect());
+  ASSERT_NO_FATALS(SetSessionIsolation(&reader));
+  // yb_max_query_layer_retries = 0 => cannot mask read restart erros using retries.
+  ASSERT_OK(reader.Execute("SET yb_max_query_layer_retries = 0"));
+  ASSERT_OK(reader.Execute("PREPARE cnt AS SELECT count(*) FROM t"));
+
+  ASSERT_OK(reader.ExecuteFormat("SET yb_read_time TO $0", t1));
+  RunFor(10s * kTimeMultiplier, [&reader] {
+    ASSERT_EQ(ASSERT_RESULT(reader.FetchRow<PGUint64>("EXECUTE cnt")), 2000);
+  });
+
+  threads.Stop();
+}
+
+TEST_P(PgYbReadTimeTest, PrecedesClampDefer) {
+  auto conn = ASSERT_RESULT(Connect());
+  ASSERT_OK(conn.Execute("CREATE TABLE t (k INT PRIMARY KEY, v INT)"));
+  ASSERT_OK(conn.Execute("INSERT INTO t SELECT i, i FROM generate_series(1, 6) i"));
+  const auto t1 = ASSERT_RESULT(NowMicros(&conn));
+  ASSERT_OK(conn.Execute("INSERT INTO t SELECT i, i FROM generate_series(7, 10) i"));
+  ASSERT_EQ(ASSERT_RESULT(conn.FetchRow<PGUint64>("SELECT count(*) FROM t")), 10);
+
+  for (const auto* mode : {"relaxed", "deferred"}) {
+    auto reader = ASSERT_RESULT(Connect());
+    ASSERT_NO_FATALS(SetSessionIsolation(&reader));
+    ASSERT_OK(reader.ExecuteFormat("SET yb_read_after_commit_visibility = '$0'", mode));
+    ASSERT_OK(reader.ExecuteFormat("SET yb_read_time TO $0", t1));
+    ASSERT_EQ(ASSERT_RESULT(reader.FetchRow<PGUint64>("SELECT count(*) FROM t")), 6) << mode;
+  }
+}
+
+TEST_P(PgYbReadTimeTest, PrecedesEnsureReadTime) {
+  auto conn = ASSERT_RESULT(Connect());
+  ASSERT_OK(conn.Execute("CREATE TABLE t (k INT PRIMARY KEY, v INT)"));
+  ASSERT_OK(conn.Execute("INSERT INTO t SELECT i, i FROM generate_series(1, 6) i"));
+  const auto t1 = ASSERT_RESULT(NowMicros(&conn));
+  ASSERT_OK(conn.Execute("INSERT INTO t SELECT i, i FROM generate_series(7, 10) i"));
+
+  auto reader = ASSERT_RESULT(Connect());
+  ASSERT_NO_FATALS(SetSessionIsolation(&reader));
+  // Parallel queries use ENSURE_READ_TIME_IS_SET
+  ASSERT_OK(reader.Execute("SET force_parallel_mode = on"));
+  ASSERT_OK(reader.ExecuteFormat("SET yb_read_time TO $0", t1));
+  ASSERT_EQ(ASSERT_RESULT(reader.FetchRow<PGUint64>("SELECT count(*) FROM t")), 6);
+}
+
+class PgBackfillReadTimeTest : public PgYbReadTimeTest {
+ protected:
+  size_t NumTabletServers() override { return 1; }
+
+  void BeforePgProcessStart() override {
+    PgYbReadTimeTest::BeforePgProcessStart();
+    ANNOTATE_UNPROTECTED_WRITE(FLAGS_ysql_disable_index_backfill) = false;
+  }
+};
+
+INSTANTIATE_TEST_CASE_P(
+    Isolation, PgBackfillReadTimeTest,
+    ::testing::Combine(
+        ::testing::Values(IsolationLevel::READ_COMMITTED, IsolationLevel::SNAPSHOT_ISOLATION),
+        ::testing::ValuesIn(ConcurrentDdl::kValues)),
+    ReadTimeParamName);
+
+TEST_P(PgBackfillReadTimeTest, PrecedesClampDefer) {
+  auto conn = ASSERT_RESULT(Connect());
+  ASSERT_NO_FATALS(SetSessionIsolation(&conn));
+  ASSERT_OK(conn.Execute("CREATE TABLE t (k INT PRIMARY KEY, v INT)"));
+  ASSERT_OK(conn.Execute("INSERT INTO t SELECT i, i FROM generate_series(1, 6) i"));
+  const auto t1_ht = (ASSERT_RESULT(NowMicros(&conn))) << 12;
+  ASSERT_OK(conn.Execute("INSERT INTO t SELECT i, i FROM generate_series(7, 10) i"));
+  ASSERT_OK(conn.Execute("CREATE INDEX t_v ON t (v ASC)"));
+  const auto idx_oid = ASSERT_RESULT(conn.FetchRow<PGOid>("SELECT 't_v'::regclass::oid"));
+
+  const auto auth_key =
+      cluster_->mini_tablet_server(0)->server()->GetSharedMemoryPostgresAuthKey();
+  auto internal = ASSERT_RESULT(CreateInternalPGConnBuilder(
+      pg_host_port(), "yugabyte", /*user=*/"postgres", auth_key,
+      /* deadline= */ std::nullopt).Connect());
+
+  for (const auto* mode : {"relaxed", "deferred"}) {
+    ASSERT_OK(internal.ExecuteFormat("SET yb_read_after_commit_visibility = '$0'", mode));
+    const auto bf = ASSERT_RESULT((internal.FetchRow<std::string, double>(Format(
+        "BACKFILL INDEX $0 WITH x'0880011a00' READ TIME $1 PARTITION x''", idx_oid, t1_ht))));
+    ASSERT_EQ(std::get<1>(bf), 6) << mode;
+  }
+}
+
+class PgFastPathWriteTest : public PgReadTimeBaseTest {};
+
+INSTANTIATE_TEST_CASE_P(
+    Isolation, PgFastPathWriteTest,
+    ::testing::Combine(
+        ::testing::Values(
+            IsolationLevel::READ_COMMITTED, IsolationLevel::SNAPSHOT_ISOLATION,
+            IsolationLevel::SERIALIZABLE_ISOLATION),
+        ::testing::ValuesIn(ConcurrentDdl::kValues)),
+    ReadTimeParamName);
+
+// Test only meant for code coverage of fast path x catalog read time.
+// Otherwise, moot.
+TEST_P(PgFastPathWriteTest, PrecedesCatalogReadTime) {
+  auto conn = ASSERT_RESULT(Connect());
+  ASSERT_NO_FATALS(SetSessionIsolation(&conn));
+  ASSERT_OK(conn.Execute("CREATE TABLE foo (k INT PRIMARY KEY, v INT)"));
+  ASSERT_OK(conn.Execute("SET yb_disable_transactional_writes = 1"));
+
+  auto ddl = ASSERT_RESULT(Connect());
+  ASSERT_OK(ddl.Execute("ALTER TABLE foo ADD COLUMN w INT DEFAULT 7"));
+
+  ASSERT_OK(conn.Execute("INSERT INTO foo VALUES (1, 10, 20)"));
+  ASSERT_EQ(ASSERT_RESULT(conn.FetchRow<int32_t>("SELECT w FROM foo WHERE k = 1")), 20);
+}
+
+TEST_P(PgFastPathWriteTest, ConflictsWithCrossTxnSnapshot) {
+  if (isolation() != IsolationLevel::SNAPSHOT_ISOLATION) {
+    return;
+  }
+  auto exporter = ASSERT_RESULT(ConnectAtIsolation());
+  ASSERT_OK(exporter.Execute("CREATE TABLE t (k INT PRIMARY KEY, v INT)"));
+  ASSERT_OK(exporter.Execute("INSERT INTO t VALUES (1, 1)"));
+
+  ASSERT_OK(exporter.Execute("BEGIN"));
+  const auto snapshot_id = ASSERT_RESULT(ExportSnapshot(exporter));
+
+  for (const auto set_before_begin : {true, false}) {
+    auto importer = ASSERT_RESULT(ConnectAtIsolation());
+    if (set_before_begin) {
+      ASSERT_OK(importer.Execute("SET yb_disable_transactional_writes = 1"));
+    }
+    ASSERT_OK(importer.Execute("BEGIN"));
+    ASSERT_OK(ImportSnapshot(importer, snapshot_id));
+    if (!set_before_begin) {
+      ASSERT_OK(importer.Execute("SET yb_disable_transactional_writes = 1"));
+    }
+
+    const auto status = importer.Execute("INSERT INTO t VALUES (100, 100)");
+    ASSERT_NOK(status);
+    ASSERT_STR_CONTAINS(
+        status.ToString(), "Cannot pick a read time in the storage layer with exported/imported");
+    ASSERT_OK(importer.Execute("ROLLBACK"));
+  }
+  ASSERT_OK(exporter.Execute("COMMIT"));
+}
+
+TEST_P(PgFastPathWriteTest, ConflictsWithFollowerReads) {
+  auto conn = ASSERT_RESULT(Connect());
+  ASSERT_NO_FATALS(SetSessionIsolation(&conn));
+  ASSERT_OK(conn.Execute("CREATE TABLE t (k INT PRIMARY KEY, v INT)"));
+  ASSERT_OK(conn.Execute("SET yb_disable_transactional_writes = 1"));
+  ASSERT_OK(EnableFollowerReads(conn));
+
+  const auto status = conn.Execute("INSERT INTO t VALUES (1, 1)");
+  ASSERT_NOK(status);
+  ASSERT_STR_CONTAINS(status.ToString(), "cannot execute INSERT in a read-only transaction");
+}
+
+// No read restart expected.
+TEST_P(PgFastPathWriteTest, ConflictsWithRestartRead) {
+  auto conn = ASSERT_RESULT(Connect());
+  ASSERT_NO_FATALS(SetSessionIsolation(&conn));
+  ASSERT_OK(conn.Execute("CREATE TABLE t (k INT PRIMARY KEY, v INT)"));
+  ASSERT_OK(conn.Execute("SET yb_max_query_layer_retries = 0"));
+  ASSERT_OK(conn.Execute("SET yb_disable_transactional_writes = 1"));
+
+  const auto csv_filename = GetTestPath("pg_read_time-test-fastpath-copy.csv");
+  GenerateCSVFileForCopy(csv_filename, 1000 /* num_rows */);
+
+  TestThreadHolder threads;
+  constexpr int kConcurrentWriters = 3;
+  for (int w = 0; w < kConcurrentWriters; ++w) {
+    StartConcurrentInserts(&threads, "t", (w + 1) * 1'000'000);
+  }
+
+  RunFor(5s * kTimeMultiplier, [&conn, &csv_filename] {
+    ASSERT_OK(ExecuteCopyFromCSV(conn, "t", csv_filename));
+    ASSERT_OK(conn.Execute("TRUNCATE t"));
+  });
+  threads.Stop();
+}
+
+TEST_P(PgFastPathWriteTest, PrecedesClampDefer) {
+  auto conn = ASSERT_RESULT(Connect());
+  ASSERT_NO_FATALS(SetSessionIsolation(&conn));
+  ASSERT_OK(conn.Execute("CREATE TABLE t (k INT PRIMARY KEY, v INT)"));
+  ASSERT_OK(conn.Execute("SET yb_disable_transactional_writes = 1"));
+
+  const auto csv_filename = GetTestPath("pg_read_time-test-fastpath-copy.csv");
+  GenerateCSVFileForCopy(csv_filename, 1 /* num_rows */);
+
+  for (const auto* mode : {"relaxed", "deferred"}) {
+    ASSERT_OK(conn.ExecuteFormat("SET yb_read_after_commit_visibility = '$0'", mode));
+    // Read time must be picked in the storage layer for conflict resolution correctness.
+    CheckReadTimePickedOnDocdb([&conn, &csv_filename] {
+      ASSERT_OK(ExecuteCopyFromCSV(conn, "t", csv_filename));
+    });
+    ASSERT_OK(conn.Execute("TRUNCATE t"));
+  }
+}
+
+class PgCatalogReadTimeTest : public PgReadTimeBaseTest {};
+
+INSTANTIATE_TEST_CASE_P(
+    Isolation, PgCatalogReadTimeTest,
+    ::testing::Combine(
+        ::testing::Values(IsolationLevel::READ_COMMITTED, IsolationLevel::SNAPSHOT_ISOLATION),
+        ::testing::ValuesIn(ConcurrentDdl::kValues)),
+    ReadTimeParamName);
+
+TEST_P(PgCatalogReadTimeTest, PrecedesCrossTxnSnapshot) {
+  if (isolation() != IsolationLevel::SNAPSHOT_ISOLATION || IsConcurrentDdl()) {
+    return;
+  }
+  auto exporter = ASSERT_RESULT(ConnectAtIsolation());
+  ASSERT_OK(exporter.Execute("CREATE TABLE foo (k INT PRIMARY KEY, v INT)"));
+  ASSERT_OK(exporter.Execute("INSERT INTO foo VALUES (1, 10)"));
+
+  ASSERT_OK(exporter.Execute("BEGIN"));
+  const auto snapshot_id = ASSERT_RESULT(ExportSnapshot(exporter));
+
+  SleepFor(kWaitPastUncertaintyWindow);
+
+  auto ddl = ASSERT_RESULT(Connect());
+  ASSERT_OK(ddl.Execute("ALTER TABLE foo ADD COLUMN w INT DEFAULT 7"));
+  ASSERT_OK(ddl.Execute("INSERT INTO foo VALUES (2, 20)"));
+
+  auto importer = ASSERT_RESULT(ConnectAtIsolation());
+  ASSERT_OK(importer.Execute("BEGIN"));
+  ASSERT_OK(ImportSnapshot(importer, snapshot_id));
+
+  // Ensure ALTER TABLE is reflected despite snapshot import.
+  // Catalog Snapshot is unaffected by imported txn snapshot.
+  ASSERT_OK(importer.Fetch("SELECT w FROM foo"));
+  ASSERT_EQ(ASSERT_RESULT(importer.FetchRow<PGUint64>("SELECT count(*) FROM foo")), 1);
+
+  ASSERT_OK(importer.Execute("COMMIT"));
+  ASSERT_OK(exporter.Execute("COMMIT"));
+}
+
+TEST_P(PgCatalogReadTimeTest, PrecedesFollowerReads) {
+  auto conn = ASSERT_RESULT(Connect());
+  ASSERT_NO_FATALS(SetSessionIsolation(&conn));
+  ASSERT_OK(conn.Execute("CREATE TABLE foo (k INT PRIMARY KEY, v INT)"));
+  ASSERT_OK(conn.Execute("INSERT INTO foo VALUES (1, 10)"));
+  ASSERT_OK(SetFollowerReadStaleness(conn));
+  SleepFor(kStalenessMs * 1ms);
+  ASSERT_OK(conn.Execute("ALTER TABLE foo ADD COLUMN w INT DEFAULT 7"));
+
+  ASSERT_OK(SwitchToFollowerReads(conn));
+  // Catalog snapshot unaffected by follower reads.
+  ASSERT_EQ(ASSERT_RESULT(conn.FetchRow<int32_t>("SELECT w FROM foo WHERE k = 1")), 7);
+}
+
+// No read restart expected.
+TEST_P(PgCatalogReadTimeTest, ConflictsWithRestartRead) {
+  auto setup = ASSERT_RESULT(Connect());
+  ASSERT_OK(setup.Execute("CREATE TABLE t (k INT PRIMARY KEY, v INT)"));
+
+  TestThreadHolder threads;
+  threads.AddThreadFunctor([this, &stop = threads.stop_flag()] {
+    auto conn = ASSERT_RESULT(Connect());
+    int i = 0;
+    LoopUntilStop(stop, [&conn, &i] {
+      const auto create_status =
+          conn.ExecuteFormat("CREATE TABLE churn_$0 (k INT PRIMARY KEY)", i);
+      ASSERT_TRUE(create_status.ok() || IsSerializeAccessError(create_status)) << create_status;
+      if (create_status.ok()) {
+        const auto drop_status = conn.ExecuteFormat("DROP TABLE churn_$0", i);
+        ASSERT_TRUE(drop_status.ok() || IsSerializeAccessError(drop_status)) << drop_status;
+      }
+      ++i;
+    });
+  });
+
+  auto reader = ASSERT_RESULT(Connect());
+  ASSERT_NO_FATALS(SetSessionIsolation(&reader));
+  ASSERT_OK(reader.Execute("SET yb_max_query_layer_retries = 0"));
+
+  RunFor(5s * kTimeMultiplier, [&reader] {
+    ASSERT_OK(reader.Fetch("SELECT count(*) FROM pg_class"));
+  });
+  threads.Stop();
+}
+
+TEST_P(PgCatalogReadTimeTest, PrecedesClampDefer) {
+  auto conn = ASSERT_RESULT(Connect());
+  ASSERT_NO_FATALS(SetSessionIsolation(&conn));
+  ASSERT_OK(conn.Execute("CREATE TABLE t (k INT PRIMARY KEY, v INT)"));
+
+  for (const auto* mode : {"relaxed", "deferred"}) {
+    ASSERT_OK(conn.ExecuteFormat("SET yb_read_after_commit_visibility = '$0'", mode));
+    ASSERT_OK(conn.Fetch("SELECT count(*) FROM pg_class"));
+    ASSERT_OK(conn.Fetch("SELECT count(*) FROM t"));
+  }
+}
+
+TEST_P(PgCatalogReadTimeTest, PrecedesEnsureReadTime) {
+  auto conn = ASSERT_RESULT(Connect());
+  ASSERT_NO_FATALS(SetSessionIsolation(&conn));
+  ASSERT_OK(conn.Execute("CREATE TABLE t (k INT PRIMARY KEY, v INT)"));
+  ASSERT_OK(conn.Execute("INSERT INTO t SELECT i, i FROM generate_series(1, 10) i"));
+
+  ASSERT_OK(conn.Execute("SET force_parallel_mode = on"));
+  ASSERT_OK(conn.Fetch("SELECT count(*) FROM pg_class"));
+  ASSERT_EQ(ASSERT_RESULT(conn.FetchRow<PGUint64>("SELECT count(*) FROM t")), 10);
+}
+
+class PgCrossTxnSnapshotTest : public PgReadTimeBaseTest {};
+
+// TODO(#32602): re-enable concurrent ddl case after fix
+INSTANTIATE_TEST_CASE_P(
+    Isolation, PgCrossTxnSnapshotTest,
+    ::testing::Combine(
+        ::testing::Values(
+            IsolationLevel::READ_COMMITTED, IsolationLevel::SNAPSHOT_ISOLATION,
+            IsolationLevel::SERIALIZABLE_ISOLATION),
+        ::testing::Values(ConcurrentDdl::kFalse)),
+    ReadTimeParamName);
+
+TEST_P(PgCrossTxnSnapshotTest, ConflictsWithFollowerReads) {
+  if (isolation() != IsolationLevel::SNAPSHOT_ISOLATION) {
+    return;
+  }
+  auto exporter = ASSERT_RESULT(ConnectAtIsolation());
+  ASSERT_OK(exporter.Execute("CREATE TABLE t (k INT PRIMARY KEY, v INT)"));
+  ASSERT_OK(exporter.Execute("INSERT INTO t VALUES (1, 1)"));
+
+  ASSERT_OK(exporter.Execute("BEGIN"));
+  const auto snapshot_id = ASSERT_RESULT(ExportSnapshot(exporter));
+
+  auto importer = ASSERT_RESULT(ConnectAtIsolation());
+  ASSERT_OK(EnableFollowerReads(importer));
+  ASSERT_OK(importer.Execute("BEGIN"));
+
+  const auto status = ImportSnapshot(importer, snapshot_id);
+  ASSERT_NOK(status);
+  ASSERT_STR_CONTAINS(
+      status.ToString(),
+      "Cannot set both 'transaction snapshot' and 'yb_read_from_followers' in the same "
+      "transaction");
+
+  ASSERT_OK(importer.Execute("ROLLBACK"));
+  ASSERT_OK(exporter.Execute("COMMIT"));
+}
+
+// Read restart errors are not retried.
+TEST_P(PgCrossTxnSnapshotTest, ConflictsWithRestartRead) {
+  if (isolation() != IsolationLevel::SNAPSHOT_ISOLATION) {
+    return;
+  }
+  auto exporter = ASSERT_RESULT(ConnectAtIsolation());
+  ASSERT_OK(exporter.Execute("CREATE TABLE t (k INT PRIMARY KEY, v INT)"));
+  ASSERT_OK(exporter.Execute("INSERT INTO t SELECT i, i FROM generate_series(1, 6) i"));
+
+  ASSERT_OK(exporter.Execute("BEGIN"));
+  const auto snapshot_id = ASSERT_RESULT(ExportSnapshot(exporter));
+
+  auto importer = ASSERT_RESULT(ConnectAtIsolation());
+  ASSERT_OK(importer.Execute("BEGIN"));
+  ASSERT_OK(ImportSnapshot(importer, snapshot_id));
+
+  auto writer = ASSERT_RESULT(Connect());
+  ASSERT_OK(writer.Execute("INSERT INTO t SELECT i, i FROM generate_series(7, 10) i"));
+
+  const auto status = importer.Fetch("SELECT count(*) FROM t");
+  ASSERT_NOK(status);
+  ASSERT_STR_CONTAINS(status.status().ToString(), "Restart read required");
+  ASSERT_STR_CONTAINS(
+      status.status().ToString(), "not the first command in the transaction");
+
+  ASSERT_OK(importer.Execute("ROLLBACK"));
+  ASSERT_OK(exporter.Execute("COMMIT"));
+}
+
+TEST_P(PgCrossTxnSnapshotTest, ConflictsWithClampDefer) {
+  if (isolation() != IsolationLevel::SNAPSHOT_ISOLATION) {
+    return;
+  }
+  auto exporter = ASSERT_RESULT(ConnectAtIsolation());
+  ASSERT_OK(exporter.Execute("CREATE TABLE t (k INT PRIMARY KEY, v INT)"));
+  ASSERT_OK(exporter.Execute("INSERT INTO t VALUES (1, 1)"));
+
+  ASSERT_OK(exporter.Execute("BEGIN"));
+  const auto snapshot_id = ASSERT_RESULT(ExportSnapshot(exporter));
+
+  for (const auto* mode : {"relaxed", "deferred"}) {
+    auto importer = ASSERT_RESULT(ConnectAtIsolation());
+    ASSERT_OK(importer.ExecuteFormat("SET yb_read_after_commit_visibility = '$0'", mode));
+    ASSERT_OK(importer.Execute("BEGIN"));
+
+    const auto status = ImportSnapshot(importer, snapshot_id);
+    ASSERT_NOK(status);
+    ASSERT_STR_CONTAINS(
+        status.ToString(),
+        "Cannot set both 'transaction snapshot' and 'yb_read_after_commit_visibility' in "
+        "the same transaction");
+
+    ASSERT_OK(importer.Execute("ROLLBACK"));
+  }
+  ASSERT_OK(exporter.Execute("COMMIT"));
+}
+
+TEST_P(PgCrossTxnSnapshotTest, PrecedesEnsureReadTime) {
+  if (isolation() != IsolationLevel::SNAPSHOT_ISOLATION) {
+    return;
+  }
+  auto exporter = ASSERT_RESULT(ConnectAtIsolation());
+  ASSERT_OK(exporter.Execute("CREATE TABLE t (k INT PRIMARY KEY, v INT)"));
+  ASSERT_OK(exporter.Execute("INSERT INTO t SELECT i, i FROM generate_series(1, 6) i"));
+
+  ASSERT_OK(exporter.Execute("BEGIN"));
+  const auto snapshot_id = ASSERT_RESULT(ExportSnapshot(exporter));
+
+  SleepFor(kWaitPastUncertaintyWindow);
+
+  auto writer = ASSERT_RESULT(Connect());
+  ASSERT_OK(writer.Execute("INSERT INTO t SELECT i, i FROM generate_series(7, 10) i"));
+
+  auto importer = ASSERT_RESULT(ConnectAtIsolation());
+  ASSERT_OK(importer.Execute("SET force_parallel_mode = on"));
+  ASSERT_OK(importer.Execute("BEGIN"));
+  ASSERT_OK(ImportSnapshot(importer, snapshot_id));
+
+  ASSERT_EQ(ASSERT_RESULT(importer.FetchRow<PGUint64>("SELECT count(*) FROM t")), 6);
+
+  ASSERT_OK(importer.Execute("COMMIT"));
+  ASSERT_OK(exporter.Execute("COMMIT"));
+}
+
+class PgFollowerReadTest : public PgReadTimeBaseTest {};
+
+INSTANTIATE_TEST_CASE_P(
+    Isolation, PgFollowerReadTest,
+    ::testing::Combine(
+        ::testing::Values(IsolationLevel::READ_COMMITTED, IsolationLevel::SNAPSHOT_ISOLATION),
+        ::testing::ValuesIn(ConcurrentDdl::kValues)),
+    ReadTimeParamName);
+
+// No read restart errors are expected.
+TEST_P(PgFollowerReadTest, ConflictsWithRestartRead) {
+  auto setup = ASSERT_RESULT(Connect());
+  ASSERT_OK(setup.Execute("CREATE TABLE t (k INT PRIMARY KEY, v INT)"));
+  ASSERT_OK(setup.ExecuteFormat(
+      "INSERT INTO t SELECT i, 0 FROM generate_series(1, $0) i", kSeedRows));
+
+  TestThreadHolder threads;
+  StartConcurrentInserts(&threads, "t", kWriterStartKey);
+
+  auto reader = ASSERT_RESULT(Connect());
+  ASSERT_NO_FATALS(SetSessionIsolation(&reader));
+  ASSERT_OK(reader.Execute("SET yb_max_query_layer_retries = 0"));
+  ASSERT_OK(EnableFollowerReads(reader));
+
+  RunFor(10s * kTimeMultiplier, [&reader] {
+    ASSERT_OK(reader.Fetch("SELECT count(*) FROM t"));
+  });
+  threads.Stop();
+}
+
+TEST_P(PgFollowerReadTest, PrecedesClampDefer) {
+  auto conn = ASSERT_RESULT(Connect());
+  ASSERT_NO_FATALS(SetSessionIsolation(&conn));
+  ASSERT_OK(conn.Execute("CREATE TABLE t (k INT PRIMARY KEY, v INT)"));
+  ASSERT_OK(conn.Execute("INSERT INTO t SELECT i, i FROM generate_series(1, 6) i"));
+
+  ASSERT_OK(SetFollowerReadStaleness(conn));
+  SleepFor(kStalenessMs * 1ms);
+  ASSERT_OK(conn.Execute("INSERT INTO t SELECT i, i FROM generate_series(7, 10) i"));
+
+  ASSERT_OK(SwitchToFollowerReads(conn));
+
+  for (const auto* mode : {"relaxed", "deferred"}) {
+    ASSERT_OK(conn.ExecuteFormat("SET yb_read_after_commit_visibility = '$0'", mode));
+    ASSERT_EQ(ASSERT_RESULT(conn.FetchRow<PGUint64>("SELECT count(*) FROM t")), 6) << mode;
+  }
+}
+
+TEST_P(PgFollowerReadTest, PrecedesEnsureReadTime) {
+  auto conn = ASSERT_RESULT(Connect());
+  ASSERT_NO_FATALS(SetSessionIsolation(&conn));
+  ASSERT_OK(conn.Execute("CREATE TABLE t (k INT PRIMARY KEY, v INT)"));
+  ASSERT_OK(conn.Execute("INSERT INTO t SELECT i, i FROM generate_series(1, 6) i"));
+
+  ASSERT_OK(SetFollowerReadStaleness(conn));
+  SleepFor(kStalenessMs * 1ms);
+  ASSERT_OK(conn.Execute("INSERT INTO t SELECT i, i FROM generate_series(7, 10) i"));
+
+  ASSERT_OK(SwitchToFollowerReads(conn));
+
+  ASSERT_OK(conn.Execute("SET force_parallel_mode = on"));
+  ASSERT_EQ(ASSERT_RESULT(conn.FetchRow<PGUint64>("SELECT count(*) FROM t")), 6);
+}
+
+class PgRestartReadTest : public PgReadTimeBaseTest {};
+
+INSTANTIATE_TEST_CASE_P(
+    Isolation, PgRestartReadTest,
+    ::testing::Combine(
+        ::testing::Values(
+            IsolationLevel::READ_COMMITTED, IsolationLevel::SNAPSHOT_ISOLATION,
+            IsolationLevel::SERIALIZABLE_ISOLATION),
+        ::testing::ValuesIn(ConcurrentDdl::kValues)),
+    ReadTimeParamName);
+
+// No read restart errors are expected.
+TEST_P(PgRestartReadTest, ConflictsWithClampDefer) {
+  auto setup = ASSERT_RESULT(Connect());
+  ASSERT_OK(setup.Execute("CREATE TABLE t (k INT PRIMARY KEY, v INT)"));
+  ASSERT_OK(setup.ExecuteFormat(
+      "INSERT INTO t SELECT i, 0 FROM generate_series(1, $0) i", kSeedRows));
+
+  for (const auto* mode : {"relaxed", "deferred"}) {
+    auto reader = ASSERT_RESULT(Connect());
+    ASSERT_OK(reader.Execute("SET yb_max_query_layer_retries = 0"));
+    ASSERT_OK(reader.ExecuteFormat("SET yb_read_after_commit_visibility = '$0'", mode));
+
+    TestThreadHolder threads;
+    StartConcurrentInserts(&threads, "t", kWriterStartKey);
+
+    RunFor(10s * kTimeMultiplier, [this, &reader] {
+      ASSERT_OK(reader.StartTransaction(isolation()));
+      ASSERT_OK(reader.Fetch(Format("SELECT count(*) FROM t WHERE k <= $0", kSeedRows)));
+      ASSERT_OK(reader.CommitTransaction());
+    });
+    threads.Stop();
+  }
+}
+
+TEST_P(PgRestartReadTest, PrecedesEnsureReadTime) {
+  auto setup = ASSERT_RESULT(Connect());
+  ASSERT_OK(setup.Execute("CREATE TABLE t (k INT PRIMARY KEY, v INT)"));
+  ASSERT_OK(setup.ExecuteFormat(
+      "INSERT INTO t SELECT i, 0 FROM generate_series(1, $0) i", kSeedRows));
+
+  auto reader = ASSERT_RESULT(Connect());
+  ASSERT_OK(reader.Execute("SET force_parallel_mode = on"));
+  ASSERT_OK(reader.Execute("SET yb_max_query_layer_retries = 60"));
+
+  TestThreadHolder threads;
+  StartConcurrentInserts(&threads, "t", kWriterStartKey);
+
+  RunFor(10s * kTimeMultiplier, [this, &reader] {
+    ASSERT_OK(reader.StartTransaction(isolation()));
+    // Should not see any internal errors such as "Attempted to restart ..."
+    ASSERT_OK(reader.Fetch(Format("SELECT count(*) FROM t WHERE k <= $0", kSeedRows)));
+    ASSERT_OK(reader.CommitTransaction());
+  });
+  threads.Stop();
+}
+
+class PgClampDeferReadTest : public PgReadTimeBaseTest {};
+
+INSTANTIATE_TEST_CASE_P(
+    Isolation, PgClampDeferReadTest,
+    ::testing::Combine(
+        ::testing::Values(
+            IsolationLevel::READ_COMMITTED, IsolationLevel::SNAPSHOT_ISOLATION,
+            IsolationLevel::SERIALIZABLE_ISOLATION),
+        ::testing::ValuesIn(ConcurrentDdl::kValues)),
+    ReadTimeParamName);
+
+TEST_P(PgClampDeferReadTest, PrecedesEnsureReadTime) {
+  if (isolation() == IsolationLevel::SERIALIZABLE_ISOLATION) {
+    return;
+  }
+  auto conn = ASSERT_RESULT(Connect());
+  ASSERT_NO_FATALS(SetSessionIsolation(&conn));
+  ASSERT_OK(conn.Execute("CREATE TABLE t (k INT PRIMARY KEY, v INT)"));
+  ASSERT_OK(conn.Execute("INSERT INTO t SELECT i, i FROM generate_series(1, 10) i"));
+
+  for (const auto* mode : {"relaxed", "deferred"}) {
+    ASSERT_OK(conn.ExecuteFormat("SET yb_read_after_commit_visibility = '$0'", mode));
+    ASSERT_OK(conn.Execute("SET force_parallel_mode = on"));
+    CheckReadTimeProvidedToDocdb([&conn] {
+      ASSERT_OK(conn.Fetch("SELECT count(*) FROM t"));
+    });
+  }
+}
+
+TEST_P(PgClampDeferReadTest, DoesNotApplyIfReadTimeIsAlreadyPicked) {
+  if (isolation() != IsolationLevel::SNAPSHOT_ISOLATION) {
+    return;
+  }
+  auto setup = ASSERT_RESULT(Connect());
+  ASSERT_OK(setup.Execute("CREATE TABLE t (k INT PRIMARY KEY, v INT)"));
+  ASSERT_OK(setup.ExecuteFormat(
+      "INSERT INTO t SELECT i, 0 FROM generate_series(1, $0) i", kSeedRows));
+
+  auto reader = ASSERT_RESULT(Connect());
+  ASSERT_NO_FATALS(SetSessionIsolation(&reader));
+  ASSERT_OK(reader.Execute("SET yb_max_query_layer_retries = 60"));
+  ASSERT_OK(reader.ExecuteFormat(
+      "CREATE FUNCTION clamp_after_read_time() RETURNS bigint AS "
+      "'BEGIN"
+      "   PERFORM count(*) FROM t WHERE k <= $0;"
+      "   SET yb_read_after_commit_visibility = relaxed;"
+      "   RETURN (SELECT count(*) FROM t WHERE k <= $0);"
+      " END' LANGUAGE plpgsql", kSeedRows));
+
+  TestThreadHolder threads;
+  StartConcurrentInserts(&threads, "t", kWriterStartKey);
+
+  RunFor(10s * kTimeMultiplier, [&reader] {
+    ASSERT_OK(reader.Execute("SET yb_read_after_commit_visibility = strict"));
+    ASSERT_EQ(
+        ASSERT_RESULT(reader.FetchRow<PGUint64>("SELECT clamp_after_read_time()")), kSeedRows);
+  });
+  threads.Stop();
+}
+
+} // namespace yb::pgwrapper

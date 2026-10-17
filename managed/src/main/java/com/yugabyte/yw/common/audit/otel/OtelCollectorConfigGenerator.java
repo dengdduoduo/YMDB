@@ -1,0 +1,3289 @@
+package com.yugabyte.yw.common.audit.otel;
+
+import com.google.common.collect.ImmutableList;
+import com.google.common.collect.ImmutableMap;
+import com.google.common.collect.ImmutableSet;
+import com.yugabyte.yw.commissioner.Common;
+import com.yugabyte.yw.commissioner.tasks.params.NodeTaskParams;
+import com.yugabyte.yw.common.FileHelperService;
+import com.yugabyte.yw.common.Util;
+import com.yugabyte.yw.common.audit.otel.OtelCollectorConfigFormat.MultilineConfig;
+import com.yugabyte.yw.common.audit.otel.OtelCollectorConfigFormat.RetryConfig;
+import com.yugabyte.yw.common.config.ConfKeyInfo;
+import com.yugabyte.yw.common.config.GlobalConfKeys;
+import com.yugabyte.yw.common.config.RuntimeConfGetter;
+import com.yugabyte.yw.common.config.UniverseConfKeys;
+import com.yugabyte.yw.common.export.TelemetryConfig;
+import com.yugabyte.yw.common.yaml.SkipNullRepresenter;
+import com.yugabyte.yw.forms.UniverseDefinitionTaskParams;
+import com.yugabyte.yw.forms.UniverseTaskParams;
+import com.yugabyte.yw.models.NodeAgent;
+import com.yugabyte.yw.models.Provider;
+import com.yugabyte.yw.models.TelemetryProvider;
+import com.yugabyte.yw.models.Universe;
+import com.yugabyte.yw.models.helpers.MetricCollectionLevel;
+import com.yugabyte.yw.models.helpers.NodeDetails;
+import com.yugabyte.yw.models.helpers.TelemetryProviderService;
+import com.yugabyte.yw.models.helpers.exporters.BatchedLogsExporterConfig;
+import com.yugabyte.yw.models.helpers.exporters.UniverseExporterConfig;
+import com.yugabyte.yw.models.helpers.exporters.audit.AuditLogConfig;
+import com.yugabyte.yw.models.helpers.exporters.audit.UniverseLogsExporterConfig;
+import com.yugabyte.yw.models.helpers.exporters.audit.YCQLAuditConfig;
+import com.yugabyte.yw.models.helpers.exporters.metrics.MetricsExportConfig;
+import com.yugabyte.yw.models.helpers.exporters.metrics.ScrapeConfigTargetType;
+import com.yugabyte.yw.models.helpers.exporters.metrics.UniverseMetricsExporterConfig;
+import com.yugabyte.yw.models.helpers.exporters.query.QueryLogConfig;
+import com.yugabyte.yw.models.helpers.exporters.query.UniverseQueryLogsExporterConfig;
+import com.yugabyte.yw.models.helpers.exporters.server.ControllerLogConfig;
+import com.yugabyte.yw.models.helpers.exporters.server.MasterLogConfig;
+import com.yugabyte.yw.models.helpers.exporters.server.NodeAgentLogConfig;
+import com.yugabyte.yw.models.helpers.exporters.server.ServerLogLevel;
+import com.yugabyte.yw.models.helpers.exporters.server.SimpleServerLogConfig;
+import com.yugabyte.yw.models.helpers.exporters.server.TServerLogConfig;
+import com.yugabyte.yw.models.helpers.exporters.server.UniverseServerLogsExporterConfig;
+import com.yugabyte.yw.models.helpers.exporters.server.YnpLogConfig;
+import com.yugabyte.yw.models.helpers.exporters.server.YsqlConnMgrLogConfig;
+import com.yugabyte.yw.models.helpers.telemetry.AWSCloudWatchConfig;
+import com.yugabyte.yw.models.helpers.telemetry.AuthCredentials.AuthType;
+import com.yugabyte.yw.models.helpers.telemetry.DataDogConfig;
+import com.yugabyte.yw.models.helpers.telemetry.DynatraceConfig;
+import com.yugabyte.yw.models.helpers.telemetry.ExportType;
+import com.yugabyte.yw.models.helpers.telemetry.ExporterRetryConfig;
+import com.yugabyte.yw.models.helpers.telemetry.GCPCloudMonitoringConfig;
+import com.yugabyte.yw.models.helpers.telemetry.LokiConfig;
+import com.yugabyte.yw.models.helpers.telemetry.OTLPConfig;
+import com.yugabyte.yw.models.helpers.telemetry.ProviderType;
+import com.yugabyte.yw.models.helpers.telemetry.S3Config;
+import com.yugabyte.yw.models.helpers.telemetry.SplunkConfig;
+import java.io.BufferedWriter;
+import java.io.FileWriter;
+import java.io.StringWriter;
+import java.nio.file.Path;
+import java.util.*;
+import java.util.stream.Collectors;
+import javax.inject.Inject;
+import javax.inject.Singleton;
+import lombok.AllArgsConstructor;
+import lombok.Data;
+import lombok.extern.slf4j.Slf4j;
+import org.apache.commons.collections4.CollectionUtils;
+import org.apache.commons.collections4.MapUtils;
+import org.apache.commons.lang3.StringUtils;
+import org.yaml.snakeyaml.Yaml;
+import play.Environment;
+import play.libs.Json;
+
+@Slf4j
+@Singleton
+public class OtelCollectorConfigGenerator {
+  // Service names
+  private static final String SERVICE_TSERVER = "yb-tserver";
+  private static final String SERVICE_NODE_EXPORTER = "node-exporter";
+  private static final String SERVICE_NODE_AGENT = "node-agent";
+  private static final String SERVICE_OTEL_COLLECTOR = "otel-collector";
+  private static final String SERVICE_OTEL_COLLECTOR_FULL = "yb-otel-collector";
+
+  // Export types
+  private static final String EXPORT_TYPE_MASTER = "master_export";
+  private static final String EXPORT_TYPE_TSERVER = "tserver_export";
+  private static final String EXPORT_TYPE_CQL = "cql_export";
+  private static final String EXPORT_TYPE_YSQL = "ysql_export";
+  private static final String EXPORT_TYPE_NODE = "node_export";
+  private static final String EXPORT_TYPE_NODE_AGENT = "node_agent";
+  private static final String EXPORT_TYPE_OTEL = "otel_export";
+
+  // Log types
+  private static final String LOG_TYPE_YSQL = "ysql";
+  private static final String LOG_TYPE_YCQL = "ycql";
+  private static final String LOG_TYPE_QUERY_YSQL = "query_logs_ysql";
+  private static final String LOG_TYPE_MASTER = "master";
+  private static final String LOG_TYPE_TSERVER = "tserver";
+  // Internal-only diagnostic log sources (VM-only).
+  private static final String LOG_TYPE_YSQL_CONN_MGR = "ysql_conn_mgr";
+  private static final String LOG_TYPE_NODE_AGENT = "node_agent";
+  private static final String LOG_TYPE_YNP = "ynp";
+  private static final String LOG_TYPE_CONTROLLER = "controller";
+
+  // Job names
+  private static final String JOB_NAME_YUGABYTE = "yugabyte";
+  private static final String JOB_NAME_NODE = "node";
+  private static final String JOB_NAME_NODE_AGENT = "node-agent";
+  private static final String JOB_NAME_OTEL_COLLECTOR = "otel-collector";
+
+  // Parameters
+  private static final String PARAM_SHOW_HELP = "__param_show_help";
+  private static final String PARAM_PRIORITY_REGEX = "__param_priority_regex";
+  private static final String PARAM_METRICS = "__param_metrics";
+  private static final String DEFAULT_SHOW_HELP = "true";
+
+  // Receiver prefixes
+  private static final String RECEIVER_PREFIX_FILELOG = "filelog/";
+  private static final String RECEIVER_PREFIX_PROMETHEUS = "prometheus/";
+
+  // K8s pod paths (mounted by the chart), in place of the VM provider.getYbHome() paths.
+  private static final String K8S_TSERVER_LOG_DIR = "/mnt/disk0/yb-data/tserver/logs";
+  private static final String K8S_MASTER_LOG_DIR = "/mnt/disk0/yb-data/master/logs";
+  // yb-controller sidecar log dir inside the yb-tserver pod (matches
+  // GFlagsUtil.K8S_YBC_LOG_SUBDIR).
+  private static final String K8S_YBC_LOG_DIR = "/mnt/disk0/ybc-data/controller/logs";
+  private static final String K8S_OTEL_DIR = "/mnt/disk0/otel-collector";
+  // The otel sidecar shares the pod network namespace, so all scrape targets are pod-local.
+  private static final String K8S_POD_LOCAL_ADDRESS = "127.0.0.1";
+  // Fallback only, for universes created before the port was tracked in communicationPorts.
+  private static final int K8S_OTEL_METRICS_PORT_DEFAULT = 8889;
+
+  // Bind address for the collector's own internal-telemetry metrics endpoint.
+  private static final String ALL_INTERFACES_ADDRESS = "0.0.0.0";
+
+  // Processor prefixes
+  private static final String PROCESSOR_PREFIX_ATTRIBUTES = "attributes/";
+  private static final String PROCESSOR_PREFIX_BATCH = "batch/";
+  private static final String PROCESSOR_PREFIX_MEMORY_LIMITER = "memory_limiter/";
+  private static final String PROCESSOR_PREFIX_TRANSFORM = "transform/";
+
+  // Pipeline prefixes
+  private static final String PIPELINE_PREFIX_LOGS = "logs/";
+  private static final String PIPELINE_PREFIX_METRICS = "metrics/";
+
+  // API endpoints
+  private static final String DYNATRACE_OTLP_ENDPOINT = "/api/v2/otlp";
+
+  // Processor prefixes
+  private static final String PROCESSOR_PREFIX_CUMULATIVE_TO_DELTA = "cumulativetodelta/";
+  private static final String PROCESSOR_PREFIX_METRIC_TRANSFORM = "metricstransform/";
+
+  // Exporter prefixes
+  private static final String EXPORTER_PREFIX_DATADOG = "datadog/";
+  private static final String EXPORTER_PREFIX_SPLUNK = "splunk_hec/";
+  private static final String EXPORTER_PREFIX_AWS_CLOUDWATCH = "awscloudwatchlogs/";
+  private static final String EXPORTER_PREFIX_GCP_CLOUD_MONITORING = "googlecloud/";
+  // Loki now exports over OTLP HTTP - the `loki` exporter was removed from contrib in 0.131.0.
+  private static final String EXPORTER_PREFIX_LOKI = "otlphttp/";
+  private static final String EXPORTER_PREFIX_DYNATRACE = "otlphttp/";
+  private static final String EXPORTER_PREFIX_S3 = "awss3/";
+
+  // Export type prefixes
+  private static final String EXPORT_TYPE_PREFIX_QUERY_LOGS = "query_logs_";
+  private static final String EXPORT_TYPE_PREFIX_METRICS = "metrics_";
+  private static final String EXPORT_TYPE_PREFIX_MASTER_LOGS = "master_logs_";
+  private static final String EXPORT_TYPE_PREFIX_TSERVER_LOGS = "tserver_logs_";
+  private static final String EXPORT_TYPE_PREFIX_YSQL_CONN_MGR_LOGS = "ysql_conn_mgr_logs_";
+  private static final String EXPORT_TYPE_PREFIX_NODE_AGENT_LOGS = "node_agent_logs_";
+  private static final String EXPORT_TYPE_PREFIX_YNP_LOGS = "ynp_logs_";
+  private static final String EXPORT_TYPE_PREFIX_CONTROLLER_LOGS = "controller_logs_";
+
+  // Common attribute strings
+  private static final String ATTR_PREFIX_YUGABYTE = "yugabyte.";
+  private static final String PURPOSE_SUFFIX_METRICS_EXPORT = "_METRICS_EXPORT";
+  private static final String PURPOSE_SUFFIX_AUDIT_LOG_EXPORT = "_LOG_EXPORT";
+  private static final String PURPOSE_SUFFIX_QUERY_LOG_EXPORT = "_QUERY_LOG_EXPORT";
+  private static final String PURPOSE_SUFFIX_MASTER_LOG_EXPORT = "_MASTER_LOG_EXPORT";
+  private static final String PURPOSE_SUFFIX_TSERVER_LOG_EXPORT = "_TSERVER_LOG_EXPORT";
+  private static final String PURPOSE_SUFFIX_YSQL_CONN_MGR_LOG_EXPORT = "_YSQL_CONN_MGR_LOG_EXPORT";
+  private static final String PURPOSE_SUFFIX_NODE_AGENT_LOG_EXPORT = "_NODE_AGENT_LOG_EXPORT";
+  private static final String PURPOSE_SUFFIX_YNP_LOG_EXPORT = "_YNP_LOG_EXPORT";
+  private static final String PURPOSE_SUFFIX_CONTROLLER_LOG_EXPORT = "_CONTROLLER_LOG_EXPORT";
+
+  /** Result of building the full K8s collector config: the config YAML + secret env for the pod. */
+  @Data
+  @AllArgsConstructor
+  public static class K8sOtelConfig {
+    private boolean enabled;
+    private String config;
+    private List<Object> secretEnv;
+  }
+
+  private final FileHelperService fileHelperService;
+  private final TelemetryProviderService telemetryProviderService;
+  private final RuntimeConfGetter confGetter;
+
+  private final AuditLogRegexGenerator auditLogRegexGenerator;
+  private final QueryLogRegexGenerator queryLogRegexGenerator;
+  private final Environment environment;
+
+  @Inject
+  public OtelCollectorConfigGenerator(
+      Environment environment,
+      FileHelperService fileHelperService,
+      TelemetryProviderService telemetryProviderService,
+      AuditLogRegexGenerator auditLogRegexGenerator,
+      QueryLogRegexGenerator queryLogRegexGenerator,
+      RuntimeConfGetter confGetter) {
+    this.environment = environment;
+    this.fileHelperService = fileHelperService;
+    this.telemetryProviderService = telemetryProviderService;
+    this.auditLogRegexGenerator = auditLogRegexGenerator;
+    this.queryLogRegexGenerator = queryLogRegexGenerator;
+    this.confGetter = confGetter;
+  }
+
+  public Path generateConfigFile(
+      NodeTaskParams nodeParams,
+      Provider provider,
+      UniverseDefinitionTaskParams.UserIntent userIntent,
+      TelemetryConfig telemetryConfig,
+      String logLinePrefix,
+      int otelColMetricsPort,
+      NodeAgent nodeAgent) {
+    Path path =
+        fileHelperService.createTempFile(
+            "otel_collector_config_" + nodeParams.getUniverseUUID() + "_" + nodeParams.nodeUuid,
+            ".yml");
+    generateConfigFile(
+        nodeParams,
+        provider,
+        userIntent,
+        telemetryConfig,
+        logLinePrefix,
+        path,
+        otelColMetricsPort,
+        nodeAgent);
+    return path;
+  }
+
+  void generateConfigFile(
+      NodeTaskParams nodeParams,
+      Provider provider,
+      UniverseDefinitionTaskParams.UserIntent userIntent,
+      TelemetryConfig telemetryConfig,
+      String logLinePrefix,
+      Path path,
+      int otelColMetricsPort,
+      NodeAgent nodeAgent) {
+    try (BufferedWriter writer = new BufferedWriter(new FileWriter(path.toFile()))) {
+      Yaml yaml = new Yaml(new SkipNullRepresenter());
+      OtelCollectorConfigFormat collectorConfigFormat = new OtelCollectorConfigFormat();
+      addCommonService(collectorConfigFormat, provider, userIntent, otelColMetricsPort);
+      AuditLogConfig auditLogConfig =
+          telemetryConfig != null ? telemetryConfig.getAuditLogConfig() : null;
+      QueryLogConfig queryLogConfig =
+          telemetryConfig != null ? telemetryConfig.getQueryLogConfig() : null;
+      MetricsExportConfig metricsExportConfig =
+          telemetryConfig != null ? telemetryConfig.getMetricsExportConfig() : null;
+      MasterLogConfig masterLogConfig =
+          telemetryConfig != null ? telemetryConfig.getMasterLogConfig() : null;
+      TServerLogConfig tserverLogConfig =
+          telemetryConfig != null ? telemetryConfig.getTserverLogConfig() : null;
+      addLogPipelines(
+          collectorConfigFormat,
+          nodeParams,
+          provider,
+          auditLogConfig,
+          queryLogConfig,
+          masterLogConfig,
+          tserverLogConfig,
+          telemetryConfig,
+          logLinePrefix);
+      if (metricsExportConfig != null) {
+        addMetricsExporterPipelines(
+            collectorConfigFormat,
+            nodeParams,
+            provider,
+            userIntent,
+            metricsExportConfig,
+            logLinePrefix,
+            otelColMetricsPort,
+            nodeAgent);
+      }
+
+      yaml.dump(collectorConfigFormat, writer);
+    } catch (Exception e) {
+      throw new RuntimeException("Error creating OpenTelemetry collector config file", e);
+    }
+  }
+
+  private void addCommonService(
+      OtelCollectorConfigFormat collectorConfigFormat,
+      Provider provider,
+      UniverseDefinitionTaskParams.UserIntent userIntent,
+      int otelColMetricsPort) {
+    OtelCollectorConfigFormat.Service service = new OtelCollectorConfigFormat.Service();
+
+    // Add extensions
+    collectorConfigFormat
+        .getExtensions()
+        .put("file_storage/queue", createStorageExtension(provider, userIntent));
+    service.setExtensions(new ArrayList<>(collectorConfigFormat.getExtensions().keySet()));
+
+    // Add internal telemetry config
+    OtelCollectorConfigFormat.TelemetryConfig telemetryConfig =
+        new OtelCollectorConfigFormat.TelemetryConfig();
+    service.setTelemetry(telemetryConfig);
+
+    // Add internal otel logs config
+    OtelCollectorConfigFormat.LogsConfig logsConfig = new OtelCollectorConfigFormat.LogsConfig();
+    logsConfig.setOutput_paths(
+        ImmutableList.of(provider.getYbHome() + "/otel-collector/logs/otel-collector.logs"));
+    telemetryConfig.setLogs(logsConfig);
+
+    // Add internal otel metrics config
+    telemetryConfig.setMetrics(createInternalMetricsConfig(otelColMetricsPort));
+
+    // Add service to collector config
+    collectorConfigFormat.setService(service);
+  }
+
+  /**
+   * Builds the {@code service::telemetry::metrics} section exposing the collector's own metrics for
+   * scraping on {@code 0.0.0.0:<port>}. Replaces the flat {@code address} field, which was removed
+   * from otel-collector in 0.120.0 in favour of the declarative-config {@code readers} list. The
+   * {@code without_*} flags preserve the pre-0.120.0 metric names - see {@link
+   * OtelCollectorConfigFormat.PrometheusMetricExporter}.
+   */
+  private OtelCollectorConfigFormat.MetricsConfig createInternalMetricsConfig(int metricsPort) {
+    OtelCollectorConfigFormat.PrometheusMetricExporter prometheusExporter =
+        new OtelCollectorConfigFormat.PrometheusMetricExporter();
+    prometheusExporter.setHost(ALL_INTERFACES_ADDRESS);
+    prometheusExporter.setPort(metricsPort);
+    prometheusExporter.setWithout_scope_info(true);
+    prometheusExporter.setWithout_type_suffix(true);
+    prometheusExporter.setWithout_units(true);
+
+    OtelCollectorConfigFormat.MetricReaderExporter readerExporter =
+        new OtelCollectorConfigFormat.MetricReaderExporter();
+    readerExporter.setPrometheus(prometheusExporter);
+
+    OtelCollectorConfigFormat.PullMetricReader pullReader =
+        new OtelCollectorConfigFormat.PullMetricReader();
+    pullReader.setExporter(readerExporter);
+
+    OtelCollectorConfigFormat.MetricReader reader = new OtelCollectorConfigFormat.MetricReader();
+    reader.setPull(pullReader);
+
+    OtelCollectorConfigFormat.MetricsConfig metricsConfig =
+        new OtelCollectorConfigFormat.MetricsConfig();
+    metricsConfig.setReaders(ImmutableList.of(reader));
+    return metricsConfig;
+  }
+
+  /**
+   * Registers a filelog receiver per enabled log source and a pipeline per exporter, for all log
+   * export types (audit ysql/ycql, query ysql, master). Adding a new log type is a matter of
+   * registering its receiver here and an {@link ExportType} case in the {@code logExport*} helpers
+   * - the per-type {@code appendExporter}/{@code add*Pipelines} duplication is gone.
+   */
+  private void addLogPipelines(
+      OtelCollectorConfigFormat collectorConfigFormat,
+      NodeTaskParams nodeParams,
+      Provider provider,
+      AuditLogConfig auditLogConfig,
+      QueryLogConfig queryLogConfig,
+      MasterLogConfig masterLogConfig,
+      TServerLogConfig tserverLogConfig,
+      TelemetryConfig telemetryConfig,
+      String logLinePrefix) {
+    Universe universe = Universe.getOrBadRequest(nodeParams.getUniverseUUID());
+    Map<String, OtelCollectorConfigFormat.Receiver> receivers =
+        collectorConfigFormat.getReceivers();
+
+    boolean ysqlAuditEnabled = OtelCollectorUtil.isYsqlAuditEnabled(auditLogConfig);
+    boolean ycqlAuditEnabled = OtelCollectorUtil.isYcqlAuditEnabled(auditLogConfig);
+    boolean queryEnabled =
+        OtelCollectorUtil.isQueryLogExportEnabledInUniverse(queryLogConfig)
+            && OtelCollectorUtil.isQueryLogEnabledInUniverse(queryLogConfig);
+    boolean masterEnabled = OtelCollectorUtil.isMasterLogExportEnabledInUniverse(masterLogConfig);
+    boolean tserverEnabled =
+        OtelCollectorUtil.isTserverLogExportEnabledInUniverse(tserverLogConfig);
+
+    // Internal-only diagnostic log sources (VM-only). Resolved from the telemetry config.
+    YsqlConnMgrLogConfig ysqlConnMgrLogConfig =
+        telemetryConfig != null ? telemetryConfig.getYsqlConnMgrLogConfig() : null;
+    NodeAgentLogConfig nodeAgentLogConfig =
+        telemetryConfig != null ? telemetryConfig.getNodeAgentLogConfig() : null;
+    YnpLogConfig ynpLogConfig = telemetryConfig != null ? telemetryConfig.getYnpLogConfig() : null;
+    ControllerLogConfig controllerLogConfig =
+        telemetryConfig != null ? telemetryConfig.getControllerLogConfig() : null;
+    boolean ysqlConnMgrEnabled =
+        OtelCollectorUtil.isSimpleServerLogExportEnabledInUniverse(ysqlConnMgrLogConfig);
+    boolean nodeAgentEnabled =
+        OtelCollectorUtil.isSimpleServerLogExportEnabledInUniverse(nodeAgentLogConfig);
+    boolean ynpEnabled = OtelCollectorUtil.isSimpleServerLogExportEnabledInUniverse(ynpLogConfig);
+    boolean controllerEnabled =
+        OtelCollectorUtil.isSimpleServerLogExportEnabledInUniverse(controllerLogConfig);
+
+    // 1. Register a filelog receiver for each enabled log source (insertion order matters for the
+    // generated YAML, so keep it: ysql, ycql, query, master, tserver, then the diagnostic sources).
+    if (ysqlAuditEnabled) {
+      receivers.put(
+          RECEIVER_PREFIX_FILELOG + LOG_TYPE_YSQL, createYsqlReceiver(provider, logLinePrefix));
+    }
+    if (ycqlAuditEnabled) {
+      receivers.put(
+          RECEIVER_PREFIX_FILELOG + LOG_TYPE_YCQL,
+          createYcqlReceiver(provider, auditLogConfig.getYcqlAuditConfig()));
+    }
+    if (queryEnabled) {
+      receivers.put(
+          RECEIVER_PREFIX_FILELOG + LOG_TYPE_QUERY_YSQL,
+          createYsqlQueryLogReceiver(provider, logLinePrefix));
+    }
+    if (masterEnabled) {
+      receivers.put(
+          RECEIVER_PREFIX_FILELOG + LOG_TYPE_MASTER,
+          createMasterLogReceiver(
+              provider, masterLogConfig, getMasterLogAdditionalDropPatterns(universe)));
+    }
+    if (tserverEnabled) {
+      receivers.put(
+          RECEIVER_PREFIX_FILELOG + LOG_TYPE_TSERVER,
+          createTserverLogReceiver(
+              provider, tserverLogConfig, getTserverLogAdditionalDropPatterns(universe)));
+    }
+    if (ysqlConnMgrEnabled) {
+      receivers.put(
+          RECEIVER_PREFIX_FILELOG + LOG_TYPE_YSQL_CONN_MGR, createYsqlConnMgrLogReceiver(provider));
+    }
+    if (nodeAgentEnabled || ynpEnabled) {
+      // node-agent and YNP logs share the node-agent install dir.
+      String nodeAgentLogDir =
+          confGetter.getGlobalConf(GlobalConfKeys.nodeAgentInstallPath) + "/node-agent/logs";
+      if (nodeAgentEnabled) {
+        receivers.put(
+            RECEIVER_PREFIX_FILELOG + LOG_TYPE_NODE_AGENT,
+            createNodeAgentLogReceiver(nodeAgentLogDir));
+      }
+      if (ynpEnabled) {
+        receivers.put(
+            RECEIVER_PREFIX_FILELOG + LOG_TYPE_YNP, createYnpLogReceiver(nodeAgentLogDir));
+      }
+    }
+    if (controllerEnabled) {
+      NodeDetails node = universe.getNode(nodeParams.nodeName);
+      String ybcDataDir = Util.getDataDirectoryPath(universe, node, confGetter.getStaticConf());
+      receivers.put(
+          RECEIVER_PREFIX_FILELOG + LOG_TYPE_CONTROLLER, createControllerLogReceiver(ybcDataDir));
+    }
+
+    // 2. Append a pipeline per exporter, per log family (each family routes only its own
+    // receivers). Audit exporters carry no batch/memory tuning; query and master do.
+    if (auditLogConfig != null
+        && CollectionUtils.isNotEmpty(auditLogConfig.getUniverseLogsExporterConfig())) {
+      auditLogConfig
+          .getUniverseLogsExporterConfig()
+          .forEach(
+              config ->
+                  appendLogExporter(
+                      ExportType.AUDIT_LOGS,
+                      universe,
+                      collectorConfigFormat,
+                      config,
+                      nodeParams.nodeName,
+                      logLinePrefix));
+    }
+    if (queryEnabled) {
+      queryLogConfig
+          .getUniverseLogsExporterConfig()
+          .forEach(
+              config ->
+                  appendLogExporter(
+                      ExportType.QUERY_LOGS,
+                      universe,
+                      collectorConfigFormat,
+                      config,
+                      nodeParams.nodeName,
+                      logLinePrefix));
+    }
+    if (masterEnabled) {
+      masterLogConfig
+          .getUniverseLogsExporterConfig()
+          .forEach(
+              config ->
+                  appendLogExporter(
+                      ExportType.MASTER_LOGS,
+                      universe,
+                      collectorConfigFormat,
+                      config,
+                      nodeParams.nodeName,
+                      logLinePrefix));
+    }
+    if (tserverEnabled) {
+      tserverLogConfig
+          .getUniverseLogsExporterConfig()
+          .forEach(
+              config ->
+                  appendLogExporter(
+                      ExportType.TSERVER_LOGS,
+                      universe,
+                      collectorConfigFormat,
+                      config,
+                      nodeParams.nodeName,
+                      logLinePrefix));
+    }
+    appendSimpleLogPipelines(
+        ysqlConnMgrEnabled ? ysqlConnMgrLogConfig : null,
+        ExportType.YSQL_CONN_MGR_LOGS,
+        universe,
+        collectorConfigFormat,
+        nodeParams.nodeName,
+        logLinePrefix);
+    appendSimpleLogPipelines(
+        nodeAgentEnabled ? nodeAgentLogConfig : null,
+        ExportType.NODE_AGENT_LOGS,
+        universe,
+        collectorConfigFormat,
+        nodeParams.nodeName,
+        logLinePrefix);
+    appendSimpleLogPipelines(
+        ynpEnabled ? ynpLogConfig : null,
+        ExportType.YNP_LOGS,
+        universe,
+        collectorConfigFormat,
+        nodeParams.nodeName,
+        logLinePrefix);
+    appendSimpleLogPipelines(
+        controllerEnabled ? controllerLogConfig : null,
+        ExportType.CONTROLLER_LOGS,
+        universe,
+        collectorConfigFormat,
+        nodeParams.nodeName,
+        logLinePrefix);
+  }
+
+  /** Append one pipeline per exporter for an internal-only diagnostic server-log section. */
+  private void appendSimpleLogPipelines(
+      SimpleServerLogConfig config,
+      ExportType exportType,
+      Universe universe,
+      OtelCollectorConfigFormat collectorConfigFormat,
+      String nodeName,
+      String logLinePrefix) {
+    if (config == null) {
+      return;
+    }
+    config
+        .getUniverseLogsExporterConfig()
+        .forEach(
+            exporter ->
+                appendLogExporter(
+                    exportType,
+                    universe,
+                    collectorConfigFormat,
+                    exporter,
+                    nodeName,
+                    logLinePrefix));
+  }
+
+  /** Filelog receiver names that feed the pipeline for a given log export type. */
+  private static Set<String> logReceiverNames(ExportType exportType) {
+    switch (exportType) {
+      case AUDIT_LOGS:
+        return ImmutableSet.of(
+            RECEIVER_PREFIX_FILELOG + LOG_TYPE_YSQL, RECEIVER_PREFIX_FILELOG + LOG_TYPE_YCQL);
+      case QUERY_LOGS:
+        return ImmutableSet.of(RECEIVER_PREFIX_FILELOG + LOG_TYPE_QUERY_YSQL);
+      case MASTER_LOGS:
+        return ImmutableSet.of(RECEIVER_PREFIX_FILELOG + LOG_TYPE_MASTER);
+      case TSERVER_LOGS:
+        return ImmutableSet.of(RECEIVER_PREFIX_FILELOG + LOG_TYPE_TSERVER);
+      case YSQL_CONN_MGR_LOGS:
+        return ImmutableSet.of(RECEIVER_PREFIX_FILELOG + LOG_TYPE_YSQL_CONN_MGR);
+      case NODE_AGENT_LOGS:
+        return ImmutableSet.of(RECEIVER_PREFIX_FILELOG + LOG_TYPE_NODE_AGENT);
+      case YNP_LOGS:
+        return ImmutableSet.of(RECEIVER_PREFIX_FILELOG + LOG_TYPE_YNP);
+      case CONTROLLER_LOGS:
+        return ImmutableSet.of(RECEIVER_PREFIX_FILELOG + LOG_TYPE_CONTROLLER);
+      default:
+        throw new IllegalArgumentException("Not a log export type: " + exportType);
+    }
+  }
+
+  private static String logExportPurposeSuffix(ExportType exportType) {
+    switch (exportType) {
+      case AUDIT_LOGS:
+        return PURPOSE_SUFFIX_AUDIT_LOG_EXPORT;
+      case QUERY_LOGS:
+        return PURPOSE_SUFFIX_QUERY_LOG_EXPORT;
+      case MASTER_LOGS:
+        return PURPOSE_SUFFIX_MASTER_LOG_EXPORT;
+      case TSERVER_LOGS:
+        return PURPOSE_SUFFIX_TSERVER_LOG_EXPORT;
+      case YSQL_CONN_MGR_LOGS:
+        return PURPOSE_SUFFIX_YSQL_CONN_MGR_LOG_EXPORT;
+      case NODE_AGENT_LOGS:
+        return PURPOSE_SUFFIX_NODE_AGENT_LOG_EXPORT;
+      case YNP_LOGS:
+        return PURPOSE_SUFFIX_YNP_LOG_EXPORT;
+      case CONTROLLER_LOGS:
+        return PURPOSE_SUFFIX_CONTROLLER_LOG_EXPORT;
+      default:
+        throw new IllegalArgumentException("Not a log export type: " + exportType);
+    }
+  }
+
+  private AuditLogRegexGenerator.LogRegexResult logExportRegexResult(
+      ExportType exportType, String logLinePrefix) {
+    switch (exportType) {
+      case AUDIT_LOGS:
+        return auditLogRegexGenerator.generateAuditLogRegex(logLinePrefix, /*onlyPrefix*/ true);
+      case QUERY_LOGS:
+        return queryLogRegexGenerator.generateQueryLogRegex(logLinePrefix, /*onlyPrefix*/ true);
+      case MASTER_LOGS:
+      case TSERVER_LOGS:
+      case YSQL_CONN_MGR_LOGS:
+      case NODE_AGENT_LOGS:
+      case YNP_LOGS:
+      case CONTROLLER_LOGS:
+        // These sources are not PG-prefixed, so there is no log-prefix regex to extract from.
+        return new AuditLogRegexGenerator.LogRegexResult("", Collections.emptyList());
+      default:
+        throw new IllegalArgumentException("Not a log export type: " + exportType);
+    }
+  }
+
+  private List<String> getMasterLogAdditionalDropPatterns(Universe universe) {
+    return getAdditionalDropPatterns(universe, UniverseConfKeys.masterLogsAdditionalDropPatterns);
+  }
+
+  private List<String> getTserverLogAdditionalDropPatterns(Universe universe) {
+    return getAdditionalDropPatterns(universe, UniverseConfKeys.tserverLogsAdditionalDropPatterns);
+  }
+
+  /**
+   * Additional substrings whose matching server-log lines should be dropped, on top of the
+   * hardcoded redaction list. Sourced from a universe-scoped runtime flag so the redaction set can
+   * be extended without a release. Returns an empty list when unset.
+   */
+  private List<String> getAdditionalDropPatterns(Universe universe, ConfKeyInfo<String> confKey) {
+    String raw = confGetter.getConfForScope(universe, confKey);
+    if (StringUtils.isBlank(raw)) {
+      return Collections.emptyList();
+    }
+    return Arrays.stream(raw.split(","))
+        .map(String::trim)
+        .filter(StringUtils::isNotBlank)
+        .collect(Collectors.toList());
+  }
+
+  private void addMetricsExporterPipelines(
+      OtelCollectorConfigFormat collectorConfigFormat,
+      NodeTaskParams nodeParams,
+      Provider provider,
+      UniverseDefinitionTaskParams.UserIntent userIntent,
+      MetricsExportConfig metricsExportConfig,
+      String logLinePrefix,
+      int otelColMetricsPort,
+      NodeAgent nodeAgent) {
+    if (metricsExportConfig != null
+        && !CollectionUtils.isEmpty(metricsExportConfig.getUniverseMetricsExporterConfig())) {
+
+      // Add a common Prometheus receiver for metrics export.
+      Universe universe = Universe.getOrBadRequest(nodeParams.getUniverseUUID());
+      NodeDetails nodeDetails = universe.getNode(nodeParams.getNodeName());
+      collectorConfigFormat
+          .getReceivers()
+          .put(
+              RECEIVER_PREFIX_PROMETHEUS + "yugabyte",
+              createPrometheusReceiver(
+                  metricsExportConfig,
+                  nodeDetails.cloudInfo.private_ip,
+                  universe,
+                  otelColMetricsPort,
+                  nodeDetails,
+                  nodeAgent));
+
+      // Add a new pipeline for each active metrics exporter config, since they can have different
+      // additional tags.
+      for (UniverseMetricsExporterConfig exporterConfig :
+          metricsExportConfig.getUniverseMetricsExporterConfig()) {
+        List<String> processorNames = new ArrayList<>();
+        // Create a new pipeline for metrics export.
+        OtelCollectorConfigFormat.Pipeline pipeline = new OtelCollectorConfigFormat.Pipeline();
+
+        // Set the common Prometheus receiver for the pipeline
+        pipeline.setReceivers(ImmutableList.of(RECEIVER_PREFIX_PROMETHEUS + "yugabyte"));
+
+        TelemetryProvider telemetryProvider =
+            telemetryProviderService.getOrBadRequest(exporterConfig.getExporterUuid());
+        String exportTypeAndUUIDString =
+            exportTypeAndUUID(telemetryProvider.getUuid(), ExportType.METRICS);
+
+        // Add AttributesProcessor for metrics.
+        String attributesProcessorName = PROCESSOR_PREFIX_ATTRIBUTES + exportTypeAndUUIDString;
+        OtelCollectorConfigFormat.AttributesProcessor attributesProcessor =
+            createMetricsExporterAttributesProcessor(
+                exporterConfig,
+                nodeParams.nodeName,
+                nodeDetails,
+                universe,
+                exporterConfig.getAdditionalTags());
+        if (attributesProcessor != null
+            && !CollectionUtils.isEmpty(attributesProcessor.getActions())) {
+          collectorConfigFormat.getProcessors().put(attributesProcessorName, attributesProcessor);
+          // Add AttributesProcessor to the pipeline
+          processorNames.add(attributesProcessorName);
+        }
+
+        // Add the common metrics processors and the exporter itself.
+        String exporterName =
+            addCommonMetricsProcessorsAndExporter(
+                collectorConfigFormat,
+                exporterConfig,
+                telemetryProvider,
+                exportTypeAndUUIDString,
+                processorNames);
+
+        // Add all the processor names to the pipeline
+        pipeline.setProcessors(processorNames);
+        pipeline.setExporters(ImmutableList.of(exporterName));
+
+        collectorConfigFormat
+            .getService()
+            .getPipelines()
+            .put(PIPELINE_PREFIX_METRICS + exportTypeAndUUIDString, pipeline);
+      }
+    }
+  }
+
+  /**
+   * Adds the per-exporter metrics processors shared between the VM and K8s configs (memory limiter,
+   * optional metrics-prefix transform, cumulative-to-delta for Dynatrace, batch) plus the metrics
+   * exporter itself. Processor names are appended to processorNames in pipeline order; the
+   * registered exporter name is returned.
+   */
+  private String addCommonMetricsProcessorsAndExporter(
+      OtelCollectorConfigFormat collectorConfigFormat,
+      UniverseMetricsExporterConfig exporterConfig,
+      TelemetryProvider telemetryProvider,
+      String exportTypeAndUUIDString,
+      List<String> processorNames) {
+    // Add MemoryLimiterProcessor for metrics.
+    String memoryLimiterProcessorName = PROCESSOR_PREFIX_MEMORY_LIMITER + exportTypeAndUUIDString;
+    OtelCollectorConfigFormat.MemoryLimiterProcessor memoryLimiterProcessor =
+        new OtelCollectorConfigFormat.MemoryLimiterProcessor();
+    memoryLimiterProcessor.setCheck_interval(
+        exporterConfig.getMemoryLimitCheckIntervalSeconds().toString() + "s");
+    memoryLimiterProcessor.setLimit_mib(exporterConfig.getMemoryLimitMib());
+    collectorConfigFormat.getProcessors().put(memoryLimiterProcessorName, memoryLimiterProcessor);
+    // Add MemoryLimiterProcessor to the pipeline
+    processorNames.add(memoryLimiterProcessorName);
+
+    if (!StringUtils.isBlank(exporterConfig.getMetricsPrefix())) {
+      String metricTransformProcessorName =
+          PROCESSOR_PREFIX_METRIC_TRANSFORM + exportTypeAndUUIDString;
+      OtelCollectorConfigFormat.MetricTransformProcessor metricTransformProcessor =
+          new OtelCollectorConfigFormat.MetricTransformProcessor();
+
+      // Create the transform rule to add custom prefix to all metrics
+      OtelCollectorConfigFormat.MetricTransformRule transformRule =
+          new OtelCollectorConfigFormat.MetricTransformRule();
+      transformRule.setInclude("^(.*)$");
+      transformRule.setMatch_type("regexp");
+      transformRule.setAction("update");
+      transformRule.setExperimental_match_labels(ImmutableMap.of("export_type", ".+"));
+      transformRule.setNew_name(exporterConfig.getMetricsPrefix() + "$${1}");
+
+      metricTransformProcessor.setTransforms(ImmutableList.of(transformRule));
+      collectorConfigFormat
+          .getProcessors()
+          .put(metricTransformProcessorName, metricTransformProcessor);
+      // Add MetricTransformProcessor to the pipeline
+      processorNames.add(metricTransformProcessorName);
+    }
+
+    // Add CumulativeToDeltaProcessor for Dynatrace metrics only
+    if (telemetryProvider.getConfig().getType() == ProviderType.DYNATRACE) {
+      String cumulativetodeltaProcessorName =
+          PROCESSOR_PREFIX_CUMULATIVE_TO_DELTA + exportTypeAndUUIDString;
+      OtelCollectorConfigFormat.CumulativeToDeltaProcessor cumulativetodeltaProcessor =
+          new OtelCollectorConfigFormat.CumulativeToDeltaProcessor();
+      collectorConfigFormat
+          .getProcessors()
+          .put(cumulativetodeltaProcessorName, cumulativetodeltaProcessor);
+      // Add CumulativeToDeltaProcessor to the pipeline
+      processorNames.add(cumulativetodeltaProcessorName);
+    }
+
+    // Add BatchProcessor at the end, after cumulativetodelta, so processors know metric type
+    String batchProcessorName = PROCESSOR_PREFIX_BATCH + exportTypeAndUUIDString;
+    OtelCollectorConfigFormat.BatchProcessor batchProcessor =
+        new OtelCollectorConfigFormat.BatchProcessor();
+    batchProcessor.setSend_batch_size(exporterConfig.getSendBatchSize());
+    batchProcessor.setSend_batch_max_size(exporterConfig.getSendBatchMaxSize());
+    batchProcessor.setTimeout(exporterConfig.getSendBatchTimeoutSeconds().toString() + "s");
+    collectorConfigFormat.getProcessors().put(batchProcessorName, batchProcessor);
+    processorNames.add(batchProcessorName);
+
+    // Add metrics exporter for each active exporter config
+    return addMetricsExporter(collectorConfigFormat, exporterConfig);
+  }
+
+  // Deprecated in favour of @getOtelColConfigK8s
+  public Map<String, Object> getOtelHelmValues(
+      AuditLogConfig auditLogConfig, String logLinePrefix) {
+    // only DBAL is supported via k8s
+    // For K8s, we don't need to generate the entire config file.
+    // We just need exporterCofigs and receiverConfigs.
+    if (auditLogConfig == null) {
+      return null;
+    }
+    Map<String, Object> otelConfig = new HashMap<>();
+
+    if (!auditLogConfig.isExportActive()) {
+      otelConfig.put("enabled", false);
+    } else {
+
+      otelConfig.put("enabled", true);
+      // Recievers
+      Map<String, Object> receivers = new HashMap<>();
+      OtelCollectorConfigFormat.RegexOperator regexOperator =
+          getRegexOperator(logLinePrefix, ExportType.AUDIT_LOGS);
+      if (auditLogConfig.getYsqlAuditConfig() != null
+          && auditLogConfig.getYsqlAuditConfig().isEnabled()) {
+        Map<String, Object> ysqlReciever = new HashMap<>();
+        ysqlReciever.put("regex", regexOperator.getRegex());
+        ysqlReciever.put("timestamp", regexOperator.getTimestamp());
+        ysqlReciever.put("lineStartPattern", generateLineStartPattern(logLinePrefix));
+        receivers.put(LOG_TYPE_YSQL, ysqlReciever);
+      }
+      otelConfig.put("recievers", receivers);
+
+      // Exporters
+      OtelCollectorConfigFormat collectorConfigFormat = new OtelCollectorConfigFormat();
+      List<Object> secretEnv = new ArrayList<>();
+      Set<UUID> secretEnvProviderUuids = new HashSet<>();
+      if (CollectionUtils.isNotEmpty(auditLogConfig.getUniverseLogsExporterConfig())) {
+        auditLogConfig
+            .getUniverseLogsExporterConfig()
+            .forEach(
+                config -> {
+                  TelemetryProvider telemetryProvider =
+                      telemetryProviderService.getOrBadRequest(config.getExporterUuid());
+                  String exporterName =
+                      appendExporterConfig(
+                          telemetryProvider,
+                          collectorConfigFormat,
+                          new ArrayList<>(),
+                          ExportType.AUDIT_LOGS);
+                  appendSecretEnv(telemetryProvider, secretEnv, secretEnvProviderUuids);
+                });
+        otelConfig.put("exporters", collectorConfigFormat.getExporters());
+        otelConfig.put("secretEnv", secretEnv);
+      }
+    }
+    return otelConfig;
+  }
+
+  @Data
+  @AllArgsConstructor
+  public static class K8sPodPlacement {
+    private String cloud;
+    private String region;
+    private String zone;
+    private UniverseDefinitionTaskParams.ClusterType clusterType;
+  }
+
+  /**
+   * Port the collector sidecar serves its own metrics on inside a K8s pod. Read from the universe's
+   * communication ports (seeded from the provider conf key otelCollectorMetricsPort at create time)
+   * rather than hardcoded, so that the port the sidecar listens on is the same one SwamperHelper
+   * writes into the Prometheus target file for that pod.
+   */
+  private static int getK8sOtelMetricsPort(Universe universe) {
+    int port = universe.getUniverseDetails().communicationPorts.otelCollectorMetricsPort;
+    return port > 0 ? port : K8S_OTEL_METRICS_PORT_DEFAULT;
+  }
+
+  /**
+   * Builds the complete OpenTelemetry collector config for a K8s universe and returns it as a YAML
+   * string (for the chart's spec.config passthrough) plus the secret env entries the chart wires
+   * into the sidecar.
+   */
+  public K8sOtelConfig getOtelColConfigK8s(
+      Provider provider,
+      Universe universe,
+      TelemetryConfig telemetryConfig,
+      K8sPodPlacement podPlacement,
+      String logLinePrefix) {
+    AuditLogConfig auditLogConfig =
+        telemetryConfig != null ? telemetryConfig.getAuditLogConfig() : null;
+    QueryLogConfig queryLogConfig =
+        telemetryConfig != null ? telemetryConfig.getQueryLogConfig() : null;
+    MetricsExportConfig metricsExportConfig =
+        telemetryConfig != null ? telemetryConfig.getMetricsExportConfig() : null;
+    MasterLogConfig masterLogConfig =
+        telemetryConfig != null ? telemetryConfig.getMasterLogConfig() : null;
+    TServerLogConfig tserverLogConfig =
+        telemetryConfig != null ? telemetryConfig.getTserverLogConfig() : null;
+    // Internal-only diagnostic sources that are pod-local on K8s (both live in the yb-tserver pod).
+    YsqlConnMgrLogConfig ysqlConnMgrLogConfig =
+        telemetryConfig != null ? telemetryConfig.getYsqlConnMgrLogConfig() : null;
+    ControllerLogConfig controllerLogConfig =
+        telemetryConfig != null ? telemetryConfig.getControllerLogConfig() : null;
+    List<Object> secretEnv = new ArrayList<>();
+    Set<UUID> secretEnvProviderUuids = new HashSet<>();
+    boolean auditActive = OtelCollectorUtil.isAuditLogExportEnabledInUniverse(auditLogConfig);
+    boolean queryActive = OtelCollectorUtil.isQueryLogExportEnabledInUniverse(queryLogConfig);
+    boolean metricsActive = OtelCollectorUtil.isMetricsExportEnabledInUniverse(metricsExportConfig);
+    boolean masterActive = OtelCollectorUtil.isMasterLogExportEnabledInUniverse(masterLogConfig);
+    boolean tserverActive = OtelCollectorUtil.isTserverLogExportEnabledInUniverse(tserverLogConfig);
+    boolean connMgrActive =
+        OtelCollectorUtil.isSimpleServerLogExportEnabledInUniverse(ysqlConnMgrLogConfig);
+    boolean controllerActive =
+        OtelCollectorUtil.isSimpleServerLogExportEnabledInUniverse(controllerLogConfig);
+    if (!auditActive
+        && !queryActive
+        && !metricsActive
+        && !masterActive
+        && !tserverActive
+        && !connMgrActive
+        && !controllerActive) {
+      return new K8sOtelConfig(false, "", secretEnv);
+    }
+
+    OtelCollectorConfigFormat cfg = new OtelCollectorConfigFormat();
+    boolean logsActive =
+        auditActive
+            || queryActive
+            || masterActive
+            || tserverActive
+            || connMgrActive
+            || controllerActive;
+
+    // Extensions: on-disk send queue (only the log pipelines use it filelog receiver state and
+    // the audit exporters sending_queue) + health check (the operator's sidecar readiness probe).
+    if (logsActive) {
+      OtelCollectorConfigFormat.StorageExtension storage =
+          new OtelCollectorConfigFormat.StorageExtension();
+      storage.setDirectory(K8S_OTEL_DIR + "/queue");
+      // The /queue dir isn't pre-created in the pod, so let the collector create it (matches the
+      // create_directory: true the chart template used to hardcode). Without this the collector
+      // fails config validation and crash-loops.
+      storage.setCreate_directory(true);
+      OtelCollectorConfigFormat.StorageCompaction compaction =
+          new OtelCollectorConfigFormat.StorageCompaction();
+      compaction.setDirectory(K8S_OTEL_DIR + "/queue");
+      compaction.setOn_start(true);
+      compaction.setOn_rebound(true);
+      compaction.setRebound_needed_threshold_mib(100);
+      compaction.setRebound_trigger_threshold_mib(10);
+      storage.setCompaction(compaction);
+      cfg.getExtensions().put("file_storage/queue", storage);
+    }
+    OtelCollectorConfigFormat.HealthCheckExtension health =
+        new OtelCollectorConfigFormat.HealthCheckExtension();
+    health.setEndpoint("0.0.0.0:13133");
+    health.setPath("/health");
+    cfg.getExtensions().put("health_check", health);
+
+    // Shared transform processor (strips the otho8Aut marker from the log body).
+    // Metrics-only configs have no log pipeline referencing it, so skip it there.
+    if (logsActive) {
+      addCommonTransformProcessor(cfg);
+    }
+    String transformName = PROCESSOR_PREFIX_TRANSFORM + "replace";
+
+    // Receivers: reuse the VM builders for operators/multiline, override paths for K8s mounts.
+    if (auditActive) {
+      OtelCollectorConfigFormat.FileLogReceiver r =
+          (OtelCollectorConfigFormat.FileLogReceiver) createYsqlReceiver(provider, logLinePrefix);
+      r.setInclude(ImmutableList.of(K8S_TSERVER_LOG_DIR + "/postgresql-*.log"));
+      r.setExclude(ImmutableList.of(K8S_TSERVER_LOG_DIR + "/*.gz"));
+      // Emit both the legacy un-prefixed "audit_log_type" (what older K8s charts set) and the
+      // VM-parity "yugabyte.audit_log_type", so existing K8s audit-log consumers keyed on the old
+      // attribute keep working across the upgrade to the spec.config rendering.
+      r.setAttributes(
+          ImmutableMap.of(
+              "audit_log_type",
+              LOG_TYPE_YSQL,
+              ATTR_PREFIX_YUGABYTE + "audit_log_type",
+              LOG_TYPE_YSQL));
+      cfg.getReceivers().put(RECEIVER_PREFIX_FILELOG + LOG_TYPE_YSQL, r);
+    }
+    if (queryActive) {
+      OtelCollectorConfigFormat.FileLogReceiver r =
+          (OtelCollectorConfigFormat.FileLogReceiver)
+              createYsqlQueryLogReceiver(provider, logLinePrefix);
+      r.setInclude(ImmutableList.of(K8S_TSERVER_LOG_DIR + "/postgresql-*.log"));
+      r.setExclude(ImmutableList.of(K8S_TSERVER_LOG_DIR + "/*.gz"));
+      cfg.getReceivers().put(RECEIVER_PREFIX_FILELOG + LOG_TYPE_QUERY_YSQL, r);
+    }
+    if (masterActive) {
+      // yb-master glog lives in the yb-master pod, so this receiver only matches when the sidecar
+      // runs there (runOnMaster, set by KubernetesCommandExecutor when master log export is on).
+      // Reuse the VM builder (operators/multiline + the universe-scoped additional drop patterns),
+      // override the include/exclude for K8s mounts.
+      OtelCollectorConfigFormat.FileLogReceiver r =
+          (OtelCollectorConfigFormat.FileLogReceiver)
+              createMasterLogReceiver(
+                  provider, masterLogConfig, getMasterLogAdditionalDropPatterns(universe));
+      r.setInclude(ImmutableList.of(K8S_MASTER_LOG_DIR + "/yb-master.*.INFO.*"));
+      r.setExclude(ImmutableList.of(K8S_MASTER_LOG_DIR + "/*.gz"));
+      cfg.getReceivers().put(RECEIVER_PREFIX_FILELOG + LOG_TYPE_MASTER, r);
+    }
+    if (tserverActive) {
+      // Reuse the VM builder (operators/multiline + the universe-scoped additional drop patterns),
+      // override the include/exclude for K8s mounts.
+      OtelCollectorConfigFormat.FileLogReceiver r =
+          (OtelCollectorConfigFormat.FileLogReceiver)
+              createTserverLogReceiver(
+                  provider, tserverLogConfig, getTserverLogAdditionalDropPatterns(universe));
+      r.setInclude(ImmutableList.of(K8S_TSERVER_LOG_DIR + "/yb-tserver.*.INFO.*"));
+      r.setExclude(ImmutableList.of(K8S_TSERVER_LOG_DIR + "/*.gz"));
+      cfg.getReceivers().put(RECEIVER_PREFIX_FILELOG + LOG_TYPE_TSERVER, r);
+    }
+    if (connMgrActive) {
+      // ysql-conn-mgr logs are co-located with postgres logs in the yb-tserver pod.
+      OtelCollectorConfigFormat.FileLogReceiver r =
+          (OtelCollectorConfigFormat.FileLogReceiver) createYsqlConnMgrLogReceiver(provider);
+      r.setInclude(ImmutableList.of(K8S_TSERVER_LOG_DIR + "/ysql-conn-mgr-*"));
+      r.setExclude(ImmutableList.of(K8S_TSERVER_LOG_DIR + "/*.gz"));
+      cfg.getReceivers().put(RECEIVER_PREFIX_FILELOG + LOG_TYPE_YSQL_CONN_MGR, r);
+    }
+    if (controllerActive) {
+      // yb-controller runs as a sidecar in the yb-tserver pod; its logs live under the ybc-data
+      // mount. Reuse the VM builder (operators/multiline), override the include/exclude for K8s.
+      OtelCollectorConfigFormat.FileLogReceiver r =
+          (OtelCollectorConfigFormat.FileLogReceiver) createControllerLogReceiver("");
+      r.setInclude(ImmutableList.of(K8S_YBC_LOG_DIR + "/yb-controller-server.INFO"));
+      r.setExclude(ImmutableList.of(K8S_YBC_LOG_DIR + "/*.gz"));
+      cfg.getReceivers().put(RECEIVER_PREFIX_FILELOG + LOG_TYPE_CONTROLLER, r);
+    }
+
+    OtelCollectorConfigFormat.Service service = new OtelCollectorConfigFormat.Service();
+    // Telemetry: internal collector logs + metrics endpoint.
+    OtelCollectorConfigFormat.TelemetryConfig telemetry =
+        new OtelCollectorConfigFormat.TelemetryConfig();
+    OtelCollectorConfigFormat.LogsConfig logsConfig = new OtelCollectorConfigFormat.LogsConfig();
+    logsConfig.setOutput_paths(ImmutableList.of(K8S_OTEL_DIR + "/logs/otel-collector.logs"));
+    telemetry.setLogs(logsConfig);
+    telemetry.setMetrics(createInternalMetricsConfig(getK8sOtelMetricsPort(universe)));
+    service.setTelemetry(telemetry);
+
+    if (auditActive) {
+      for (UniverseLogsExporterConfig ec : auditLogConfig.getUniverseLogsExporterConfig()) {
+        addK8sLogPipeline(
+            cfg,
+            service,
+            universe,
+            podPlacement,
+            ec.getExporterUuid(),
+            ExportType.AUDIT_LOGS,
+            RECEIVER_PREFIX_FILELOG + LOG_TYPE_YSQL,
+            transformName,
+            null,
+            ec.getAdditionalTags(),
+            secretEnv,
+            secretEnvProviderUuids);
+      }
+    }
+    if (queryActive) {
+      for (UniverseQueryLogsExporterConfig ec : queryLogConfig.getUniverseLogsExporterConfig()) {
+        addK8sLogPipeline(
+            cfg,
+            service,
+            universe,
+            podPlacement,
+            ec.getExporterUuid(),
+            ExportType.QUERY_LOGS,
+            RECEIVER_PREFIX_FILELOG + LOG_TYPE_QUERY_YSQL,
+            transformName,
+            ec,
+            ec.getAdditionalTags(),
+            secretEnv,
+            secretEnvProviderUuids);
+      }
+    }
+    if (metricsActive) {
+      addK8sMetricsPipelines(
+          cfg,
+          service,
+          universe,
+          metricsExportConfig,
+          podPlacement,
+          secretEnv,
+          secretEnvProviderUuids);
+    }
+    if (masterActive) {
+      for (UniverseServerLogsExporterConfig ec : masterLogConfig.getUniverseLogsExporterConfig()) {
+        addK8sLogPipeline(
+            cfg,
+            service,
+            universe,
+            podPlacement,
+            ec.getExporterUuid(),
+            ExportType.MASTER_LOGS,
+            RECEIVER_PREFIX_FILELOG + LOG_TYPE_MASTER,
+            transformName,
+            ec,
+            ec.getAdditionalTags(),
+            secretEnv,
+            secretEnvProviderUuids);
+      }
+    }
+    if (tserverActive) {
+      for (UniverseServerLogsExporterConfig ec : tserverLogConfig.getUniverseLogsExporterConfig()) {
+        addK8sLogPipeline(
+            cfg,
+            service,
+            universe,
+            podPlacement,
+            ec.getExporterUuid(),
+            ExportType.TSERVER_LOGS,
+            RECEIVER_PREFIX_FILELOG + LOG_TYPE_TSERVER,
+            transformName,
+            ec,
+            ec.getAdditionalTags(),
+            secretEnv,
+            secretEnvProviderUuids);
+      }
+    }
+    if (connMgrActive) {
+      for (UniverseServerLogsExporterConfig ec :
+          ysqlConnMgrLogConfig.getUniverseLogsExporterConfig()) {
+        addK8sLogPipeline(
+            cfg,
+            service,
+            universe,
+            podPlacement,
+            ec.getExporterUuid(),
+            ExportType.YSQL_CONN_MGR_LOGS,
+            RECEIVER_PREFIX_FILELOG + LOG_TYPE_YSQL_CONN_MGR,
+            transformName,
+            ec,
+            ec.getAdditionalTags(),
+            secretEnv,
+            secretEnvProviderUuids);
+      }
+    }
+    if (controllerActive) {
+      for (UniverseServerLogsExporterConfig ec :
+          controllerLogConfig.getUniverseLogsExporterConfig()) {
+        addK8sLogPipeline(
+            cfg,
+            service,
+            universe,
+            podPlacement,
+            ec.getExporterUuid(),
+            ExportType.CONTROLLER_LOGS,
+            RECEIVER_PREFIX_FILELOG + LOG_TYPE_CONTROLLER,
+            transformName,
+            ec,
+            ec.getAdditionalTags(),
+            secretEnv,
+            secretEnvProviderUuids);
+      }
+    }
+    service.setExtensions(new ArrayList<>(cfg.getExtensions().keySet()));
+    cfg.setService(service);
+
+    // Convert the typed POJO to a plain Map tree first so SnakeYAML emits clean YAML. Dumping the
+    // POJO directly tags every node with its Java class (e.g. !!...$FileLogReceiver), which
+    // pollutes the rendered collector config. SkipNullRepresenter drops the nulls Jackson includes.
+    Object plainConfig = Json.mapper().convertValue(cfg, Object.class);
+    Yaml yaml = new Yaml(new SkipNullRepresenter());
+    StringWriter writer = new StringWriter();
+    yaml.dump(plainConfig, writer);
+    return new K8sOtelConfig(true, writer.toString(), secretEnv);
+  }
+
+  private void addK8sLogPipeline(
+      OtelCollectorConfigFormat cfg,
+      OtelCollectorConfigFormat.Service service,
+      Universe universe,
+      K8sPodPlacement podPlacement,
+      UUID exporterUuid,
+      ExportType exportType,
+      String receiverName,
+      String transformName,
+      BatchedLogsExporterConfig batchConfig,
+      Map<String, String> additionalTags,
+      List<Object> secretEnv,
+      Set<UUID> secretEnvProviderUuids) {
+    TelemetryProvider tp = telemetryProviderService.getOrBadRequest(exporterUuid);
+    List<OtelCollectorConfigFormat.AttributeAction> attrs = new ArrayList<>();
+    String exporterName = appendExporterConfig(tp, cfg, attrs, exportType);
+    addK8sCommonRequiredAttributes(
+        attrs, universe, podPlacement, tp, logExportPurposeSuffix(exportType));
+    // Merge telemetry-provider tags + the exporter config's additionalTags (parity with VM).
+    addCommonAdditionalAttributes(attrs, tp, additionalTags);
+    attrs.add(new OtelCollectorConfigFormat.AttributeAction("host", "${POD_NAME}", "upsert", null));
+
+    List<String> processors = new ArrayList<>();
+    processors.add(transformName);
+
+    String attrName = PROCESSOR_PREFIX_ATTRIBUTES + exporterName;
+    OtelCollectorConfigFormat.AttributesProcessor attrProc =
+        new OtelCollectorConfigFormat.AttributesProcessor();
+    attrProc.setActions(attrs);
+    cfg.getProcessors().put(attrName, attrProc);
+    processors.add(attrName);
+
+    if (batchConfig != null) {
+      String batchName = PROCESSOR_PREFIX_BATCH + exporterName;
+      OtelCollectorConfigFormat.BatchProcessor batch =
+          new OtelCollectorConfigFormat.BatchProcessor();
+      batch.setSend_batch_size(batchConfig.getSendBatchSize());
+      batch.setSend_batch_max_size(batchConfig.getSendBatchMaxSize());
+      batch.setTimeout(batchConfig.getSendBatchTimeoutSeconds() + "s");
+      cfg.getProcessors().put(batchName, batch);
+      processors.add(batchName);
+
+      String memName = PROCESSOR_PREFIX_MEMORY_LIMITER + exporterName;
+      OtelCollectorConfigFormat.MemoryLimiterProcessor mem =
+          new OtelCollectorConfigFormat.MemoryLimiterProcessor();
+      mem.setCheck_interval(batchConfig.getMemoryLimitCheckIntervalSeconds() + "s");
+      mem.setLimit_mib(batchConfig.getMemoryLimitMib());
+      cfg.getProcessors().put(memName, mem);
+      processors.add(memName);
+    }
+
+    OtelCollectorConfigFormat.Pipeline pipeline = new OtelCollectorConfigFormat.Pipeline();
+    pipeline.setReceivers(ImmutableList.of(receiverName));
+    pipeline.setProcessors(processors);
+    pipeline.setExporters(ImmutableList.of(exporterName));
+    service
+        .getPipelines()
+        .put(PIPELINE_PREFIX_LOGS + exportTypeAndUUID(exporterUuid, exportType), pipeline);
+
+    appendSecretEnv(tp, secretEnv, secretEnvProviderUuids);
+  }
+
+  private void addK8sMetricsPipelines(
+      OtelCollectorConfigFormat cfg,
+      OtelCollectorConfigFormat.Service service,
+      Universe universe,
+      MetricsExportConfig metricsExportConfig,
+      K8sPodPlacement podPlacement,
+      List<Object> secretEnv,
+      Set<UUID> secretEnvProviderUuids) {
+    Set<ScrapeConfigTargetType> scrapeTargets = metricsExportConfig.getScrapeConfigTargets();
+
+    // Shared prometheus receiver scraping pod-local endpoints.
+    OtelCollectorConfigFormat.PrometheusReceiver receiver =
+        new OtelCollectorConfigFormat.PrometheusReceiver();
+    OtelCollectorConfigFormat.PrometheusConfig prometheusConfig =
+        new OtelCollectorConfigFormat.PrometheusConfig();
+    OtelCollectorConfigFormat.GlobalConfig globalConfig =
+        new OtelCollectorConfigFormat.GlobalConfig();
+    globalConfig.setScrape_interval(metricsExportConfig.getScrapeIntervalSeconds() + "s");
+    globalConfig.setScrape_timeout(metricsExportConfig.getScrapeTimeoutSeconds() + "s");
+    prometheusConfig.setGlobal(globalConfig);
+
+    List<OtelCollectorConfigFormat.ScrapeConfig> scrapeConfigs = new ArrayList<>();
+    if (OtelCollectorUtil.yugabyteJobScrapeConfigEnabled(scrapeTargets)) {
+      UniverseTaskParams.CommunicationPorts ports =
+          universe.getUniverseDetails().communicationPorts;
+      scrapeConfigs.add(
+          createYugabyteScrapeConfig(
+              K8S_POD_LOCAL_ADDRESS,
+              metricsExportConfig,
+              scrapeTargets,
+              ports.masterHttpPort,
+              ports.tserverHttpPort,
+              ports.ysqlServerHttpPort,
+              ports.yqlServerHttpPort));
+    }
+    if (scrapeTargets.contains(ScrapeConfigTargetType.OTEL_EXPORT)) {
+      scrapeConfigs.add(
+          createOtelCollectorScrapeConfig(
+              K8S_POD_LOCAL_ADDRESS, universe, getK8sOtelMetricsPort(universe)));
+    }
+    prometheusConfig.setScrape_configs(scrapeConfigs);
+    receiver.setConfig(prometheusConfig);
+    cfg.getReceivers().put(RECEIVER_PREFIX_PROMETHEUS + JOB_NAME_YUGABYTE, receiver);
+
+    // Add a new pipeline for each active metrics exporter config, since they can have different
+    // additional tags.
+    for (UniverseMetricsExporterConfig exporterConfig :
+        metricsExportConfig.getUniverseMetricsExporterConfig()) {
+      TelemetryProvider telemetryProvider =
+          telemetryProviderService.getOrBadRequest(exporterConfig.getExporterUuid());
+      String exportTypeAndUUIDString =
+          exportTypeAndUUID(telemetryProvider.getUuid(), ExportType.METRICS);
+      List<String> processorNames = new ArrayList<>();
+
+      OtelCollectorConfigFormat.Pipeline pipeline = new OtelCollectorConfigFormat.Pipeline();
+      pipeline.setReceivers(ImmutableList.of(RECEIVER_PREFIX_PROMETHEUS + JOB_NAME_YUGABYTE));
+
+      // Add AttributesProcessor for metrics.
+      List<OtelCollectorConfigFormat.AttributeAction> attributeActions = new ArrayList<>();
+      addK8sCommonRequiredAttributes(
+          attributeActions,
+          universe,
+          podPlacement,
+          telemetryProvider,
+          PURPOSE_SUFFIX_METRICS_EXPORT);
+      addCommonAdditionalAttributes(
+          attributeActions, telemetryProvider, exporterConfig.getAdditionalTags());
+
+      String attributesProcessorName = PROCESSOR_PREFIX_ATTRIBUTES + exportTypeAndUUIDString;
+      OtelCollectorConfigFormat.AttributesProcessor attributesProcessor =
+          new OtelCollectorConfigFormat.AttributesProcessor();
+      attributesProcessor.setActions(attributeActions);
+      cfg.getProcessors().put(attributesProcessorName, attributesProcessor);
+      processorNames.add(attributesProcessorName);
+
+      // Add the common metrics processors and the exporter itself.
+      String exporterName =
+          addCommonMetricsProcessorsAndExporter(
+              cfg, exporterConfig, telemetryProvider, exportTypeAndUUIDString, processorNames);
+
+      pipeline.setProcessors(processorNames);
+      pipeline.setExporters(ImmutableList.of(exporterName));
+      service.getPipelines().put(PIPELINE_PREFIX_METRICS + exportTypeAndUUIDString, pipeline);
+
+      appendSecretEnv(telemetryProvider, secretEnv, secretEnvProviderUuids);
+    }
+  }
+
+  /**
+   * K8s counterpart of {@link #addCommonRequiredAttributes}: the node identity attributes come from
+   * the pod (POD_NAME env var, injected by the operator) and the helm release placement instead of
+   * NodeDetails.
+   */
+  private void addK8sCommonRequiredAttributes(
+      List<OtelCollectorConfigFormat.AttributeAction> attributeActions,
+      Universe universe,
+      K8sPodPlacement podPlacement,
+      TelemetryProvider telemetryProvider,
+      String purposeSuffix) {
+    attributeActions.add(
+        new OtelCollectorConfigFormat.AttributeAction("host", "${POD_NAME}", "upsert", null));
+    attributeActions.add(
+        new OtelCollectorConfigFormat.AttributeAction(
+            "yugabyte.node_name", "${POD_NAME}", "upsert", null));
+    attributeActions.add(
+        new OtelCollectorConfigFormat.AttributeAction(
+            "yugabyte.universe_uuid", universe.getUniverseUUID().toString(), "upsert", null));
+    if (podPlacement != null) {
+      attributeActions.add(
+          new OtelCollectorConfigFormat.AttributeAction(
+              "yugabyte.cloud",
+              StringUtils.defaultString(podPlacement.getCloud(), ""),
+              "upsert",
+              null));
+      attributeActions.add(
+          new OtelCollectorConfigFormat.AttributeAction(
+              "yugabyte.region",
+              StringUtils.defaultString(podPlacement.getRegion(), ""),
+              "upsert",
+              null));
+      attributeActions.add(
+          new OtelCollectorConfigFormat.AttributeAction(
+              "yugabyte.zone",
+              StringUtils.defaultString(podPlacement.getZone(), ""),
+              "upsert",
+              null));
+      if (podPlacement.getClusterType() != null) {
+        attributeActions.add(
+            new OtelCollectorConfigFormat.AttributeAction(
+                "yugabyte.node_type", podPlacement.getClusterType().toString(), "upsert", null));
+      }
+    }
+    attributeActions.add(
+        new OtelCollectorConfigFormat.AttributeAction(
+            "yugabyte.purpose",
+            telemetryProvider.getConfig().getType().toString() + purposeSuffix,
+            "upsert",
+            null));
+  }
+
+  private OtelCollectorConfigFormat.Receiver createYsqlReceiver(
+      Provider provider, String logPrefix) {
+    // Filter only single/multi-line audit logs
+    OtelCollectorConfigFormat.FilterOperator filterOperator =
+        new OtelCollectorConfigFormat.FilterOperator();
+    filterOperator.setType("filter");
+    filterOperator.setExpr("body not matches \"^.*\\\\w+:  AUDIT:(.|\\\\n|\\\\r|\\\\s)*$\"");
+
+    // Parse attributes from audit logs
+    OtelCollectorConfigFormat.RegexOperator regexOperator =
+        getRegexOperator(logPrefix, ExportType.AUDIT_LOGS);
+
+    OtelCollectorConfigFormat.FileLogReceiver receiver =
+        createFileLogReceiver(
+            LOG_TYPE_YSQL, ImmutableList.of(filterOperator, regexOperator), ExportType.AUDIT_LOGS);
+    receiver.setInclude(ImmutableList.of(provider.getYbHome() + "/tserver/logs/postgresql-*.log"));
+    receiver.setExclude(ImmutableList.of(provider.getYbHome() + "/tserver/logs/*.gz"));
+
+    // Set multiline config to split by both normal log prefix and audit log prefix instead of the
+    // default newline character.
+    // Normal log line prefix = ([A-Z]\\d{4}). Ex: I0419 ...
+    // Audit log line prefix = prefix of the audit log regex.
+    // Example regex = ((?P<timestamp_with_ms>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}[.]\d{3} \w{3})[
+    // ][[](?P<process_id>\d+)[]][ ])
+    // Example audit log line = 2024-04-19 15:26:08.973 UTC [10011] LOG:  AUDIT: ...
+    // Logic is we first split the lines by either normal log prefix or audit log prefix.
+    // Then apply more strict audit log regex patterns to filter only the audit logs.
+    MultilineConfig multilineConfig = new MultilineConfig();
+    multilineConfig.setLine_start_pattern(generateLineStartPattern(logPrefix));
+    receiver.setMultiline(multilineConfig);
+    return receiver;
+  }
+
+  private OtelCollectorConfigFormat.Receiver createYsqlQueryLogReceiver(
+      Provider provider, String logPrefix) {
+    OtelCollectorConfigFormat.FilterOperator filterOperator1 =
+        new OtelCollectorConfigFormat.FilterOperator();
+    // filtering out the audit logs
+    filterOperator1.setType("filter");
+    filterOperator1.setExpr("body matches \"^.*\\\\w+:  AUDIT:(.|\\\\n|\\\\r|\\\\s)*$\"");
+
+    OtelCollectorConfigFormat.FilterOperator filterOperator2 =
+        new OtelCollectorConfigFormat.FilterOperator();
+    // Drop noisy PGSTAT logs
+    filterOperator2.setType("filter");
+    filterOperator2.setExpr(
+        "body matches \"unable to find pgstat entry for abnormally terminated PID\"");
+
+    OtelCollectorConfigFormat.FilterOperator filterOperator3 =
+        new OtelCollectorConfigFormat.FilterOperator();
+    // Filter out YBDB glob logs
+    filterOperator3.setType("filter");
+    filterOperator3.setExpr(
+        "body matches \"^[IWEF]\\\\d{4} \\\\d{2}:\\\\d{2}:\\\\d{2}\\\\.\\\\d{6} +\\\\d+"
+            + " .*\\\\.[ch]+:\\\\d+\"");
+
+    OtelCollectorConfigFormat.RegexOperator regexOperator =
+        getRegexOperator(logPrefix, ExportType.QUERY_LOGS);
+
+    OtelCollectorConfigFormat.FileLogReceiver receiver =
+        createFileLogReceiver(
+            LOG_TYPE_YSQL,
+            ImmutableList.of(filterOperator1, filterOperator2, filterOperator3, regexOperator),
+            ExportType.QUERY_LOGS);
+    receiver.setInclude(ImmutableList.of(provider.getYbHome() + "/tserver/logs/postgresql-*.log"));
+    receiver.setExclude(ImmutableList.of(provider.getYbHome() + "/tserver/logs/*.gz"));
+
+    MultilineConfig multilineConfig = new MultilineConfig();
+    multilineConfig.setLine_start_pattern(generateQueryLineStartPattern(logPrefix));
+    receiver.setMultiline(multilineConfig);
+    return receiver;
+  }
+
+  /** One hardcoded noise-sampling tier: lines matching {@code expr} are dropped at that ratio. */
+  private static class NoiseTier {
+    final String expr;
+    final double dropRatio;
+
+    NoiseTier(String expr, double dropRatio) {
+      this.expr = expr;
+      this.dropRatio = dropRatio;
+    }
+  }
+
+  /**
+   * Everything that varies between the glog (yb-master / yb-tserver) filelog receivers. A new
+   * glog-family log type is a matter of populating this spec, not writing a new operator pipeline.
+   */
+  private static class GlogReceiverSpec {
+    String logType;
+    ExportType exportType;
+    // Redaction body-match conditions (joined with " or "), dropped at ratio 1.0.
+    List<String> redactionConditions;
+    // Drop YCQL AUDIT lines (they live in the tserver glog and have a dedicated receiver).
+    boolean excludeAuditLines;
+    // Prefix the glog regex with (?s) so . spans newlines in multiline bodies.
+    boolean dotAllGlogRegex;
+    // Minimum severity to keep; INFO means keep all (no filter emitted).
+    ServerLogLevel minLevel;
+    // Noise-sampling tiers, applied after the glog parse (so they can key off parsed fields).
+    List<NoiseTier> noiseTiers;
+    // Log dir subpath under ybHome (e.g. "master") and the file prefix (e.g. "yb-master").
+    String logSubdir;
+    String filePrefix;
+    String multilinePattern;
+  }
+
+  private OtelCollectorConfigFormat.Receiver createMasterLogReceiver(
+      Provider provider, MasterLogConfig masterLogConfig, List<String> additionalDropPatterns) {
+    List<String> redactionConditions =
+        new ArrayList<>(
+            Arrays.asList(
+                "body contains \"Writing version edit\"",
+                "body contains \"Intent for transaction w/o metadata\"",
+                "body contains \"Colocated Tablet not found for table\"",
+                "(body contains \"READ_REPLICA\" or (body contains \"Skipping add replicas\""
+                    + " and body contains \"Currently remote bootstrapping\"))"));
+    addAdditionalDropPatterns(redactionConditions, additionalDropPatterns);
+
+    // Master has a single, customer-configurable noise tier (default 0.99; 0.0 disables it).
+    double noiseDropRatio =
+        (masterLogConfig != null && masterLogConfig.getNoiseSampleDropRatio() != null)
+            ? masterLogConfig.getNoiseSampleDropRatio()
+            : 0.99;
+    List<NoiseTier> noiseTiers = new ArrayList<>();
+    if (noiseDropRatio > 0.0) {
+      noiseTiers.add(
+          new NoiseTier(
+              "(body contains \"Found uninitialized path\" or body contains \"Not allowing it to"
+                  + " take more tablets\" or body contains \"Processing tablet\")",
+              noiseDropRatio));
+    }
+
+    GlogReceiverSpec spec = new GlogReceiverSpec();
+    spec.logType = LOG_TYPE_MASTER;
+    spec.exportType = ExportType.MASTER_LOGS;
+    spec.redactionConditions = redactionConditions;
+    spec.excludeAuditLines = false;
+    spec.dotAllGlogRegex = false;
+    spec.minLevel =
+        (masterLogConfig != null && masterLogConfig.getMinLevel() != null)
+            ? masterLogConfig.getMinLevel()
+            : ServerLogLevel.INFO;
+    spec.noiseTiers = noiseTiers;
+    spec.logSubdir = "master";
+    spec.filePrefix = "yb-master";
+    spec.multilinePattern = "^[IWEF]";
+    return buildGlogReceiver(provider, spec);
+  }
+
+  /** Append runtime-flag drop patterns (from an internal flag) onto a redaction condition list. */
+  private void addAdditionalDropPatterns(List<String> conditions, List<String> additional) {
+    if (CollectionUtils.isNotEmpty(additional)) {
+      additional.forEach(p -> conditions.add("body contains \"" + p.replace("\"", "\\\"") + "\""));
+    }
+  }
+
+  /** Assemble a glog filelog receiver (operators + include/exclude/multiline) from its spec. */
+  private OtelCollectorConfigFormat.Receiver buildGlogReceiver(
+      Provider provider, GlogReceiverSpec spec) {
+    OtelCollectorConfigFormat.FileLogReceiver receiver =
+        createFileLogReceiver(spec.logType, buildGlogOperators(spec), spec.exportType);
+    receiver.setPoll_interval("1s");
+    String logsDir = provider.getYbHome() + "/" + spec.logSubdir + "/logs/";
+    receiver.setInclude(ImmutableList.of(logsDir + spec.filePrefix + ".*.INFO.*"));
+    receiver.setExclude(ImmutableList.of(logsDir + "*.gz"));
+    MultilineConfig multilineConfig = new MultilineConfig();
+    multilineConfig.setLine_start_pattern(spec.multilinePattern);
+    receiver.setMultiline(multilineConfig);
+    return receiver;
+  }
+
+  /**
+   * The shared glog operator pipeline, in a single canonical order. Noise sampling runs after the
+   * glog parse so a tier can key off parsed fields (e.g. tserver's file_name); the min-level drop
+   * runs there too. Unparseable lines (glog parse on_error=send, no log_level) survive the
+   * min-level drop and are later defaulted to INFO.
+   */
+  private List<OtelCollectorConfigFormat.Operator> buildGlogOperators(GlogReceiverSpec spec) {
+    List<OtelCollectorConfigFormat.Operator> operators = new ArrayList<>();
+
+    // Redact lines that may contain raw rocksdb updates / customer data (drop all matches).
+    OtelCollectorConfigFormat.FilterOperator redactFilter =
+        new OtelCollectorConfigFormat.FilterOperator();
+    redactFilter.setType("filter");
+    redactFilter.setExpr(String.join(" or ", spec.redactionConditions));
+    redactFilter.setDrop_ratio(1.0);
+    operators.add(redactFilter);
+
+    // Optionally drop YCQL AUDIT lines (handled by the dedicated YCQL audit receiver), keeping
+    // audit content out of the server-log export and avoiding double-export.
+    if (spec.excludeAuditLines) {
+      OtelCollectorConfigFormat.FilterOperator auditExcludeFilter =
+          new OtelCollectorConfigFormat.FilterOperator();
+      auditExcludeFilter.setType("filter");
+      auditExcludeFilter.setExpr("body matches \"^.*AUDIT: user:(.|\\\\n|\\\\r|\\\\s)*$\"");
+      operators.add(auditExcludeFilter);
+    }
+
+    // Parse glog fields. on_error=send so unparseable lines are still exported.
+    OtelCollectorConfigFormat.RegexOperator glogParser =
+        new OtelCollectorConfigFormat.RegexOperator();
+    glogParser.setType("regex_parser");
+    glogParser.setRegex(
+        (spec.dotAllGlogRegex ? "(?s)" : "")
+            + "(?P<log_level>[IWEF])(?P<log_time>\\d{4} \\d{2}:\\d{2}:\\d{2}[.]\\d{6})\\s*"
+            + "(?P<thread_id>\\d+) (?P<file_name>[^:]+):(?P<file_line>\\d+)[]] (?P<message>.*)");
+    glogParser.setOn_error("send");
+    glogParser.setIf("body matches \"^[IWEF]\"");
+    operators.add(glogParser);
+
+    // Drop lines below the configured minimum severity (INFO = keep all).
+    OtelCollectorConfigFormat.FilterOperator minLevelFilter =
+        buildMinLevelDropFilter(spec.minLevel);
+    if (minLevelFilter != null) {
+      operators.add(minLevelFilter);
+    }
+
+    // Sample down high-volume, low-value noise lines. Patterns are hardcoded DB-internal strings
+    // that can change across DB versions; to extend them, add an internal runtime flag rather than
+    // a customer-facing API field.
+    for (NoiseTier tier : spec.noiseTiers) {
+      OtelCollectorConfigFormat.FilterOperator noiseFilter =
+          new OtelCollectorConfigFormat.FilterOperator();
+      noiseFilter.setType("filter");
+      noiseFilter.setExpr(tier.expr);
+      noiseFilter.setDrop_ratio(tier.dropRatio);
+      operators.add(noiseFilter);
+    }
+
+    // Extract the year from the log file name (glog timestamps omit the year). on_error=send so a
+    // filename that does not match (rotation/naming drift) does not drop the line.
+    OtelCollectorConfigFormat.RegexOperator yearParser =
+        new OtelCollectorConfigFormat.RegexOperator();
+    yearParser.setType("regex_parser");
+    yearParser.setParse_from("attributes[\"log.file.name\"]");
+    yearParser.setRegex(spec.filePrefix + "[.].*[.]log[.]INFO[.](?P<log_year>\\d{4}).*");
+    yearParser.setOn_error("send");
+    operators.add(yearParser);
+
+    // Combine year + glog time into a single timestamp and parse it.
+    OtelCollectorConfigFormat.AddOperator combineTime = new OtelCollectorConfigFormat.AddOperator();
+    combineTime.setType("add");
+    combineTime.setField("attributes.log_time_full");
+    combineTime.setValue("EXPR(attributes.log_year + attributes.log_time)");
+    combineTime.setIf("attributes.log_time != nil");
+    operators.add(combineTime);
+
+    OtelCollectorConfigFormat.TimeParserOperator timeParser =
+        new OtelCollectorConfigFormat.TimeParserOperator();
+    timeParser.setType("time_parser");
+    timeParser.setParse_from("attributes.log_time_full");
+    timeParser.setLayout("%Y%m%d %H:%M:%S.%f");
+    timeParser.setIf("attributes.log_time != nil");
+    operators.add(timeParser);
+
+    // Default the log level when the glog parse did not produce one, then map to severity.
+    OtelCollectorConfigFormat.AddOperator defaultLevel =
+        new OtelCollectorConfigFormat.AddOperator();
+    defaultLevel.setType("add");
+    defaultLevel.setField("attributes.log_level");
+    defaultLevel.setValue("I");
+    defaultLevel.setIf("attributes.log_level == nil");
+    operators.add(defaultLevel);
+
+    operators.add(buildSeverityParser());
+    operators.add(buildMessageToBodyMove());
+    return operators;
+  }
+
+  /**
+   * Filter that drops glog lines below {@code minLevel} (by the {@code attributes.log_level} char),
+   * or null when {@code minLevel} is INFO (keep all). Shared by the master and tserver glog
+   * receivers. Callers place it where log_level is populated (after the glog parse / default-level
+   * add).
+   */
+  private OtelCollectorConfigFormat.FilterOperator buildMinLevelDropFilter(
+      ServerLogLevel minLevel) {
+    if (minLevel == null || minLevel == ServerLogLevel.INFO) {
+      return null;
+    }
+    List<String> belowMinConditions = new ArrayList<>();
+    for (ServerLogLevel level : ServerLogLevel.values()) {
+      if (level.ordinal() < minLevel.ordinal()) {
+        belowMinConditions.add("attributes.log_level == \"" + level.getGlogChar() + "\"");
+      }
+    }
+    OtelCollectorConfigFormat.FilterOperator minLevelFilter =
+        new OtelCollectorConfigFormat.FilterOperator();
+    minLevelFilter.setType("filter");
+    minLevelFilter.setExpr("(" + String.join(" or ", belowMinConditions) + ")");
+    minLevelFilter.setDrop_ratio(1.0);
+    return minLevelFilter;
+  }
+
+  /** severity_parser mapping the glog log_level char to an OTEL severity. */
+  private OtelCollectorConfigFormat.SeverityParserOperator buildSeverityParser() {
+    OtelCollectorConfigFormat.SeverityParserOperator severityParser =
+        new OtelCollectorConfigFormat.SeverityParserOperator();
+    severityParser.setType("severity_parser");
+    severityParser.setParse_from("attributes.log_level");
+    severityParser.setMapping(
+        ImmutableMap.of("info", "I", "warn", "W", "error", "E", "fatal", "F"));
+    return severityParser;
+  }
+
+  /** move the parsed message into the log body (glog receivers). */
+  private OtelCollectorConfigFormat.MoveOperator buildMessageToBodyMove() {
+    OtelCollectorConfigFormat.MoveOperator moveMessage =
+        new OtelCollectorConfigFormat.MoveOperator();
+    moveMessage.setType("move");
+    moveMessage.setFrom("attributes.message");
+    moveMessage.setTo("body");
+    moveMessage.setIf("attributes.message != nil");
+    return moveMessage;
+  }
+
+  private OtelCollectorConfigFormat.Receiver createTserverLogReceiver(
+      Provider provider, TServerLogConfig tserverLogConfig, List<String> additionalDropPatterns) {
+    List<String> redactionConditions =
+        new ArrayList<>(
+            Arrays.asList(
+                "body contains \"Writing version edit\"",
+                "body contains \"DETAIL:\"",
+                "body contains \"Intent for transaction w/o metadata\"",
+                "body contains \"Colocated Tablet not found for table\"",
+                "(body contains \"READ_REPLICA\" or (body contains \"Skipping add replicas\""
+                    + " and body contains \"Currently remote bootstrapping\"))"));
+    addAdditionalDropPatterns(redactionConditions, additionalDropPatterns);
+
+    // TServer has two hardcoded noise tiers. The first keys off the glog-parsed file_name, which
+    // is why noise runs after the glog parse (buildGlogOperators order).
+    List<NoiseTier> noiseTiers =
+        Arrays.asList(
+            new NoiseTier(
+                "((attributes.file_name == \"log.cc\" and body contains \"Time spent Fsync log took"
+                    + " a long time\") or body contains \"default Universal file being compacted"
+                    + " skipping\" or body contains \"skip_prefix_locks gflag is enabled while"
+                    + " there are active serializable isolation transactions\")",
+                0.999),
+            new NoiseTier(
+                "(body contains \"Increasing compaction threads because we have\" and body contains"
+                    + " \"level 0 files\")",
+                0.75));
+
+    GlogReceiverSpec spec = new GlogReceiverSpec();
+    spec.logType = LOG_TYPE_TSERVER;
+    spec.exportType = ExportType.TSERVER_LOGS;
+    spec.redactionConditions = redactionConditions;
+    spec.excludeAuditLines = true;
+    spec.dotAllGlogRegex = true;
+    spec.minLevel =
+        (tserverLogConfig != null && tserverLogConfig.getMinLevel() != null)
+            ? tserverLogConfig.getMinLevel()
+            : ServerLogLevel.WARNING;
+    spec.noiseTiers = noiseTiers;
+    spec.logSubdir = "tserver";
+    spec.filePrefix = "yb-tserver";
+    // Allow both the redaction sentinel (otho8Aut, stripped by the shared transform processor) and
+    // a glog severity char to start a new log record.
+    spec.multilinePattern = "^((otho8Aut)|[IWEF])";
+    return buildGlogReceiver(provider, spec);
+  }
+
+  private OtelCollectorConfigFormat.Receiver createYcqlReceiver(
+      Provider provider, YCQLAuditConfig config) {
+    // Filter only audit logs
+    OtelCollectorConfigFormat.FilterOperator filterOperator =
+        new OtelCollectorConfigFormat.FilterOperator();
+    filterOperator.setType("filter");
+    filterOperator.setExpr("body not matches \"^.*AUDIT: user:(.|\\\\n|\\\\r|\\\\s)*$\"");
+
+    // Parse attributes from audit logs
+    OtelCollectorConfigFormat.RegexOperator regexOperator =
+        new OtelCollectorConfigFormat.RegexOperator();
+    regexOperator.setType("regex_parser");
+    regexOperator.setRegex(
+        "(?P<log_level>\\w)(?P<log_time>\\d{2}\\d{2} \\d{2}:\\d{2}:\\d{2}[.]\\d{6})"
+            + "\\s*(?P<thread_id>\\d+) (?P<file_name>[^:]+):(?P<file_line>\\d+)[]] AUDIT: "
+            + "user:(?P<user_name>[^|]+)[|]host:(?P<local_host>[^:]+):(?P<local_port>\\d+)[|]"
+            + "source:(?P<remote_host>[^|]+)[|]port:(?P<remote_port>\\d+)[|]"
+            + "timestamp:(?P<timestamp>\\d+)[|]type:(?P<type>[^|]+)[|]"
+            + "category:(?P<category>[^|]+)([|]ks:(?P<keyspace>[^|]+))?([|]"
+            + "scope:(?P<scope>[^|]+))?[|]operation:(?P<statement>(.|\\n|\\r|\\s)*)");
+    regexOperator.setOn_error("drop");
+    OtelCollectorConfigFormat.OperatorTimestamp timestamp =
+        new OtelCollectorConfigFormat.OperatorTimestamp();
+    timestamp.setParse_from("attributes.timestamp");
+    timestamp.setLayout_type("epoch");
+    timestamp.setLayout("ms");
+    regexOperator.setTimestamp(timestamp);
+    OtelCollectorConfigFormat.FileLogReceiver receiver =
+        createFileLogReceiver(
+            LOG_TYPE_YCQL, ImmutableList.of(filterOperator, regexOperator), ExportType.AUDIT_LOGS);
+    YCQLAuditConfig.YCQLAuditLogLevel logLevel =
+        config.getLogLevel() != null
+            ? config.getLogLevel()
+            : YCQLAuditConfig.YCQLAuditLogLevel.ERROR;
+    receiver.setInclude(
+        ImmutableList.of(provider.getYbHome() + "/tserver/logs/yb-tserver.*." + logLevel + ".*"));
+    receiver.setExclude(ImmutableList.of(provider.getYbHome() + "/tserver/logs/*.gz"));
+    // Set multiline config to split by both normal log prefix and audit log prefix.
+    MultilineConfig multilineConfig = new MultilineConfig();
+    multilineConfig.setLine_start_pattern("([A-Z]\\d{4})");
+    receiver.setMultiline(multilineConfig);
+    return receiver;
+  }
+
+  /** Severity parser for non-glog sources whose levels are already words (info/warn/error/...). */
+  private OtelCollectorConfigFormat.SeverityParserOperator buildPlainSeverityParser() {
+    OtelCollectorConfigFormat.SeverityParserOperator severityParser =
+        new OtelCollectorConfigFormat.SeverityParserOperator();
+    severityParser.setType("severity_parser");
+    severityParser.setParse_from("attributes.log_level");
+    return severityParser;
+  }
+
+  /**
+   * YSQL Connection Manager log receiver (internal-only). Available on both VM and Kubernetes: the
+   * ysql-conn-mgr logs are co-located with the postgres logs in the yb-tserver pod, so the K8s
+   * caller reuses this builder and overrides the include path. Format: {@code <pid> <YYYY-MM-DD
+   * HH:MM:SS.mmm UTC> <level> <message>}.
+   */
+  private OtelCollectorConfigFormat.Receiver createYsqlConnMgrLogReceiver(Provider provider) {
+    List<OtelCollectorConfigFormat.Operator> operators = new ArrayList<>();
+
+    OtelCollectorConfigFormat.RegexOperator parser = new OtelCollectorConfigFormat.RegexOperator();
+    parser.setType("regex_parser");
+    parser.setOn_error("send");
+    parser.setRegex(
+        "(?s)(?P<pid>\\d+)\\s+(?P<log_time_full>\\d{4}-\\d{2}-\\d{2} "
+            + "\\d{2}:\\d{2}:\\d{2}[.]\\d{3} UTC)\\s+(?P<log_level>\\w+)\\s+(?P<message>.*)$");
+    operators.add(parser);
+
+    OtelCollectorConfigFormat.TimeParserOperator timeParser =
+        new OtelCollectorConfigFormat.TimeParserOperator();
+    timeParser.setType("time_parser");
+    timeParser.setParse_from("attributes.log_time_full");
+    timeParser.setLayout("%Y-%m-%d %H:%M:%S.%L UTC");
+    timeParser.setIf("attributes.log_time_full != nil");
+    operators.add(timeParser);
+
+    OtelCollectorConfigFormat.AddOperator defaultLevel =
+        new OtelCollectorConfigFormat.AddOperator();
+    defaultLevel.setType("add");
+    defaultLevel.setField("attributes.log_level");
+    defaultLevel.setValue("info");
+    defaultLevel.setIf("attributes.log_level == nil");
+    operators.add(defaultLevel);
+
+    operators.add(buildPlainSeverityParser());
+    operators.add(buildMessageToBodyMove());
+
+    OtelCollectorConfigFormat.FileLogReceiver receiver =
+        createFileLogReceiver(LOG_TYPE_YSQL_CONN_MGR, operators, ExportType.YSQL_CONN_MGR_LOGS);
+    receiver.setPoll_interval("1s");
+    receiver.setInclude(ImmutableList.of(provider.getYbHome() + "/tserver/logs/ysql-conn-mgr-*"));
+    receiver.setExclude(ImmutableList.of(provider.getYbHome() + "/tserver/logs/*.gz"));
+    MultilineConfig multiline = new MultilineConfig();
+    multiline.setLine_start_pattern("^\\d+\\s+\\d{4}-\\d{2}-\\d{2}");
+    receiver.setMultiline(multiline);
+    return receiver;
+  }
+
+  /**
+   * node-agent log receiver (internal-only, VM-only). Not available on Kubernetes: node-agent does
+   * not run inside the yb-master/yb-tserver pods (NodeAgentClient.isCloudTypeSupported is false for
+   * kubernetes), so node_agent.log does not exist there for a sidecar to tail. Format: {@code
+   * timestamp=<RFC3339> level=<level> message="<msg>" [key=value ...]}.
+   */
+  private OtelCollectorConfigFormat.Receiver createNodeAgentLogReceiver(String nodeAgentLogDir) {
+    List<OtelCollectorConfigFormat.Operator> operators = new ArrayList<>();
+
+    OtelCollectorConfigFormat.RegexOperator parser = new OtelCollectorConfigFormat.RegexOperator();
+    parser.setType("regex_parser");
+    parser.setOn_error("send");
+    parser.setRegex(
+        "^timestamp=(?P<log_time_full>\\S+)\\s+level=(?P<log_level>\\S+)\\s+"
+            + "message=\"(?P<message>[^\"]*)\"");
+    operators.add(parser);
+
+    // Truncate nanoseconds to milliseconds so the time_parser layout matches.
+    OtelCollectorConfigFormat.RegexOperator millis = new OtelCollectorConfigFormat.RegexOperator();
+    millis.setType("regex_parser");
+    millis.setParse_from("attributes.log_time_full");
+    millis.setRegex(
+        "^(?P<log_time_millis>\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(?:\\.\\d{1,3})?)\\d*Z$");
+    millis.setOn_error("send");
+    millis.setIf("attributes.log_time_full != nil");
+    operators.add(millis);
+
+    OtelCollectorConfigFormat.TimeParserOperator timeParser =
+        new OtelCollectorConfigFormat.TimeParserOperator();
+    timeParser.setType("time_parser");
+    timeParser.setParse_from("attributes.log_time_millis");
+    timeParser.setLayout("%Y-%m-%dT%H:%M:%S.%L");
+    timeParser.setIf("attributes.log_time_millis != nil");
+    operators.add(timeParser);
+
+    operators.add(buildPlainSeverityParser());
+    operators.add(buildMessageToBodyMove());
+
+    OtelCollectorConfigFormat.FileLogReceiver receiver =
+        createFileLogReceiver(LOG_TYPE_NODE_AGENT, operators, ExportType.NODE_AGENT_LOGS);
+    receiver.setPoll_interval("1s");
+    receiver.setInclude(ImmutableList.of(nodeAgentLogDir + "/node_agent.log"));
+    return receiver;
+  }
+
+  /**
+   * YNP (node provisioning) log receiver (internal-only, VM-only). Not available on Kubernetes: YNP
+   * shares the node-agent install dir, which does not exist inside the DB pods (node provisioning
+   * is a VM/on-prem concept). Format: {@code <RFC3339> - <logger> - <level> - <message>}.
+   */
+  private OtelCollectorConfigFormat.Receiver createYnpLogReceiver(String nodeAgentLogDir) {
+    List<OtelCollectorConfigFormat.Operator> operators = new ArrayList<>();
+
+    OtelCollectorConfigFormat.RegexOperator parser = new OtelCollectorConfigFormat.RegexOperator();
+    parser.setType("regex_parser");
+    parser.setOn_error("send");
+    parser.setRegex(
+        "(?s)^(?P<log_time_full>\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}Z)\\s+-\\s+"
+            + "(?P<logger>\\S+)\\s+-\\s+(?P<log_level>\\S+)\\s+-\\s+(?P<message>.*)");
+    operators.add(parser);
+
+    OtelCollectorConfigFormat.TimeParserOperator timeParser =
+        new OtelCollectorConfigFormat.TimeParserOperator();
+    timeParser.setType("time_parser");
+    timeParser.setParse_from("attributes.log_time_full");
+    timeParser.setLayout("%Y-%m-%dT%H:%M:%SZ");
+    timeParser.setIf("attributes.log_time_full != nil");
+    operators.add(timeParser);
+
+    operators.add(buildPlainSeverityParser());
+    operators.add(buildMessageToBodyMove());
+
+    OtelCollectorConfigFormat.FileLogReceiver receiver =
+        createFileLogReceiver(LOG_TYPE_YNP, operators, ExportType.YNP_LOGS);
+    receiver.setPoll_interval("1s");
+    receiver.setInclude(ImmutableList.of(nodeAgentLogDir + "/app.log"));
+    MultilineConfig multiline = new MultilineConfig();
+    multiline.setLine_start_pattern("^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}Z");
+    receiver.setMultiline(multiline);
+    return receiver;
+  }
+
+  /**
+   * YB-Controller log receiver (internal-only). Available on both VM and Kubernetes: yb-controller
+   * runs as a sidecar in the yb-tserver pod, so the K8s caller reuses this builder and overrides
+   * the include path to the ybc-data mount. glog format with an 8-digit date: {@code
+   * <level><YYYYMMDD HH:MM:SS.uuuuuu> <tid> <file>:<line>] <message>}.
+   */
+  private OtelCollectorConfigFormat.Receiver createControllerLogReceiver(String ybcDataDir) {
+    List<OtelCollectorConfigFormat.Operator> operators = new ArrayList<>();
+
+    // Drop low-value / potentially-sensitive lines outright.
+    OtelCollectorConfigFormat.FilterOperator redactFilter =
+        new OtelCollectorConfigFormat.FilterOperator();
+    redactFilter.setType("filter");
+    redactFilter.setExpr(
+        "body contains \"not found, removing\" or body contains \"CA FILE\""
+            + " or body contains \"Not uploading\"");
+    redactFilter.setDrop_ratio(1.0);
+    operators.add(redactFilter);
+
+    OtelCollectorConfigFormat.RegexOperator parser = new OtelCollectorConfigFormat.RegexOperator();
+    parser.setType("regex_parser");
+    parser.setOn_error("send");
+    parser.setRegex(
+        "(?s)(?P<log_level>[IWEF])(?P<log_time_full>\\d{8} "
+            + "\\d{2}:\\d{2}:\\d{2}[.]\\d{6})\\s*(?P<thread_id>\\d+) "
+            + "(?P<file_name>[^:]+):(?P<file_line>\\d+)[]] (?P<message>.*)");
+    parser.setIf("body matches \"^[IWEF]\"");
+    operators.add(parser);
+
+    OtelCollectorConfigFormat.TimeParserOperator timeParser =
+        new OtelCollectorConfigFormat.TimeParserOperator();
+    timeParser.setType("time_parser");
+    timeParser.setParse_from("attributes.log_time_full");
+    timeParser.setLayout("%Y%m%d %H:%M:%S.%f");
+    timeParser.setIf("attributes.log_time_full != nil");
+    operators.add(timeParser);
+
+    OtelCollectorConfigFormat.AddOperator defaultLevel =
+        new OtelCollectorConfigFormat.AddOperator();
+    defaultLevel.setType("add");
+    defaultLevel.setField("attributes.log_level");
+    defaultLevel.setValue("I");
+    defaultLevel.setIf("attributes.log_level == nil");
+    operators.add(defaultLevel);
+
+    operators.add(buildSeverityParser());
+    operators.add(buildMessageToBodyMove());
+
+    OtelCollectorConfigFormat.FileLogReceiver receiver =
+        createFileLogReceiver(LOG_TYPE_CONTROLLER, operators, ExportType.CONTROLLER_LOGS);
+    receiver.setPoll_interval("1s");
+    String logsDir = ybcDataDir + "/ybc-data/controller/logs/";
+    receiver.setInclude(ImmutableList.of(logsDir + "yb-controller-server.INFO"));
+    receiver.setExclude(ImmutableList.of(logsDir + "*.gz"));
+    MultilineConfig multiline = new MultilineConfig();
+    multiline.setLine_start_pattern("^[IWEF]\\d{8}");
+    receiver.setMultiline(multiline);
+    return receiver;
+  }
+
+  private OtelCollectorConfigFormat.FileLogReceiver createFileLogReceiver(
+      String logType, List<OtelCollectorConfigFormat.Operator> operators, ExportType exportType) {
+    OtelCollectorConfigFormat.FileLogReceiver receiver =
+        new OtelCollectorConfigFormat.FileLogReceiver();
+    receiver.setStart_at("beginning");
+    receiver.setStorage("file_storage/queue");
+    receiver.setOperators(operators);
+    if (ExportType.AUDIT_LOGS.equals(exportType)) {
+      receiver.setAttributes(ImmutableMap.of("yugabyte.audit_log_type", logType));
+    } else if (ExportType.QUERY_LOGS.equals(exportType)) {
+      receiver.setAttributes(ImmutableMap.of("yugabyte.query_log_type", logType));
+    } else if (ExportType.MASTER_LOGS.equals(exportType)
+        || ExportType.TSERVER_LOGS.equals(exportType)
+        || ExportType.YSQL_CONN_MGR_LOGS.equals(exportType)
+        || ExportType.NODE_AGENT_LOGS.equals(exportType)
+        || ExportType.YNP_LOGS.equals(exportType)
+        || ExportType.CONTROLLER_LOGS.equals(exportType)) {
+      receiver.setAttributes(ImmutableMap.of("yugabyte.server_log_type", logType));
+    }
+    return receiver;
+  }
+
+  private OtelCollectorConfigFormat.PrometheusReceiver createPrometheusReceiver(
+      MetricsExportConfig metricsExportConfig,
+      String nodeAddress,
+      Universe universe,
+      int otelColMetricsPort,
+      NodeDetails nodeDetails,
+      NodeAgent nodeAgent) {
+    OtelCollectorConfigFormat.PrometheusReceiver receiver =
+        new OtelCollectorConfigFormat.PrometheusReceiver();
+    OtelCollectorConfigFormat.PrometheusConfig config =
+        new OtelCollectorConfigFormat.PrometheusConfig();
+
+    // Set global configuration
+    OtelCollectorConfigFormat.GlobalConfig globalConfig =
+        new OtelCollectorConfigFormat.GlobalConfig();
+    globalConfig.setScrape_interval(metricsExportConfig.getScrapeIntervalSeconds() + "s");
+    globalConfig.setScrape_timeout(metricsExportConfig.getScrapeTimeoutSeconds() + "s");
+    config.setGlobal(globalConfig);
+
+    List<OtelCollectorConfigFormat.ScrapeConfig> scrapeConfigs = new ArrayList<>();
+
+    // Add yugabyte scrape config. Includes master, tserver, ysql, cql exports.
+    if (OtelCollectorUtil.yugabyteJobScrapeConfigEnabled(
+        metricsExportConfig.getScrapeConfigTargets())) {
+      scrapeConfigs.add(createYugabyteScrapeConfig(nodeAddress, nodeDetails, metricsExportConfig));
+    }
+
+    // Add node exporter scrape config if the scrape config target is enabled.
+    if (metricsExportConfig.getScrapeConfigTargets().contains(ScrapeConfigTargetType.NODE_EXPORT)) {
+      scrapeConfigs.add(createNodeExporterScrapeConfig(nodeAddress, nodeDetails));
+    }
+
+    // Add node-agent scrape config if the scrape config target is enabled.
+    if (metricsExportConfig
+        .getScrapeConfigTargets()
+        .contains(ScrapeConfigTargetType.NODE_AGENT_EXPORT)) {
+      scrapeConfigs.add(createNodeAgentScrapeConfig(nodeAddress, nodeAgent));
+    }
+
+    // Add otel-collector scrape config if the scrape config target is enabled.
+    if (metricsExportConfig.getScrapeConfigTargets().contains(ScrapeConfigTargetType.OTEL_EXPORT)) {
+      scrapeConfigs.add(createOtelCollectorScrapeConfig(nodeAddress, universe, otelColMetricsPort));
+    }
+
+    // Set the scrape configs to the prometheus receiver
+    config.setScrape_configs(scrapeConfigs);
+    receiver.setConfig(config);
+    return receiver;
+  }
+
+  public String getPriorityRegex(MetricCollectionLevel level) {
+    return level.getPriorityRegex(environment);
+  }
+
+  public String getMetrics(MetricCollectionLevel level) {
+    return level.getMetrics(environment);
+  }
+
+  public OtelCollectorConfigFormat.StaticConfig createMasterStaticConfig(
+      String nodeAddress, int masterHttpPort, MetricsExportConfig metricsExportConfig) {
+    OtelCollectorConfigFormat.StaticConfig staticConfig =
+        new OtelCollectorConfigFormat.StaticConfig();
+    staticConfig.setTargets(ImmutableList.of(nodeAddress + ":" + masterHttpPort));
+
+    // Build up all labels
+    Map<String, String> labels = new HashMap<>();
+    labels.put("export_type", EXPORT_TYPE_MASTER);
+    labels.put("service", "yb-master");
+
+    // Get the metric collection level from the metrics export config
+    MetricCollectionLevel level = metricsExportConfig.getCollectionLevel();
+    String priorityRegex = getPriorityRegex(level);
+    if (!StringUtils.isEmpty(priorityRegex)) {
+      labels.put(PARAM_PRIORITY_REGEX, priorityRegex);
+    }
+
+    // For minimal collection level, also add the 'metrics' param to limit server level metrics
+    String metrics = getMetrics(level);
+    if (!StringUtils.isEmpty(metrics)) {
+      labels.put(PARAM_METRICS, metrics);
+    }
+
+    labels.put(PARAM_SHOW_HELP, DEFAULT_SHOW_HELP);
+
+    // Set all labels at once
+    staticConfig.setLabels(ImmutableMap.copyOf(labels));
+    return staticConfig;
+  }
+
+  private OtelCollectorConfigFormat.StaticConfig createTserverStaticConfig(
+      String nodeAddress, int tserverHttpPort, MetricsExportConfig metricsExportConfig) {
+    OtelCollectorConfigFormat.StaticConfig staticConfig =
+        new OtelCollectorConfigFormat.StaticConfig();
+    staticConfig.setTargets(ImmutableList.of(nodeAddress + ":" + tserverHttpPort));
+
+    // Build up all labels
+    Map<String, String> labels = new HashMap<>();
+    labels.put("export_type", EXPORT_TYPE_TSERVER);
+    labels.put("service", SERVICE_TSERVER);
+
+    // Get the metric collection level from the metrics export config
+    MetricCollectionLevel level = metricsExportConfig.getCollectionLevel();
+    String priorityRegex = getPriorityRegex(level);
+    if (!StringUtils.isEmpty(priorityRegex)) {
+      labels.put(PARAM_PRIORITY_REGEX, priorityRegex);
+    }
+
+    // For minimal collection level, also add the 'metrics' param to limit server level metrics
+    String metrics = getMetrics(level);
+    if (!StringUtils.isEmpty(metrics)) {
+      labels.put(PARAM_METRICS, metrics);
+    }
+
+    labels.put(PARAM_SHOW_HELP, DEFAULT_SHOW_HELP);
+
+    // Set all labels at once
+    staticConfig.setLabels(ImmutableMap.copyOf(labels));
+    return staticConfig;
+  }
+
+  private OtelCollectorConfigFormat.StaticConfig createYsqlStaticConfig(
+      String nodeAddress, int ysqlServerHttpPort) {
+    OtelCollectorConfigFormat.StaticConfig staticConfig =
+        new OtelCollectorConfigFormat.StaticConfig();
+    staticConfig.setTargets(ImmutableList.of(nodeAddress + ":" + ysqlServerHttpPort));
+
+    // Build up all labels
+    Map<String, String> labels = new HashMap<>();
+    labels.put("export_type", EXPORT_TYPE_YSQL);
+    labels.put("service", SERVICE_TSERVER);
+    labels.put(PARAM_SHOW_HELP, DEFAULT_SHOW_HELP);
+
+    // Set all labels at once
+    staticConfig.setLabels(ImmutableMap.copyOf(labels));
+    return staticConfig;
+  }
+
+  private OtelCollectorConfigFormat.StaticConfig createCqlStaticConfig(
+      String nodeAddress, int yqlServerHttpPort) {
+    OtelCollectorConfigFormat.StaticConfig staticConfig =
+        new OtelCollectorConfigFormat.StaticConfig();
+    staticConfig.setTargets(ImmutableList.of(nodeAddress + ":" + yqlServerHttpPort));
+
+    // Build up all labels
+    Map<String, String> labels = new HashMap<>();
+    labels.put("export_type", EXPORT_TYPE_CQL);
+    labels.put("service", SERVICE_TSERVER);
+    labels.put(PARAM_SHOW_HELP, DEFAULT_SHOW_HELP);
+
+    // Set all labels at once
+    staticConfig.setLabels(ImmutableMap.copyOf(labels));
+    return staticConfig;
+  }
+
+  private OtelCollectorConfigFormat.MetricRelabelConfig createMetricRelabelConfig(
+      List<String> sourceLabels, String regex, String targetLabel, String replacement) {
+    OtelCollectorConfigFormat.MetricRelabelConfig config =
+        new OtelCollectorConfigFormat.MetricRelabelConfig();
+    config.setSource_labels(sourceLabels);
+    config.setRegex(regex);
+    config.setTarget_label(targetLabel);
+    config.setReplacement(replacement);
+    return config;
+  }
+
+  private List<OtelCollectorConfigFormat.MetricRelabelConfig> createYugabyteMetricRelabelConfigs() {
+    List<OtelCollectorConfigFormat.MetricRelabelConfig> configs = new ArrayList<>();
+
+    // Add yugabyte metric relabel configs.
+    // Capture-group references must be written as "$$N", not "$N". The otel collector expands
+    // "$N" as an environment variable while loading the config, which resolves to an empty
+    // string, and Prometheus then drops any label whose replacement expanded to empty. Writing
+    // "$$N" makes the collector emit a literal "$N" for the Prometheus relabeller.
+    configs.add(
+        createMetricRelabelConfig(ImmutableList.of("__name__"), "(.*)", "saved_name", "$$1"));
+    configs.add(
+        createMetricRelabelConfig(
+            ImmutableList.of("__name__"),
+            "handler_latency_(yb_[^_]*)_([^_]*)_([^_]*)(.*)",
+            "server_type",
+            "$$1"));
+    configs.add(
+        createMetricRelabelConfig(
+            ImmutableList.of("__name__"),
+            "handler_latency_(yb_[^_]*)_([^_]*)_([^_]*)(.*)",
+            "service_type",
+            "$$2"));
+    configs.add(
+        createMetricRelabelConfig(
+            ImmutableList.of("__name__"),
+            "handler_latency_(yb_[^_]*)_([^_]*)_([^_]*)(_sum|_count)?",
+            "service_method",
+            "$$3"));
+    configs.add(
+        createMetricRelabelConfig(
+            ImmutableList.of("__name__"),
+            "handler_latency_(yb_[^_]*)_([^_]*)_([^_]*)(_sum|_count)?",
+            "__name__",
+            "rpc_latency$$4"));
+
+    return configs;
+  }
+
+  private OtelCollectorConfigFormat.ScrapeConfig createYugabyteScrapeConfig(
+      String nodeAddress, NodeDetails nodeDetails, MetricsExportConfig metricsExportConfig) {
+    return createYugabyteScrapeConfig(
+        nodeAddress,
+        metricsExportConfig,
+        metricsExportConfig.getScrapeConfigTargets(),
+        nodeDetails.masterHttpPort,
+        nodeDetails.tserverHttpPort,
+        nodeDetails.ysqlServerHttpPort,
+        nodeDetails.yqlServerHttpPort);
+  }
+
+  private OtelCollectorConfigFormat.ScrapeConfig createYugabyteScrapeConfig(
+      String nodeAddress,
+      MetricsExportConfig metricsExportConfig,
+      Set<ScrapeConfigTargetType> scrapeConfigTargets,
+      int masterHttpPort,
+      int tserverHttpPort,
+      int ysqlServerHttpPort,
+      int yqlServerHttpPort) {
+    OtelCollectorConfigFormat.ScrapeConfig scrapeConfig =
+        new OtelCollectorConfigFormat.ScrapeConfig();
+    scrapeConfig.setJob_name(JOB_NAME_YUGABYTE);
+    scrapeConfig.setScheme("http");
+
+    // Add TLS config
+    OtelCollectorConfigFormat.TlsConfig tlsConfig = new OtelCollectorConfigFormat.TlsConfig();
+    tlsConfig.setInsecure_skip_verify(true);
+    scrapeConfig.setTls_config(tlsConfig);
+
+    scrapeConfig.setMetrics_path("/prometheus-metrics");
+
+    // Create static configs for all yugabyte services
+    List<OtelCollectorConfigFormat.StaticConfig> staticConfigs = new ArrayList<>();
+    // Add static configs for each yugabyte service if the scrape config target is enabled.
+    if (scrapeConfigTargets.contains(ScrapeConfigTargetType.MASTER_EXPORT)) {
+      staticConfigs.add(createMasterStaticConfig(nodeAddress, masterHttpPort, metricsExportConfig));
+    }
+    if (scrapeConfigTargets.contains(ScrapeConfigTargetType.TSERVER_EXPORT)) {
+      staticConfigs.add(
+          createTserverStaticConfig(nodeAddress, tserverHttpPort, metricsExportConfig));
+    }
+    if (scrapeConfigTargets.contains(ScrapeConfigTargetType.YSQL_EXPORT)) {
+      staticConfigs.add(createYsqlStaticConfig(nodeAddress, ysqlServerHttpPort));
+    }
+    if (scrapeConfigTargets.contains(ScrapeConfigTargetType.CQL_EXPORT)) {
+      staticConfigs.add(createCqlStaticConfig(nodeAddress, yqlServerHttpPort));
+    }
+
+    scrapeConfig.setStatic_configs(staticConfigs);
+    scrapeConfig.setMetric_relabel_configs(createYugabyteMetricRelabelConfigs());
+
+    return scrapeConfig;
+  }
+
+  private List<OtelCollectorConfigFormat.MetricRelabelConfig> createNodeMetricRelabelConfigs() {
+    List<OtelCollectorConfigFormat.MetricRelabelConfig> configs = new ArrayList<>();
+
+    // Add all the node metric relabel configs
+    configs.add(
+        createMetricRelabelConfig(
+            ImmutableList.of("__name__"), "node_cpu", "__name__", "node_cpu_seconds_total"));
+    configs.add(
+        createMetricRelabelConfig(
+            ImmutableList.of("__name__"),
+            "node_filesystem_free",
+            "__name__",
+            "node_filesystem_free_bytes"));
+    configs.add(
+        createMetricRelabelConfig(
+            ImmutableList.of("__name__"),
+            "node_filesystem_size",
+            "__name__",
+            "node_filesystem_size_bytes"));
+    configs.add(
+        createMetricRelabelConfig(
+            ImmutableList.of("__name__"),
+            "node_disk_reads_completed",
+            "__name__",
+            "node_disk_reads_completed_total"));
+    configs.add(
+        createMetricRelabelConfig(
+            ImmutableList.of("__name__"),
+            "node_disk_writes_completed",
+            "__name__",
+            "node_disk_writes_completed_total"));
+    configs.add(
+        createMetricRelabelConfig(
+            ImmutableList.of("__name__"),
+            "node_memory_MemTotal",
+            "__name__",
+            "node_memory_MemTotal_bytes"));
+    configs.add(
+        createMetricRelabelConfig(
+            ImmutableList.of("__name__"),
+            "node_memory_Slab",
+            "__name__",
+            "node_memory_Slab_bytes"));
+    configs.add(
+        createMetricRelabelConfig(
+            ImmutableList.of("__name__"),
+            "node_memory_Cached",
+            "__name__",
+            "node_memory_Cached_bytes"));
+    configs.add(
+        createMetricRelabelConfig(
+            ImmutableList.of("__name__"),
+            "node_memory_Buffers",
+            "__name__",
+            "node_memory_Buffers_bytes"));
+    configs.add(
+        createMetricRelabelConfig(
+            ImmutableList.of("__name__"),
+            "node_memory_MemFree",
+            "__name__",
+            "node_memory_MemFree_bytes"));
+    configs.add(
+        createMetricRelabelConfig(
+            ImmutableList.of("__name__"),
+            "node_network_receive_bytes",
+            "__name__",
+            "node_network_receive_bytes_total"));
+    configs.add(
+        createMetricRelabelConfig(
+            ImmutableList.of("__name__"),
+            "node_network_transmit_bytes",
+            "__name__",
+            "node_network_transmit_bytes_total"));
+    configs.add(
+        createMetricRelabelConfig(
+            ImmutableList.of("__name__"),
+            "node_network_receive_packets",
+            "__name__",
+            "node_network_receive_packets_total"));
+    configs.add(
+        createMetricRelabelConfig(
+            ImmutableList.of("__name__"),
+            "node_network_transmit_packets",
+            "__name__",
+            "node_network_transmit_packets_total"));
+    configs.add(
+        createMetricRelabelConfig(
+            ImmutableList.of("__name__"),
+            "node_network_receive_errs",
+            "__name__",
+            "node_network_receive_errs_total"));
+    configs.add(
+        createMetricRelabelConfig(
+            ImmutableList.of("__name__"),
+            "node_network_transmit_errs",
+            "__name__",
+            "node_network_transmit_errs_total"));
+    configs.add(
+        createMetricRelabelConfig(
+            ImmutableList.of("__name__"),
+            "node_disk_bytes_read",
+            "__name__",
+            "node_disk_read_bytes_total"));
+    configs.add(
+        createMetricRelabelConfig(
+            ImmutableList.of("__name__"),
+            "node_disk_bytes_written",
+            "__name__",
+            "node_disk_written_bytes_total"));
+    configs.add(
+        createMetricRelabelConfig(
+            ImmutableList.of("__name__"), "node_boot_time", "__name__", "node_boot_time_seconds"));
+    configs.add(
+        createMetricRelabelConfig(ImmutableList.of("__name__"), "(.*)", "saved_name", "$$1"));
+
+    return configs;
+  }
+
+  private OtelCollectorConfigFormat.ScrapeConfig createNodeExporterScrapeConfig(
+      String nodeAddress, NodeDetails nodeDetails) {
+    OtelCollectorConfigFormat.ScrapeConfig scrapeConfig =
+        new OtelCollectorConfigFormat.ScrapeConfig();
+    scrapeConfig.setJob_name(JOB_NAME_NODE);
+    scrapeConfig.setScheme("http");
+    scrapeConfig.setMetrics_path("/metrics");
+
+    // Add TLS config
+    OtelCollectorConfigFormat.TlsConfig tlsConfig = new OtelCollectorConfigFormat.TlsConfig();
+    tlsConfig.setInsecure_skip_verify(true);
+    scrapeConfig.setTls_config(tlsConfig);
+
+    OtelCollectorConfigFormat.StaticConfig staticConfig =
+        new OtelCollectorConfigFormat.StaticConfig();
+
+    // Get the node exporter port from node details
+    int nodeExporterPort = nodeDetails.nodeExporterPort;
+    staticConfig.setTargets(ImmutableList.of(nodeAddress + ":" + nodeExporterPort));
+
+    // Build up all labels
+    Map<String, String> labels = new HashMap<>();
+    labels.put("export_type", EXPORT_TYPE_NODE);
+    labels.put("service", SERVICE_NODE_EXPORTER);
+
+    // Set all labels at once
+    staticConfig.setLabels(ImmutableMap.copyOf(labels));
+
+    scrapeConfig.setStatic_configs(ImmutableList.of(staticConfig));
+    scrapeConfig.setMetric_relabel_configs(createNodeMetricRelabelConfigs());
+
+    return scrapeConfig;
+  }
+
+  private OtelCollectorConfigFormat.ScrapeConfig createNodeAgentScrapeConfig(
+      String nodeAddress, NodeAgent nodeAgent) {
+    OtelCollectorConfigFormat.ScrapeConfig scrapeConfig =
+        new OtelCollectorConfigFormat.ScrapeConfig();
+    scrapeConfig.setJob_name(JOB_NAME_NODE_AGENT);
+    scrapeConfig.setScheme("http");
+    scrapeConfig.setMetrics_path("/metrics");
+
+    // Add TLS config
+    OtelCollectorConfigFormat.TlsConfig tlsConfig = new OtelCollectorConfigFormat.TlsConfig();
+    tlsConfig.setInsecure_skip_verify(true);
+    scrapeConfig.setTls_config(tlsConfig);
+
+    OtelCollectorConfigFormat.StaticConfig staticConfig =
+        new OtelCollectorConfigFormat.StaticConfig();
+
+    // Get the node agent server port from runtime config, default to 9070 if not specified
+    int nodeAgentPort = confGetter.getGlobalConf(GlobalConfKeys.nodeAgentServerPort);
+    staticConfig.setTargets(ImmutableList.of(nodeAddress + ":" + nodeAgentPort));
+
+    // Build up all labels
+    Map<String, String> labels = new HashMap<>();
+    labels.put("export_type", EXPORT_TYPE_NODE_AGENT);
+    labels.put("service", SERVICE_NODE_AGENT);
+    if (nodeAgent != null) {
+      labels.put("node_agent_uuid", nodeAgent.getUuid().toString());
+    }
+
+    // Set all labels at once
+    staticConfig.setLabels(ImmutableMap.copyOf(labels));
+
+    scrapeConfig.setStatic_configs(ImmutableList.of(staticConfig));
+    return scrapeConfig;
+  }
+
+  private OtelCollectorConfigFormat.ScrapeConfig createOtelCollectorScrapeConfig(
+      String nodeAddress, Universe universe, int otelColMetricsPort) {
+    OtelCollectorConfigFormat.ScrapeConfig scrapeConfig =
+        new OtelCollectorConfigFormat.ScrapeConfig();
+    scrapeConfig.setJob_name(JOB_NAME_OTEL_COLLECTOR);
+    scrapeConfig.setScheme("http");
+    scrapeConfig.setMetrics_path("/metrics");
+
+    // Add TLS config
+    OtelCollectorConfigFormat.TlsConfig tlsConfig = new OtelCollectorConfigFormat.TlsConfig();
+    tlsConfig.setInsecure_skip_verify(true);
+    scrapeConfig.setTls_config(tlsConfig);
+
+    OtelCollectorConfigFormat.StaticConfig staticConfig =
+        new OtelCollectorConfigFormat.StaticConfig();
+
+    staticConfig.setTargets(ImmutableList.of(nodeAddress + ":" + otelColMetricsPort));
+
+    // Build up all labels
+    Map<String, String> labels = new HashMap<>();
+    labels.put("export_type", EXPORT_TYPE_OTEL);
+    labels.put("service", SERVICE_OTEL_COLLECTOR);
+
+    // Set all labels at once
+    staticConfig.setLabels(ImmutableMap.copyOf(labels));
+
+    scrapeConfig.setStatic_configs(ImmutableList.of(staticConfig));
+    return scrapeConfig;
+  }
+
+  private OtelCollectorConfigFormat.AttributesProcessor createMetricsExporterAttributesProcessor(
+      UniverseMetricsExporterConfig exporterConfig,
+      String nodeName,
+      NodeDetails nodeDetails,
+      Universe universe,
+      Map<String, String> additionalTags) {
+    TelemetryProvider telemetryProvider =
+        telemetryProviderService.getOrBadRequest(exporterConfig.getExporterUuid());
+
+    List<OtelCollectorConfigFormat.AttributeAction> attributeActions = new ArrayList<>();
+    // Add common required attributes
+    addCommonRequiredAttributes(
+        attributeActions,
+        nodeName,
+        nodeDetails,
+        universe,
+        telemetryProvider,
+        PURPOSE_SUFFIX_METRICS_EXPORT);
+
+    // Add common additional attributes from the exporter config and additional tags from the log
+    // config payload.
+    addCommonAdditionalAttributes(attributeActions, telemetryProvider, additionalTags);
+
+    OtelCollectorConfigFormat.AttributesProcessor processor =
+        new OtelCollectorConfigFormat.AttributesProcessor();
+    processor.setActions(attributeActions);
+    return processor;
+  }
+
+  private String addMetricsExporter(
+      OtelCollectorConfigFormat collectorConfigFormat,
+      UniverseMetricsExporterConfig exporterConfig) {
+    TelemetryProvider telemetryProvider =
+        telemetryProviderService.getOrBadRequest(exporterConfig.getExporterUuid());
+
+    String exporterName =
+        appendExporterConfig(
+            telemetryProvider, collectorConfigFormat, new ArrayList<>(), ExportType.METRICS);
+
+    return exporterName;
+  }
+
+  private OtelCollectorConfigFormat.RegexOperator getRegexOperator(
+      String logPrefix, ExportType exportType) {
+    AuditLogRegexGenerator.LogRegexResult regexResult;
+    switch (exportType) {
+      case AUDIT_LOGS:
+        regexResult = auditLogRegexGenerator.generateAuditLogRegex(logPrefix, /*onlyPrefix*/ false);
+        break;
+      case QUERY_LOGS:
+        regexResult = queryLogRegexGenerator.generateQueryLogRegex(logPrefix, /*onlyPrefix*/ false);
+        break;
+      default:
+        throw new IllegalArgumentException("Unsupported export type: " + exportType);
+    }
+    OtelCollectorConfigFormat.RegexOperator regexOperator =
+        new OtelCollectorConfigFormat.RegexOperator();
+    regexOperator.setType("regex_parser");
+    regexOperator.setRegex(regexResult.getRegex());
+    regexOperator.setOn_error("drop");
+    OtelCollectorConfigFormat.OperatorTimestamp timestamp =
+        new OtelCollectorConfigFormat.OperatorTimestamp();
+    if (regexResult
+        .getTokens()
+        .contains(AuditLogRegexGenerator.LogPrefixTokens.TIMESTAMP_WITHOUT_MS)) {
+      timestamp.setParse_from("attributes.timestamp_without_ms");
+      timestamp.setLayout("%Y-%m-%d %H:%M:%S %Z");
+      regexOperator.setTimestamp(timestamp);
+    } else if (regexResult
+        .getTokens()
+        .contains(AuditLogRegexGenerator.LogPrefixTokens.TIMESTAMP_WITH_MS)) {
+      timestamp.setParse_from("attributes.timestamp_with_ms");
+      timestamp.setLayout("%Y-%m-%d %H:%M:%S.%L %Z");
+      regexOperator.setTimestamp(timestamp);
+    } else if (regexResult
+        .getTokens()
+        .contains(AuditLogRegexGenerator.LogPrefixTokens.TIMESTAMP_WITH_MS_EPOCH)) {
+      timestamp.setParse_from("attributes.timestamp_with_ms_epoch");
+      timestamp.setLayout_type("epoch");
+      timestamp.setLayout("s.ms");
+      regexOperator.setTimestamp(timestamp);
+    }
+    return regexOperator;
+  }
+
+  private String generateLineStartPattern(String logPrefix) {
+    return "([A-Z]\\d{4})|("
+        + auditLogRegexGenerator.generateAuditLogRegex(logPrefix, /*onlyPrefix*/ true).getRegex()
+        + ")";
+  }
+
+  private String generateQueryLineStartPattern(String logPrefix) {
+    return ".*([A-Z]\\d{4})|("
+        + auditLogRegexGenerator.generateAuditLogRegex(logPrefix, /*onlyPrefix*/ true).getRegex()
+        + ")";
+  }
+
+  @Data
+  @AllArgsConstructor
+  public static class RenamePair {
+    private String before;
+    private String after;
+
+    private List<OtelCollectorConfigFormat.AttributeAction> getRenameAttributeActions() {
+      List<OtelCollectorConfigFormat.AttributeAction> renameActionsList = new ArrayList<>();
+      // Copy the attribute from existing attribute and delete the original one.
+      renameActionsList.add(
+          new OtelCollectorConfigFormat.AttributeAction(this.after, null, "upsert", this.before));
+      renameActionsList.add(
+          new OtelCollectorConfigFormat.AttributeAction(this.before, null, "delete", null));
+      return renameActionsList;
+    }
+  }
+
+  /**
+   * Builds the attributes/batch/memory processors and a single-exporter pipeline for one log
+   * exporter of the given log export type. Replaces the former per-type appendExporter variants;
+   * batch/memory tuning is applied only when the exporter config carries it (query, server logs).
+   */
+  private void appendLogExporter(
+      ExportType exportType,
+      Universe universe,
+      OtelCollectorConfigFormat collectorConfig,
+      UniverseExporterConfig logsExporterConfig,
+      String nodeName,
+      String logLinePrefix) {
+    NodeDetails nodeDetails = universe.getNode(nodeName);
+    TelemetryProvider telemetryProvider =
+        telemetryProviderService.getOrBadRequest(logsExporterConfig.getExporterUuid());
+    List<OtelCollectorConfigFormat.AttributeAction> attributeActions = new ArrayList<>();
+    OtelCollectorConfigFormat.AttributesProcessor attributesProcessor =
+        new OtelCollectorConfigFormat.AttributesProcessor();
+
+    String exporterName =
+        appendExporterConfig(
+            telemetryProvider,
+            collectorConfig,
+            attributeActions,
+            exportType,
+            universe.getUniverseUUID(),
+            nodeName);
+
+    addCommonLogAttributes(
+        attributeActions,
+        nodeName,
+        nodeDetails,
+        universe,
+        telemetryProvider,
+        logExportPurposeSuffix(exportType),
+        ExportType.AUDIT_LOGS.equals(exportType),
+        !ExportType.MASTER_LOGS.equals(exportType) && !ExportType.TSERVER_LOGS.equals(exportType),
+        logExportRegexResult(exportType, logLinePrefix),
+        logsExporterConfig.getAdditionalTags());
+    attributesProcessor.setActions(attributeActions);
+
+    String exportTypeAndUUIDString = exportTypeAndUUID(telemetryProvider.getUuid(), exportType);
+    collectorConfig
+        .getProcessors()
+        .put(PROCESSOR_PREFIX_ATTRIBUTES + exportTypeAndUUIDString, attributesProcessor);
+
+    // Batch + memory-limiter processors apply to high-volume log types (query, server) whose
+    // exporter config carries the tuning fields; audit logs do not.
+    if (logsExporterConfig instanceof BatchedLogsExporterConfig) {
+      BatchedLogsExporterConfig batched = (BatchedLogsExporterConfig) logsExporterConfig;
+      OtelCollectorConfigFormat.BatchProcessor batchProcessor =
+          new OtelCollectorConfigFormat.BatchProcessor();
+      batchProcessor.setSend_batch_max_size(batched.getSendBatchMaxSize());
+      batchProcessor.setSend_batch_size(batched.getSendBatchSize());
+      batchProcessor.setTimeout(batched.getSendBatchTimeoutSeconds().toString() + "s");
+      collectorConfig
+          .getProcessors()
+          .put(PROCESSOR_PREFIX_BATCH + exportTypeAndUUIDString, batchProcessor);
+
+      OtelCollectorConfigFormat.MemoryLimiterProcessor memoryLimiterProcessor =
+          new OtelCollectorConfigFormat.MemoryLimiterProcessor();
+      memoryLimiterProcessor.setCheck_interval(
+          batched.getMemoryLimitCheckIntervalSeconds().toString() + "s");
+      memoryLimiterProcessor.setLimit_mib(batched.getMemoryLimitMib());
+      collectorConfig
+          .getProcessors()
+          .put(PROCESSOR_PREFIX_MEMORY_LIMITER + exportTypeAndUUIDString, memoryLimiterProcessor);
+    }
+
+    // Add common transform processor
+    addCommonTransformProcessor(collectorConfig);
+
+    Set<String> familyReceivers = logReceiverNames(exportType);
+    OtelCollectorConfigFormat.Pipeline pipeline = new OtelCollectorConfigFormat.Pipeline();
+    pipeline.setReceivers(
+        collectorConfig.getReceivers().keySet().stream()
+            .filter(familyReceivers::contains)
+            .collect(Collectors.toList()));
+    pipeline.setProcessors(
+        collectorConfig.getProcessors().keySet().stream()
+            .filter(
+                processor ->
+                    processor.contains(exportTypeAndUUIDString)
+                        || processor.contains(PROCESSOR_PREFIX_TRANSFORM))
+            .collect(Collectors.toList()));
+    pipeline.setExporters(ImmutableList.of(exporterName));
+    collectorConfig
+        .getService()
+        .getPipelines()
+        .put(PIPELINE_PREFIX_LOGS + exportTypeAndUUIDString, pipeline);
+  }
+
+  private List<OtelCollectorConfigFormat.AttributeAction> getTagsToAttributeActions(
+      Map<String, String> tags) {
+    return tags.entrySet().stream()
+        .map(
+            e ->
+                new OtelCollectorConfigFormat.AttributeAction(
+                    e.getKey(), e.getValue(), "upsert", null))
+        .toList();
+  }
+
+  private void addCommonRequiredAttributes(
+      List<OtelCollectorConfigFormat.AttributeAction> attributeActions,
+      String nodeName,
+      NodeDetails nodeDetails,
+      Universe universe,
+      TelemetryProvider telemetryProvider,
+      String purposeSuffix) {
+    // Add some common collector labels.
+    attributeActions.add(
+        new OtelCollectorConfigFormat.AttributeAction("host", nodeName, "upsert", null));
+    attributeActions.add(
+        new OtelCollectorConfigFormat.AttributeAction(
+            "yugabyte.node_name", nodeName, "upsert", null));
+    attributeActions.add(
+        new OtelCollectorConfigFormat.AttributeAction(
+            "yugabyte.cloud",
+            StringUtils.defaultString(nodeDetails.cloudInfo.cloud, ""),
+            "upsert",
+            null));
+    attributeActions.add(
+        new OtelCollectorConfigFormat.AttributeAction(
+            "yugabyte.universe_uuid", universe.getUniverseUUID().toString(), "upsert", null));
+    attributeActions.add(
+        new OtelCollectorConfigFormat.AttributeAction(
+            "yugabyte.node_type",
+            universe.getCluster(nodeDetails.placementUuid).clusterType.toString(),
+            "upsert",
+            null));
+    attributeActions.add(
+        new OtelCollectorConfigFormat.AttributeAction(
+            "yugabyte.region",
+            StringUtils.defaultString(nodeDetails.cloudInfo.region, ""),
+            "upsert",
+            null));
+    attributeActions.add(
+        new OtelCollectorConfigFormat.AttributeAction(
+            "yugabyte.zone",
+            StringUtils.defaultString(nodeDetails.cloudInfo.az, ""),
+            "upsert",
+            null));
+    attributeActions.add(
+        new OtelCollectorConfigFormat.AttributeAction(
+            "yugabyte.purpose",
+            telemetryProvider.getConfig().getType().toString() + purposeSuffix,
+            "upsert",
+            null));
+  }
+
+  private void addCommonAdditionalAttributes(
+      List<OtelCollectorConfigFormat.AttributeAction> attributeActions,
+      TelemetryProvider telemetryProvider,
+      Map<String, String> additionalTags) {
+    // Override or add tags from the exporter config.
+    if (MapUtils.isNotEmpty(telemetryProvider.getTags())) {
+      attributeActions.addAll(getTagsToAttributeActions(telemetryProvider.getTags()));
+    }
+
+    // Override or add additional tags from the log config payload.
+    if (MapUtils.isNotEmpty(additionalTags)) {
+      attributeActions.addAll(getTagsToAttributeActions(additionalTags));
+    }
+  }
+
+  private void addCommonLogAttributes(
+      List<OtelCollectorConfigFormat.AttributeAction> attributeActions,
+      String nodeName,
+      NodeDetails nodeDetails,
+      Universe universe,
+      TelemetryProvider telemetryProvider,
+      String purposeSuffix,
+      boolean includeAuditType,
+      boolean includePgAuditFields,
+      AuditLogRegexGenerator.LogRegexResult regexResult,
+      Map<String, String> additionalTags) {
+    // Add some common collector labels.
+    addCommonRequiredAttributes(
+        attributeActions, nodeName, nodeDetails, universe, telemetryProvider, purposeSuffix);
+
+    // Rename the common attributes to organise under the key yugabyte.
+    List<RenamePair> commonRenamePairs = new ArrayList<RenamePair>();
+    commonRenamePairs.add(new RenamePair("log.file.name", ATTR_PREFIX_YUGABYTE + "log.file.name"));
+    commonRenamePairs.add(new RenamePair("log_level", ATTR_PREFIX_YUGABYTE + "log_level"));
+    if (includeAuditType) {
+      commonRenamePairs.add(new RenamePair("audit_type", ATTR_PREFIX_YUGABYTE + "audit_type"));
+    }
+    // pgaudit-specific CSV fields are only produced by PG log parsing (audit/query); yb-master glog
+    // lines never carry them, so skip these renames for master logs to keep the config lean.
+    if (includePgAuditFields) {
+      commonRenamePairs.add(new RenamePair("statement_id", ATTR_PREFIX_YUGABYTE + "statement_id"));
+      commonRenamePairs.add(
+          new RenamePair("substatement_id", ATTR_PREFIX_YUGABYTE + "substatement_id"));
+      commonRenamePairs.add(new RenamePair("class", ATTR_PREFIX_YUGABYTE + "class"));
+      commonRenamePairs.add(new RenamePair("command", ATTR_PREFIX_YUGABYTE + "command"));
+      commonRenamePairs.add(new RenamePair("object_type", ATTR_PREFIX_YUGABYTE + "object_type"));
+      commonRenamePairs.add(new RenamePair("object_name", ATTR_PREFIX_YUGABYTE + "object_name"));
+      commonRenamePairs.add(new RenamePair("statement", ATTR_PREFIX_YUGABYTE + "statement"));
+    }
+    commonRenamePairs.forEach(rp -> attributeActions.addAll(rp.getRenameAttributeActions()));
+
+    // Rename the log prefix extracted attributes to come under the key yugabyte.
+    regexResult
+        .getTokens()
+        .forEach(
+            token -> {
+              RenamePair rp =
+                  new RenamePair(token.getAttributeName(), token.getYugabyteAttributeName());
+              attributeActions.addAll(rp.getRenameAttributeActions());
+            });
+
+    // Override or add tags from the exporter config and additional tags from the log config
+    // payload.
+    addCommonAdditionalAttributes(attributeActions, telemetryProvider, additionalTags);
+  }
+
+  private String appendExporterConfig(
+      TelemetryProvider telemetryProvider,
+      OtelCollectorConfigFormat collectorConfig,
+      List<OtelCollectorConfigFormat.AttributeAction> attributeActions,
+      ExportType exportType) {
+    return appendExporterConfig(
+        telemetryProvider, collectorConfig, attributeActions, exportType, null, null);
+  }
+
+  private String appendExporterConfig(
+      TelemetryProvider telemetryProvider,
+      OtelCollectorConfigFormat collectorConfig,
+      List<OtelCollectorConfigFormat.AttributeAction> attributeActions,
+      ExportType exportType,
+      UUID universeUUID,
+      String nodeName) {
+    String exporterName;
+    String exportTypeAndUUIDString = exportTypeAndUUID(telemetryProvider.getUuid(), exportType);
+    Map<String, OtelCollectorConfigFormat.Exporter> exporters = collectorConfig.getExporters();
+    Map<String, OtelCollectorConfigFormat.Extension> extensions = collectorConfig.getExtensions();
+    boolean setExtension = false;
+    switch (telemetryProvider.getConfig().getType()) {
+      case DATA_DOG:
+        DataDogConfig dataDogConfig = (DataDogConfig) telemetryProvider.getConfig();
+        OtelCollectorConfigFormat.DataDogExporter dataDogExporter =
+            new OtelCollectorConfigFormat.DataDogExporter();
+        OtelCollectorConfigFormat.DataDogApiConfig apiConfig =
+            new OtelCollectorConfigFormat.DataDogApiConfig();
+        apiConfig.setKey(dataDogConfig.getApiKey());
+        apiConfig.setSite(dataDogConfig.getSite());
+        dataDogExporter.setApi(apiConfig);
+        exporterName = EXPORTER_PREFIX_DATADOG + exportTypeAndUUIDString;
+        exporters.put(
+            exporterName, setExporterCommonConfig(dataDogExporter, true, true, exportType));
+
+        // Add Datadog specific labels.
+        attributeActions.add(
+            new OtelCollectorConfigFormat.AttributeAction("ddsource", "yugabyte", "upsert", null));
+        attributeActions.add(
+            new OtelCollectorConfigFormat.AttributeAction(
+                "service", SERVICE_OTEL_COLLECTOR_FULL, "upsert", null));
+        break;
+      case DYNATRACE:
+        DynatraceConfig dynatraceConfig = (DynatraceConfig) telemetryProvider.getConfig();
+        OtelCollectorConfigFormat.DynatraceExporter dynatraceExporter =
+            new OtelCollectorConfigFormat.DynatraceExporter();
+        // Construct the full endpoint with the OTLP path
+        String fullEndpoint = dynatraceConfig.getCleanEndpoint() + DYNATRACE_OTLP_ENDPOINT;
+        dynatraceExporter.setEndpoint(fullEndpoint);
+
+        // Set the Authorization header with the API token
+        Map<String, String> dynatraceHeaders = new HashMap<>();
+        dynatraceHeaders.put("Authorization", "Api-Token " + dynatraceConfig.getApiToken());
+        dynatraceExporter.setHeaders(dynatraceHeaders);
+
+        exporterName = EXPORTER_PREFIX_DYNATRACE + exportTypeAndUUIDString;
+        exporters.put(
+            exporterName, setExporterCommonConfig(dynatraceExporter, true, true, exportType));
+        break;
+      case SPLUNK:
+        SplunkConfig splunkConfig = (SplunkConfig) telemetryProvider.getConfig();
+        OtelCollectorConfigFormat.SplunkExporter splunkExporter =
+            new OtelCollectorConfigFormat.SplunkExporter();
+        splunkExporter.setToken(splunkConfig.getToken());
+        splunkExporter.setEndpoint(splunkConfig.getEndpoint());
+        splunkExporter.setSource(splunkConfig.getSource());
+        splunkExporter.setSourcetype(splunkConfig.getSourceType());
+        splunkExporter.setIndex(splunkConfig.getIndex());
+        exporterName = EXPORTER_PREFIX_SPLUNK + exportTypeAndUUIDString;
+        OtelCollectorConfigFormat.TlsSettings tlsSettings =
+            new OtelCollectorConfigFormat.TlsSettings();
+        tlsSettings.setInsecure_skip_verify(true);
+        splunkExporter.setTls(tlsSettings);
+
+        exporters.put(
+            exporterName, setExporterCommonConfig(splunkExporter, true, true, exportType));
+
+        break;
+      case AWS_CLOUDWATCH:
+        AWSCloudWatchConfig awsCloudWatchConfig =
+            (AWSCloudWatchConfig) telemetryProvider.getConfig();
+        OtelCollectorConfigFormat.AWSCloudWatchExporter awsCloudWatchExporter =
+            new OtelCollectorConfigFormat.AWSCloudWatchExporter();
+        awsCloudWatchExporter.setEndpoint(awsCloudWatchConfig.getEndpoint());
+        awsCloudWatchExporter.setRegion(awsCloudWatchConfig.getRegion());
+        awsCloudWatchExporter.setLog_group_name(awsCloudWatchConfig.getLogGroup());
+        awsCloudWatchExporter.setLog_stream_name(awsCloudWatchConfig.getLogStream());
+
+        exporterName = EXPORTER_PREFIX_AWS_CLOUDWATCH + exportTypeAndUUIDString;
+        exporters.put(
+            exporterName, setExporterCommonConfig(awsCloudWatchExporter, false, true, exportType));
+
+        break;
+      case S3:
+        S3Config s3Config = (S3Config) telemetryProvider.getConfig();
+        OtelCollectorConfigFormat.AWSS3Exporter s3Exporter =
+            new OtelCollectorConfigFormat.AWSS3Exporter();
+        s3Exporter.setMarshaler(s3Config.getMarshaler().getName());
+        OtelCollectorConfigFormat.S3UploaderConfig s3UploaderConfig =
+            new OtelCollectorConfigFormat.S3UploaderConfig();
+        s3UploaderConfig.setS3_bucket(s3Config.getBucket());
+
+        // Build S3 prefix - include universe UUID and node name if enabled
+        String s3Prefix = s3Config.getDirectoryPrefix();
+        if (s3Config.getIncludeUniverseAndNodeInPrefix()
+            && universeUUID != null
+            && nodeName != null) {
+          // Ensure prefix ends with "/" before appending universe UUID and node name
+          if (!s3Prefix.endsWith("/")) {
+            s3Prefix = s3Prefix + "/";
+          }
+          s3Prefix = s3Prefix + universeUUID.toString() + "/" + nodeName;
+        }
+        s3UploaderConfig.setS3_prefix(s3Prefix);
+
+        s3UploaderConfig.setS3_partition_format(s3Config.getPartition().getPartitionFormat());
+        s3UploaderConfig.setRole_arn(s3Config.getRoleArn());
+        s3UploaderConfig.setFile_prefix(s3Config.getFilePrefix());
+        s3UploaderConfig.setRegion(s3Config.getRegion());
+        s3UploaderConfig.setEndpoint(s3Config.getEndpoint());
+        s3UploaderConfig.setS3_force_path_style(s3Config.getForcePathStyle());
+        s3UploaderConfig.setDisable_ssl(s3Config.getDisableSSL());
+        s3Exporter.setS3uploader(s3UploaderConfig);
+
+        exporterName = EXPORTER_PREFIX_S3 + exportTypeAndUUIDString;
+
+        exporters.put(exporterName, setExporterCommonConfig(s3Exporter, false, false, exportType));
+        break;
+
+      case GCP_CLOUD_MONITORING:
+        GCPCloudMonitoringConfig gcpCloudMonitoringConfig =
+            (GCPCloudMonitoringConfig) telemetryProvider.getConfig();
+        OtelCollectorConfigFormat.GCPCloudMonitoringExporter gcpCloudMonitoringExporter =
+            new OtelCollectorConfigFormat.GCPCloudMonitoringExporter();
+        gcpCloudMonitoringExporter.setProject(gcpCloudMonitoringConfig.getProject());
+        OtelCollectorConfigFormat.GCPCloudMonitoringLog log =
+            new OtelCollectorConfigFormat.GCPCloudMonitoringLog();
+        log.setDefault_log_name("YugabyteDB");
+        gcpCloudMonitoringExporter.setLog(log);
+        exporterName = EXPORTER_PREFIX_GCP_CLOUD_MONITORING + exportTypeAndUUIDString;
+        // TODO add retry config to GCP provider once it's supported by Otel Collector
+        exporters.put(
+            exporterName,
+            setExporterCommonConfig(gcpCloudMonitoringExporter, true, false, exportType));
+        break;
+      case LOKI:
+        // The dedicated `loki` exporter was removed from otel-collector-contrib in 0.131.0, so Loki
+        // log export goes over OTLP HTTP against Loki's native OTLP ingestion path. This requires
+        // Loki 3.0+, which is where OTLP ingestion was introduced. Auth stays header-based rather
+        // than moving to the basicauth extension, so the wire behaviour is unchanged, and TLS
+        // settings are deliberately left unset to keep certificate verification on by default.
+        LokiConfig lokiConfig = (LokiConfig) telemetryProvider.getConfig();
+        OtelCollectorConfigFormat.OTLPExporter lokiExporter =
+            new OtelCollectorConfigFormat.OTLPExporter();
+        // validateConfigFields() stores the base URL, but tolerate a persisted push-path suffix so
+        // configs saved before this migration do not produce a doubled-up path.
+        String lokiBaseEndpoint = lokiConfig.getEndpoint();
+        if (lokiBaseEndpoint.endsWith(TelemetryProviderService.LOKI_PUSH_ENDPOINT)) {
+          lokiBaseEndpoint =
+              lokiBaseEndpoint.substring(
+                  0,
+                  lokiBaseEndpoint.length() - TelemetryProviderService.LOKI_PUSH_ENDPOINT.length());
+        }
+        lokiExporter.setLogs_endpoint(
+            lokiBaseEndpoint + TelemetryProviderService.LOKI_OTLP_LOGS_ENDPOINT);
+        Map<String, String> headers = new HashMap<>();
+        boolean setHeaders = false;
+        if (lokiConfig.getOrganizationID() != null && !lokiConfig.getOrganizationID().isEmpty()) {
+          headers.put("X-Scope-OrgID", lokiConfig.getOrganizationID());
+          setHeaders = true;
+        }
+        if (lokiConfig.getAuthType() == AuthType.BasicAuth) {
+          String credentials =
+              Base64.getEncoder()
+                  .encodeToString(
+                      (lokiConfig.getBasicAuth().getUsername()
+                              + ":"
+                              + lokiConfig.getBasicAuth().getPassword())
+                          .getBytes());
+          headers.put("Authorization", "Basic " + credentials);
+          setHeaders = true;
+        }
+        if (setHeaders) {
+          lokiExporter.setHeaders(headers);
+        }
+        exporterName = EXPORTER_PREFIX_LOKI + exportTypeAndUUIDString;
+        exporters.put(exporterName, setExporterCommonConfig(lokiExporter, true, true, exportType));
+        break;
+      case OTLP:
+        OTLPConfig otlpConfig = (OTLPConfig) telemetryProvider.getConfig();
+        OtelCollectorConfigFormat.OTLPExporter otlpExporter =
+            new OtelCollectorConfigFormat.OTLPExporter();
+
+        otlpExporter.setEndpoint(otlpConfig.getEndpoint());
+        otlpExporter.setTimeout(otlpConfig.getTimeoutSeconds() + "s");
+        otlpExporter.setCompression(otlpConfig.getCompression().name());
+        otlpExporter.setHeaders(otlpConfig.getHeaders());
+
+        OtelCollectorConfigFormat.TlsSettings otlpTLSSettings =
+            new OtelCollectorConfigFormat.TlsSettings();
+        otlpTLSSettings.setInsecure_skip_verify(true);
+        otlpExporter.setTls(otlpTLSSettings);
+
+        if (StringUtils.isNotBlank(otlpConfig.getLogsEndpoint())) {
+          otlpExporter.setLogs_endpoint(otlpConfig.getLogsEndpoint());
+        }
+        if (StringUtils.isNotBlank(otlpConfig.getMetricsEndpoint())) {
+          otlpExporter.setMetrics_endpoint(otlpConfig.getMetricsEndpoint());
+        }
+
+        // Add authentication extension if auth type is not NoAuth
+        String authExtensionName;
+        switch (otlpConfig.getAuthType()) {
+          case BasicAuth:
+            OtelCollectorConfigFormat.BasicAuthExtension basicAuthExt =
+                new OtelCollectorConfigFormat.BasicAuthExtension();
+            OtelCollectorConfigFormat.ClientAuth clientAuth =
+                new OtelCollectorConfigFormat.ClientAuth();
+            clientAuth.setUsername(otlpConfig.getBasicAuth().getUsername());
+            clientAuth.setPassword(otlpConfig.getBasicAuth().getPassword());
+            basicAuthExt.setClient_auth(clientAuth);
+
+            authExtensionName = "basicauth/" + exportTypeAndUUIDString;
+            extensions.put(authExtensionName, basicAuthExt);
+
+            // Set the auth reference in the exporter
+            OtelCollectorConfigFormat.AuthConfig basicAuthConfig =
+                new OtelCollectorConfigFormat.AuthConfig();
+            basicAuthConfig.setAuthenticator(authExtensionName);
+            otlpExporter.setAuth(basicAuthConfig);
+            setExtension = true;
+            break;
+
+          case BearerToken:
+            OtelCollectorConfigFormat.BearerTokenAuthExtension bearerAuthExt =
+                new OtelCollectorConfigFormat.BearerTokenAuthExtension();
+            bearerAuthExt.setToken(otlpConfig.getBearerToken().getToken());
+
+            authExtensionName = "bearertokenauth/" + exportTypeAndUUIDString;
+            extensions.put(authExtensionName, bearerAuthExt);
+
+            // Set the auth reference in the exporter
+            OtelCollectorConfigFormat.AuthConfig bearerAuthConfig =
+                new OtelCollectorConfigFormat.AuthConfig();
+            bearerAuthConfig.setAuthenticator(authExtensionName);
+            otlpExporter.setAuth(bearerAuthConfig);
+            setExtension = true;
+            break;
+
+          case NoAuth:
+            // No authentication extension needed
+            break;
+
+          default:
+            throw new IllegalArgumentException(
+                "Unsupported auth type: " + otlpConfig.getAuthType());
+        }
+
+        String exporterTypePrefix = otlpConfig.getProtocol().getExporterType();
+
+        exporterName = exporterTypePrefix + "/" + exportTypeAndUUIDString;
+        exporters.put(
+            exporterName,
+            setExporterCommonConfig(
+                otlpExporter, true, true, exportType, otlpConfig.getRetryOnFailure()));
+
+        break;
+      default:
+        throw new IllegalArgumentException(
+            "Exporter type "
+                + telemetryProvider.getConfig().getType().name()
+                + " is not supported.");
+    }
+
+    // Update service extensions to include any dynamically added extensions (e.g., auth
+    // extensions)
+    if (collectorConfig.getService() != null && setExtension) {
+      collectorConfig
+          .getService()
+          .setExtensions(new ArrayList<>(collectorConfig.getExtensions().keySet()));
+    }
+
+    return exporterName;
+  }
+
+  private OtelCollectorConfigFormat.Exporter setExporterCommonConfig(
+      OtelCollectorConfigFormat.Exporter exporter,
+      boolean setQueueEnabled,
+      boolean setRetryOnFailure,
+      ExportType exportType) {
+    return setExporterCommonConfig(exporter, setQueueEnabled, setRetryOnFailure, exportType, null);
+  }
+
+  private OtelCollectorConfigFormat.Exporter setExporterCommonConfig(
+      OtelCollectorConfigFormat.Exporter exporter,
+      boolean setQueueEnabled,
+      boolean setRetryOnFailure,
+      ExportType exportType,
+      ExporterRetryConfig apiRetry) {
+    // Set retry on failure with defaults / requested values.
+    if (setRetryOnFailure) {
+      RetryConfig retryConfig = buildRetryConfig(exportType, apiRetry);
+      exporter.setRetry_on_failure(retryConfig);
+    } else {
+      exporter.setRetry_on_failure(null);
+    }
+
+    // Set sending queue, only for DBAL and not other exports due to memory constraints.
+    if (exportType == ExportType.AUDIT_LOGS) {
+      OtelCollectorConfigFormat.QueueConfig queueConfig =
+          new OtelCollectorConfigFormat.QueueConfig();
+      if (setQueueEnabled) {
+        queueConfig.setEnabled(true);
+        queueConfig.setStorage("file_storage/queue");
+        exporter.setSending_queue(queueConfig);
+      } else {
+        exporter.setSending_queue(null);
+      }
+    }
+    return exporter;
+  }
+
+  /**
+   * Builds Otel RetryConfig from export-type defaults and applies API-provided overrides if
+   * present.
+   */
+  private RetryConfig buildRetryConfig(ExportType exportType, ExporterRetryConfig apiRetry) {
+    RetryConfig retryConfig = new RetryConfig();
+
+    // Apply YBA set defaults.
+    retryConfig.setEnabled(true);
+    switch (exportType) {
+      case AUDIT_LOGS:
+        retryConfig.setInitial_interval("1m");
+        retryConfig.setMax_interval("1800m");
+        retryConfig.setMax_elapsed_time("1800m");
+        break;
+      default:
+        retryConfig.setInitial_interval("30s");
+        retryConfig.setMax_interval("10m");
+        retryConfig.setMax_elapsed_time("60m");
+        break;
+    }
+
+    // Override with API-provided values if present.
+    return ExporterRetryConfig.applyOverrides(retryConfig, apiRetry);
+  }
+
+  private OtelCollectorConfigFormat.Extension createStorageExtension(
+      Provider provider, UniverseDefinitionTaskParams.UserIntent userIntent) {
+    OtelCollectorConfigFormat.StorageExtension extension =
+        new OtelCollectorConfigFormat.StorageExtension();
+    extension.setDirectory(getFirstMountPoint(provider, userIntent) + "/otel-collector/queue");
+    OtelCollectorConfigFormat.StorageCompaction compaction =
+        new OtelCollectorConfigFormat.StorageCompaction();
+    compaction.setDirectory(extension.getDirectory());
+    compaction.setOn_start(true);
+    compaction.setOn_rebound(true);
+    compaction.setRebound_trigger_threshold_mib(10);
+    compaction.setRebound_needed_threshold_mib(100);
+    extension.setCompaction(compaction);
+    return extension;
+  }
+
+  private String getFirstMountPoint(
+      Provider provider, UniverseDefinitionTaskParams.UserIntent userIntent) {
+    if (provider.getCloudCode() == Common.CloudType.onprem) {
+      String mountPoints = userIntent.deviceInfo.mountPoints;
+      return mountPoints.split(",")[0];
+    }
+    return "/mnt/d0";
+  }
+
+  private void addAwsCredentialsToSecretEnv(
+      String accessKey, String secretKey, List<Object> secretEnv) {
+    if (StringUtils.isNotEmpty(accessKey)) {
+      String encodedAccessKey = Base64.getEncoder().encodeToString(accessKey.getBytes());
+      secretEnv.add(ImmutableMap.of("envName", "AWS_ACCESS_KEY_ID", "envValue", encodedAccessKey));
+    }
+    if (StringUtils.isNotEmpty(secretKey)) {
+      String encodedSecretKey = Base64.getEncoder().encodeToString(secretKey.getBytes());
+      secretEnv.add(
+          ImmutableMap.of("envName", "AWS_SECRET_ACCESS_KEY", "envValue", encodedSecretKey));
+    }
+  }
+
+  private void appendSecretEnv(
+      TelemetryProvider telemetryProvider,
+      List<Object> secretEnv,
+      Set<UUID> appendedProviderUuids) {
+    if (!appendedProviderUuids.add(telemetryProvider.getUuid())) {
+      return;
+    }
+    switch (telemetryProvider.getConfig().getType()) {
+      case AWS_CLOUDWATCH:
+        AWSCloudWatchConfig awsCloudWatchConfig =
+            (AWSCloudWatchConfig) telemetryProvider.getConfig();
+        addAwsCredentialsToSecretEnv(
+            awsCloudWatchConfig.getAccessKey(), awsCloudWatchConfig.getSecretKey(), secretEnv);
+        break;
+      case S3:
+        S3Config s3Config = (S3Config) telemetryProvider.getConfig();
+        addAwsCredentialsToSecretEnv(s3Config.getAccessKey(), s3Config.getSecretKey(), secretEnv);
+        break;
+      case GCP_CLOUD_MONITORING:
+        GCPCloudMonitoringConfig gcpCloudMonitoringConfig =
+            (GCPCloudMonitoringConfig) telemetryProvider.getConfig();
+        if (gcpCloudMonitoringConfig.getGcmCredentials() != null) {
+          String encodedCredentials =
+              Base64.getEncoder()
+                  .encodeToString(
+                      gcpCloudMonitoringConfig.getGcmCredentials().toString().getBytes());
+          secretEnv.add(
+              ImmutableMap.of(
+                  "envName",
+                  "GOOGLE_APPLICATION_CREDENTIALS_CONTENT",
+                  "envValue",
+                  encodedCredentials));
+        }
+        break;
+    }
+  }
+
+  private void addCommonTransformProcessor(OtelCollectorConfigFormat collectorConfig) {
+    String transformProcessorName = PROCESSOR_PREFIX_TRANSFORM + "replace";
+
+    // Only add the transform processor if it doesn't already exist
+    if (!collectorConfig.getProcessors().containsKey(transformProcessorName)) {
+      OtelCollectorConfigFormat.TransformProcessor transformProcessor =
+          new OtelCollectorConfigFormat.TransformProcessor();
+      OtelCollectorConfigFormat.LogStatement logStatement =
+          new OtelCollectorConfigFormat.LogStatement();
+      logStatement.setContext("log");
+      logStatement.setStatements(ImmutableList.of("replace_pattern(body, \"^otho8Aut\", \"\")"));
+      transformProcessor.setLog_statements(ImmutableList.of(logStatement));
+      collectorConfig.getProcessors().put(transformProcessorName, transformProcessor);
+    }
+  }
+
+  private String exportTypeAndUUID(UUID telemetryProviderUUID, ExportType exportType) {
+    String exportTypeAndUUID;
+    switch (exportType) {
+      case AUDIT_LOGS:
+        exportTypeAndUUID = telemetryProviderUUID.toString();
+        break;
+      case QUERY_LOGS:
+        exportTypeAndUUID = EXPORT_TYPE_PREFIX_QUERY_LOGS + telemetryProviderUUID;
+        break;
+      case METRICS:
+        exportTypeAndUUID = EXPORT_TYPE_PREFIX_METRICS + telemetryProviderUUID;
+        break;
+      case MASTER_LOGS:
+        exportTypeAndUUID = EXPORT_TYPE_PREFIX_MASTER_LOGS + telemetryProviderUUID;
+        break;
+      case TSERVER_LOGS:
+        exportTypeAndUUID = EXPORT_TYPE_PREFIX_TSERVER_LOGS + telemetryProviderUUID;
+        break;
+      case YSQL_CONN_MGR_LOGS:
+        exportTypeAndUUID = EXPORT_TYPE_PREFIX_YSQL_CONN_MGR_LOGS + telemetryProviderUUID;
+        break;
+      case NODE_AGENT_LOGS:
+        exportTypeAndUUID = EXPORT_TYPE_PREFIX_NODE_AGENT_LOGS + telemetryProviderUUID;
+        break;
+      case YNP_LOGS:
+        exportTypeAndUUID = EXPORT_TYPE_PREFIX_YNP_LOGS + telemetryProviderUUID;
+        break;
+      case CONTROLLER_LOGS:
+        exportTypeAndUUID = EXPORT_TYPE_PREFIX_CONTROLLER_LOGS + telemetryProviderUUID;
+        break;
+      default:
+        throw new IllegalArgumentException("Unsupported export type: " + exportType);
+    }
+    return exportTypeAndUUID;
+  }
+}

@@ -1,0 +1,1675 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+//
+// The following only applies to changes made to this file as part of YugabyteDB development.
+//
+// Portions Copyright (c) YugabyteDB, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
+// in compliance with the License.  You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software distributed under the License
+// is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express
+// or implied.  See the License for the specific language governing permissions and limitations
+// under the License.
+//
+// Tests for the yb-admin command-line tool.
+
+#include <boost/assign/list_of.hpp>
+#include <gtest/gtest.h>
+#include "yb/util/logging.h"
+
+#include "yb/consensus/consensus.pb.h"
+
+#include "yb/fs/fs_manager.h"
+
+#include "yb/gutil/map-util.h"
+#include "yb/gutil/strings/join.h"
+#include "yb/gutil/strings/split.h"
+#include "yb/gutil/strings/substitute.h"
+
+#include "yb/integration-tests/cluster_itest_util.h"
+#include "yb/integration-tests/cql_test_util.h"
+#include "yb/integration-tests/external_mini_cluster-itest-base.h"
+#include "yb/integration-tests/test_workload.h"
+#include "yb/integration-tests/ts_itest-base.h"
+
+#include "yb/master/master_client.pb.h"
+
+#include "yb/tserver/tserver.pb.h"
+#include "yb/tserver/tserver_service.proxy.h"
+
+#include "yb/tools/admin-test-base.h"
+
+#include "yb/common/hybrid_time.h"
+#include "yb/common/wire_protocol.h"
+
+#include "yb/util/backoff_waiter.h"
+#include "yb/util/date_time.h"
+#include "yb/util/path_util.h"
+#include "yb/util/pb_util.h"
+#include "yb/util/subprocess.h"
+#include "yb/util/test_thread_holder.h"
+
+using std::string;
+using std::vector;
+
+using strings::Substitute;
+using yb::consensus::OpIdType;
+using yb::itest::FindTabletFollowers;
+using yb::itest::FindTabletLeader;
+using yb::itest::TabletServerMap;
+using yb::itest::TServerDetails;
+using yb::itest::WaitUntilLeader;
+
+constexpr int kTabletTimeout = 30;
+
+namespace yb {
+namespace tools {
+
+static const char* const kTsCliToolName = "yb-ts-cli";
+
+class YBTsCliTest : public ExternalMiniClusterITestBase {
+ protected:
+  // Figure out where the admin tool is.
+  string GetTsCliToolPath() const;
+};
+
+string YBTsCliTest::GetTsCliToolPath() const {
+  return GetToolPath(kTsCliToolName);
+}
+
+TEST_F(YBTsCliTest, SetFlagTest) {
+  std::vector<std::string> ts_flags = {
+      "--vmodule=foo=0,bar=1",
+  };
+  std::vector<std::string> master_flags = {};
+  ASSERT_NO_FATALS(StartCluster(
+      ts_flags, master_flags, /* num_tablet_servers */ 3, /* num_masters */ 1,
+      /* enable_ysql */ true));
+
+  string exe_path = GetTsCliToolPath();
+  auto server_addr = yb::ToString(cluster_->tablet_server(0)->bound_rpc_addr());
+
+  auto run_set_flag = [&](const string& flag, const string& value,
+                          const vector<string>& extra_args = {}) {
+    vector<string> argv = {exe_path, "--server_address", server_addr};
+    for (const auto& arg : extra_args) argv.push_back(arg);
+    argv.push_back("set_flag");
+    argv.push_back(flag);
+    argv.push_back(value);
+    return Subprocess::Call(argv);
+  };
+
+  // --- vmodule tests ---
+  ASSERT_OK(run_set_flag("vmodule", "foo=1,bar=2"));
+  ASSERT_OK(run_set_flag("vmodule", "foo=1"));
+  ASSERT_OK(run_set_flag("vmodule", ""));
+  ASSERT_OK(run_set_flag("vmodule", "foo=1,baz=2"));
+  ASSERT_NOK(run_set_flag("vmodule", "foo=,baz=2"));
+  ASSERT_NOK(run_set_flag("vmodule", "foo=1,=2"));
+
+  // --- set_flag validation tests ---
+  // Basic gflag validation failure: malformed CSV.
+  ASSERT_NOK(run_set_flag("ysql_pg_conf_csv", "a,b=1"));
+
+  // Extended PG validation failure: invalid GUC value.
+  ASSERT_NOK(run_set_flag("ysql_pg_conf_csv", "log_min_messages=foo"));
+}
+
+// Test deleting a tablet.
+TEST_F(YBTsCliTest, TestDeleteTablet) {
+  MonoDelta timeout = MonoDelta::FromSeconds(kTabletTimeout);
+  std::vector<std::string> ts_flags = {
+    "--enable_leader_failure_detection=false"s,
+  };
+  std::vector<std::string> master_flags = {
+    "--catalog_manager_wait_for_new_tablets_to_elect_leader=false"s,
+    "--use_create_table_leader_hint=false"s,
+  };
+  ASSERT_NO_FATALS(StartCluster(ts_flags, master_flags));
+
+  TestYcqlWorkload workload(cluster_.get());
+  workload.Setup(); // Easy way to create a new tablet.
+
+  vector<tserver::ListTabletsResponsePB::StatusAndSchemaPB> tablets;
+  for (const auto& entry : ts_map_) {
+    TServerDetails* ts = entry.second.get();
+    ASSERT_OK(itest::WaitForNumTabletsOnTS(ts, 1, timeout, &tablets));
+  }
+  string tablet_id = tablets[0].tablet_status().tablet_id();
+
+  for (size_t i = 0; i < cluster_->num_tablet_servers(); i++) {
+    ASSERT_OK(itest::WaitUntilTabletRunning(ts_map_[cluster_->tablet_server(i)->uuid()].get(),
+                                            tablet_id, timeout));
+  }
+
+  string exe_path = GetTsCliToolPath();
+  vector<string> argv;
+  argv.push_back(exe_path);
+  argv.push_back("--server_address");
+  argv.push_back(yb::ToString(cluster_->tablet_server(0)->bound_rpc_addr()));
+  argv.push_back("delete_tablet");
+  argv.push_back(tablet_id);
+  argv.push_back("Deleting for yb-ts-cli-test");
+  ASSERT_OK(Subprocess::Call(argv));
+
+  ASSERT_OK(inspect_->WaitForTabletDataStateOnTS(0, tablet_id, tablet::TABLET_DATA_TOMBSTONED));
+  TServerDetails* ts = ts_map_[cluster_->tablet_server(0)->uuid()].get();
+  ASSERT_OK(itest::WaitUntilTabletInState(ts, tablet_id, tablet::SHUTDOWN, timeout));
+}
+
+// Test readiness check before and after a tablet server is done bootstrapping.
+TEST_F(YBTsCliTest, TestTabletServerReadiness) {
+  MonoDelta timeout = MonoDelta::FromSeconds(kTabletTimeout);
+  ASSERT_NO_FATALS(StartCluster({ "--TEST_tablet_bootstrap_delay_ms=2000"s }));
+
+  TestYcqlWorkload workload(cluster_.get());
+  workload.Setup(); // Easy way to create a new tablet.
+
+  vector<tserver::ListTabletsResponsePB::StatusAndSchemaPB> tablets;
+  for (const auto& entry : ts_map_) {
+    TServerDetails* ts = entry.second.get();
+    ASSERT_OK(itest::WaitForNumTabletsOnTS(ts, 1, timeout, &tablets));
+  }
+  string tablet_id = tablets[0].tablet_status().tablet_id();
+
+  for (size_t i = 0; i < cluster_->num_tablet_servers(); i++) {
+    ASSERT_OK(itest::WaitUntilTabletRunning(ts_map_[cluster_->tablet_server(i)->uuid()].get(),
+                                            tablet_id, timeout));
+  }
+
+  ASSERT_NO_FATALS(cluster_->tablet_server(0)->Shutdown());
+  ASSERT_OK(cluster_->tablet_server(0)->Restart());
+
+  string exe_path = GetTsCliToolPath();
+  vector<string> argv;
+  argv.push_back(exe_path);
+  argv.push_back("--server_address");
+  argv.push_back(yb::ToString(cluster_->tablet_server(0)->bound_rpc_addr()));
+  argv.push_back("is_server_ready");
+  ASSERT_NOK(Subprocess::Call(argv));
+
+  ASSERT_OK(WaitFor([&]() {
+    return Subprocess::Call(argv).ok();
+  }, MonoDelta::FromSeconds(10), "Wait for tablet bootstrap to finish"));
+}
+
+TEST_F(YBTsCliTest, TestManualRemoteBootstrap) {
+  MonoDelta timeout = MonoDelta::FromSeconds(kTabletTimeout);
+  ASSERT_NO_FATALS(StartCluster({}, {}, 3 /*num tservers*/, 1 /*num masters*/));
+
+  TestYcqlWorkload workload(cluster_.get());
+  workload.Setup();
+  workload.Start();
+
+  std::vector<tserver::ListTabletsResponsePB::StatusAndSchemaPB> tablets;
+  for (const auto& entry : ts_map_) {
+    TServerDetails* ts = entry.second.get();
+    ASSERT_OK(itest::WaitForNumTabletsOnTS(ts, 1, timeout, &tablets));
+  }
+
+  for (const auto& tablet : tablets) {
+    const auto& tablet_id = tablet.tablet_status().tablet_id();
+    for (size_t i = 0; i < cluster_->num_tablet_servers(); i++) {
+      ASSERT_OK(itest::WaitUntilTabletRunning(ts_map_[cluster_->tablet_server(i)->uuid()].get(),
+                                              tablet_id, timeout));
+    }
+  }
+
+  workload.WaitInserted(1000);
+  workload.Stop();
+  ASSERT_EQ(workload.rows_insert_failed(), 0);
+
+  for (size_t i = 0; i < cluster_->num_tablet_servers(); ++i) {
+    ASSERT_NO_FATALS(cluster_->tablet_server(i)->Shutdown());
+  }
+
+  auto* env = Env::Default();
+  for (size_t i = 1; i < cluster_->num_tablet_servers(); ++i) {
+    for (const auto& data_dir : cluster_->tablet_server(i)->GetDataDirs()) {
+      for (const auto& tablet : tablets) {
+        const auto& tablet_id = tablet.tablet_status().tablet_id();
+        auto meta_dir = FsManager::GetRaftGroupMetadataDir(data_dir);
+        auto metadata_path = JoinPathSegments(meta_dir, tablet_id);
+        tablet::RaftGroupReplicaSuperBlockPB superblock;
+        ASSERT_OK(pb_util::ReadPBContainerFromPath(env, metadata_path, &superblock));
+        auto tablet_data_dir = superblock.kv_store().rocksdb_dir();
+        const auto& rocksdb_files = ASSERT_RESULT(env->GetChildren(
+            tablet_data_dir, ExcludeDots::kTrue));
+        ASSERT_GT(rocksdb_files.size(), 0);
+
+        for (const auto& file : rocksdb_files) {
+          ASSERT_OK(env->DeleteFile(JoinPathSegments(tablet_data_dir, file)));
+        }
+        ASSERT_OK(env->DeleteFile(metadata_path));
+      }
+    }
+  }
+
+  for (size_t i = 0; i < cluster_->num_tablet_servers(); ++i) {
+    ASSERT_OK(cluster_->tablet_server(i)->Restart());
+  }
+
+  std::string exe_path = GetTsCliToolPath();
+  std::vector<std::string> argv;
+  argv.push_back(exe_path);
+  argv.push_back("--server_address");
+  argv.push_back(yb::ToString(cluster_->tablet_server(1)->bound_rpc_addr()));
+  argv.push_back("remote_bootstrap");
+  argv.push_back(yb::ToString(cluster_->tablet_server(0)->bound_rpc_addr()));
+
+  for (const auto& tablet : tablets) {
+    const auto& tablet_id = tablet.tablet_status().tablet_id();
+    ASSERT_OK(itest::WaitUntilTabletRunning(ts_map_[cluster_->tablet_server(0)->uuid()].get(),
+                                            tablet_id, timeout));
+    argv.push_back(tablet_id);
+    ASSERT_OK(Subprocess::Call(argv));
+    argv.pop_back();
+
+    for (size_t i = 1; i < cluster_->num_tablet_servers(); ++i) {
+      ASSERT_OK(itest::WaitUntilTabletRunning(ts_map_[cluster_->tablet_server(i)->uuid()].get(),
+                                              tablet_id, timeout));
+    }
+  }
+
+  auto wait_until_rows = workload.rows_inserted() + 1000;
+  workload.Start();
+  workload.WaitInserted(wait_until_rows);
+  workload.StopAndJoin();
+  ASSERT_EQ(workload.rows_insert_failed(), 0);
+
+  for (size_t i = 0; i < cluster_->num_tablet_servers(); ++i) {
+    ASSERT_NO_FATALS(cluster_->tablet_server(i)->Shutdown());
+  }
+
+  for (size_t i = 1; i < cluster_->num_tablet_servers(); ++i) {
+    ASSERT_OK(cluster_->tablet_server(i)->Restart());
+    for (const auto& tablet : tablets) {
+      const auto& tablet_id = tablet.tablet_status().tablet_id();
+      ASSERT_OK(itest::WaitUntilTabletRunning(ts_map_[cluster_->tablet_server(i)->uuid()].get(),
+                                              tablet_id, timeout));
+
+      std::vector<std::string> delete_argv;
+      delete_argv.push_back(exe_path);
+      delete_argv.push_back("--server_address");
+      delete_argv.push_back(yb::ToString(cluster_->tablet_server(i)->bound_rpc_addr()));
+      delete_argv.push_back("delete_tablet");
+      delete_argv.push_back(tablet_id);
+      delete_argv.push_back("reason");
+
+      ASSERT_OK(Subprocess::Call(delete_argv));
+    }
+  }
+  ASSERT_OK(cluster_->tablet_server(0)->Restart());
+
+  for (const auto& tablet : tablets) {
+    const auto& tablet_id = tablet.tablet_status().tablet_id();
+    ASSERT_OK(itest::WaitUntilTabletRunning(ts_map_[cluster_->tablet_server(0)->uuid()].get(),
+                                            tablet_id, timeout));
+    argv.push_back(tablet_id);
+    ASSERT_OK(Subprocess::Call(argv));
+    argv.pop_back();
+  }
+
+  wait_until_rows = workload.rows_inserted() + 1000;
+  workload.Start();
+  workload.WaitInserted(wait_until_rows);
+  workload.StopAndJoin();
+  ASSERT_EQ(workload.rows_insert_failed(), 0);
+}
+
+TEST_F(YBTsCliTest, TestRefreshFlags) {
+  std::string gflag = "client_read_write_timeout_ms";
+  std::string old_value = "120000";
+  std::string new_value = "150000";
+
+  // Write a flagfile.
+  std::string flag_filename = JoinPathSegments(GetTestDataDirectory(), "flagfile.test");
+  std::unique_ptr<WritableFile> flag_file;
+  ASSERT_OK(Env::Default()->NewWritableFile(flag_filename, &flag_file));
+  ASSERT_OK(flag_file->Append("--" + gflag + "=" + old_value));
+  ASSERT_OK(flag_file->Close());
+
+  // Start the cluster;
+  vector<string> extra_flags = {"--flagfile=" + flag_filename};
+
+  ASSERT_NO_FATALS(StartCluster(extra_flags, extra_flags));
+
+  // Verify that the cluster is started with the custom GFlag value in the config.
+  auto master_flag = ASSERT_RESULT(cluster_->master(0)->GetFlag(gflag));
+  ASSERT_EQ(master_flag, old_value);
+  auto ts_flag = ASSERT_RESULT(cluster_->tablet_server(0)->GetFlag(gflag));
+  ASSERT_EQ(ts_flag, old_value);
+
+  // Change the flagfile to have a different value for the GFlag.
+  ASSERT_OK(Env::Default()->NewWritableFile(flag_filename, &flag_file));
+  ASSERT_OK(flag_file->Append("--" + gflag + "=" + new_value));
+  ASSERT_OK(flag_file->Close());
+
+  // Send RefreshFlags RPC to the Master process
+  string exe_path = GetTsCliToolPath();
+  vector<string> argv;
+  argv.push_back(exe_path);
+  argv.push_back("--server_address");
+  argv.push_back(yb::ToString(cluster_->master(0)->bound_rpc_addr()));
+  argv.push_back("refresh_flags");
+  ASSERT_OK(Subprocess::Call(argv));
+
+  // Wait for the master process to have the updated GFlag value.
+  ASSERT_OK(LoggedWaitFor([&]() -> Result<bool> {
+    return VERIFY_RESULT(cluster_->master(0)->GetFlag(gflag)) == new_value;
+  }, MonoDelta::FromSeconds(60), "Verify updated GFlag"));
+
+  // The TServer should still have the old value because we didn't send it the RPC.
+  ts_flag = ASSERT_RESULT(cluster_->tablet_server(0)->GetFlag(gflag));
+  ASSERT_EQ(ts_flag, old_value);
+
+  // Now, send a RefreshFlags RPC to the TServer process
+  argv.clear();
+  argv.push_back(exe_path);
+  argv.push_back("--server_address");
+  argv.push_back(yb::ToString(cluster_->tablet_server(0)->bound_rpc_addr()));
+  argv.push_back("refresh_flags");
+  ASSERT_OK(Subprocess::Call(argv));
+
+  // Wait for the TS process to have the updated GFlag value.
+  ASSERT_OK(LoggedWaitFor([&]() -> Result<bool> {
+    return VERIFY_RESULT(cluster_->tablet_server(0)->GetFlag(gflag)) == new_value;
+  }, MonoDelta::FromSeconds(60), "Verify updated GFlag"));
+}
+
+class YBTsCliIntegrationTest : public AdminTestBase {
+ public:
+  // Figure out where the admin tool is.
+  string GetTsCliToolPath() const { return GetToolPath(kTsCliToolName); }
+};
+
+using YBTsCliUnsafeChangeTest = YBTsCliIntegrationTest;
+
+Status RunUnsafeChangeConfig(
+    YBTsCliUnsafeChangeTest* test,
+    const string& tablet_id,
+    const string& dst_host,
+    const vector<string>& peer_uuid_list) {
+  LOG(INFO) << " Called RunUnsafeChangeConfig with " << tablet_id << " " << dst_host << " and "
+            << yb::ToString(peer_uuid_list);
+  std::vector<string> params;
+  params.push_back(test->GetTsCliToolPath());
+  params.push_back("--server_address");
+  params.push_back(dst_host);
+  params.push_back("unsafe_config_change");
+  params.push_back(tablet_id);
+  for (const auto& peer : peer_uuid_list) {
+    params.push_back(peer);
+  }
+  VERIFY_RESULT(test->CallAdminVec(params));
+  return Status::OK();
+}
+
+// Test unsafe config change when there is one follower survivor in the cluster.
+// 1. Instantiate external mini cluster with 1 tablet having 3 replicas and 5 TS.
+// 2. Shut down leader and follower1.
+// 3. Trigger unsafe config change on follower2 having follower2 in the config.
+// 4. Wait until the new config is populated on follower2(new leader) and master.
+// 5. Bring up leader and follower1 and verify replicas are deleted.
+// 6. Verify that new config doesn't contain old leader and follower1.
+TEST_F(YBTsCliUnsafeChangeTest, TestUnsafeChangeConfigOnSingleFollower) {
+  MonoDelta kTimeout = MonoDelta::FromSeconds(30);
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_num_tablet_servers) = 5;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_num_replicas) = 3;
+  // tserver_unresponsive_timeout_ms is useful so that master considers
+  // the live tservers for tablet re-replication.
+  std::vector<std::string> master_flags;
+  std::vector<std::string> ts_flags;
+  master_flags.push_back("--enable_load_balancing=true");
+  BuildAndStart(ts_flags, master_flags);
+
+  LOG(INFO) << "Finding tablet leader and waiting for things to start...";
+  string tablet_id = tablet_replicas_.begin()->first;
+
+  // Determine the list of tablet servers currently in the config.
+  itest::TabletServerMapUnowned active_tablet_servers;
+  auto iter = tablet_replicas_.equal_range(tablet_id_);
+  for (auto it = iter.first; it != iter.second; ++it) {
+    InsertOrDie(&active_tablet_servers, it->second->uuid(), it->second);
+  }
+
+  // Get a baseline config reported to the master.
+  LOG(INFO) << "Waiting for Master to see the current replicas...";
+  master::TabletLocationsPB tablet_locations;
+  bool has_leader;
+  ASSERT_OK(itest::WaitForReplicasReportedToMaster(cluster_.get(),
+                                                   3, tablet_id_, kTimeout,
+                                                   itest::WAIT_FOR_LEADER,
+                                                   &has_leader, &tablet_locations));
+  LOG(INFO) << "Tablet locations:\n" << yb::ToString(tablet_locations);
+  ASSERT_TRUE(has_leader) << yb::ToString(tablet_locations);
+
+  TServerDetails* leader_ts;
+  ASSERT_OK(FindTabletLeader(active_tablet_servers, tablet_id_, kTimeout, &leader_ts));
+  vector<TServerDetails*> followers;
+  ASSERT_OK(FindTabletFollowers(active_tablet_servers, tablet_id_, kTimeout, &followers));
+  // Wait for initial NO_OP to be committed by the leader.
+  ASSERT_OK(WaitForOpFromCurrentTerm(leader_ts, tablet_id_, OpIdType::COMMITTED_OPID, kTimeout));
+
+  // Shut down master so it doesn't interfere while we shut down the leader and
+  // one of the other followers.
+  cluster_->master()->Shutdown();
+  cluster_->tablet_server_by_uuid(leader_ts->uuid())->Shutdown();
+  cluster_->tablet_server_by_uuid(followers[1]->uuid())->Shutdown();
+
+  LOG(INFO) << "Forcing unsafe config change on remaining follower " << followers[0]->uuid();
+  const string& follower0_addr =
+      cluster_->tablet_server_by_uuid(followers[0]->uuid())->bound_rpc_addr().ToString();
+  ASSERT_OK(RunUnsafeChangeConfig(this, tablet_id_, follower0_addr, {followers[0]->uuid()}));
+  ASSERT_OK(WaitUntilLeader(followers[0], tablet_id_, kTimeout));
+  ASSERT_OK(WaitUntilCommittedConfigNumVotersIs(1, followers[0], tablet_id_, kTimeout));
+
+  LOG(INFO) << "Restarting master...";
+
+  // Restart master so it can re-replicate the tablet to remaining tablet servers.
+  ASSERT_OK(cluster_->master()->Restart());
+
+  // Wait for master to re-replicate.
+  ASSERT_OK(WaitUntilCommittedConfigNumVotersIs(3, followers[0], tablet_id_, kTimeout));
+  ASSERT_OK(itest::WaitForReplicasReportedToMaster(
+      cluster_.get(), 3, tablet_id_, kTimeout, itest::WAIT_FOR_LEADER, &has_leader,
+      &tablet_locations));
+  OpId opid;
+  ASSERT_OK(WaitForOpFromCurrentTerm(
+      followers[0], tablet_id_, OpIdType::COMMITTED_OPID, kTimeout, &opid));
+
+  active_tablet_servers.clear();
+  std::unordered_set<string> replica_uuids;
+  for (const auto& loc : tablet_locations.replicas()) {
+    const string& uuid = loc.ts_info().permanent_uuid();
+    InsertOrDie(&active_tablet_servers, uuid, tablet_servers_[uuid].get());
+  }
+  ASSERT_OK(WaitForServersToAgree(kTimeout, active_tablet_servers, tablet_id_, opid.index));
+
+  // Verify that two new servers are part of new config and old
+  // servers are gone.
+  for (const master::TabletLocationsPB_ReplicaPB& replica : tablet_locations.replicas()) {
+    ASSERT_NE(replica.ts_info().permanent_uuid(), followers[1]->uuid());
+    ASSERT_NE(replica.ts_info().permanent_uuid(), leader_ts->uuid());
+  }
+
+  // Also verify that when we bring back followers[1] and leader,
+  // we should see the tablet in TOMBSTONED state on these servers.
+  ASSERT_OK(cluster_->tablet_server_by_uuid(leader_ts->uuid())->Restart());
+  ASSERT_OK(cluster_->tablet_server_by_uuid(followers[1]->uuid())->Restart());
+  ASSERT_OK(itest::WaitUntilTabletInState(leader_ts, tablet_id, tablet::SHUTDOWN, kTimeout));
+  ASSERT_OK(itest::WaitUntilTabletInState(followers[1], tablet_id, tablet::SHUTDOWN, kTimeout));
+}
+
+// Test unsafe config change when there is one leader survivor in the cluster.
+// 1. Instantiate external mini cluster with 1 tablet having 3 replicas and 5 TS.
+// 2. Shut down both followers.
+// 3. Trigger unsafe config change on leader having leader in the config.
+// 4. Wait until the new config is populated on leader and master.
+// 5. Verify that new config does not contain old followers.
+TEST_F(YBTsCliUnsafeChangeTest, TestUnsafeChangeConfigOnSingleLeader) {
+  MonoDelta kTimeout = MonoDelta::FromSeconds(30);
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_num_tablet_servers) = 5;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_num_replicas) = 3;
+  std::vector<std::string> master_flags;
+  std::vector<std::string> ts_flags;
+  master_flags.push_back("--enable_load_balancing=true");
+  BuildAndStart(ts_flags, master_flags);
+
+  // Determine the list of tablet servers currently in the config.
+  itest::TabletServerMapUnowned active_tablet_servers;
+  auto iter = tablet_replicas_.equal_range(tablet_id_);
+  for (auto it = iter.first; it != iter.second; ++it) {
+    InsertOrDie(&active_tablet_servers, it->second->uuid(), it->second);
+  }
+
+  // Get a baseline config reported to the master.
+  LOG(INFO) << "Waiting for Master to see the current replicas...";
+  master::TabletLocationsPB tablet_locations;
+  bool has_leader;
+  ASSERT_OK(itest::WaitForReplicasReportedToMaster(
+      cluster_.get(), 3, tablet_id_, kTimeout, itest::WAIT_FOR_LEADER, &has_leader,
+      &tablet_locations));
+  LOG(INFO) << "Tablet locations:\n" << yb::ToString(tablet_locations);
+  ASSERT_TRUE(has_leader) << yb::ToString(tablet_locations);
+
+  TServerDetails* leader_ts;
+  ASSERT_OK(FindTabletLeader(active_tablet_servers, tablet_id_, kTimeout, &leader_ts));
+  vector<TServerDetails*> followers;
+  ASSERT_OK(FindTabletFollowers(active_tablet_servers, tablet_id_, kTimeout, &followers));
+  // Wait for initial NO_OP to be committed by the leader.
+  ASSERT_OK(WaitForOpFromCurrentTerm(leader_ts, tablet_id_, OpIdType::COMMITTED_OPID, kTimeout));
+
+  // Shut down servers follower1 and follower2,
+  // so that we can force new config on remaining leader.
+  cluster_->tablet_server_by_uuid(followers[0]->uuid())->Shutdown();
+  cluster_->tablet_server_by_uuid(followers[1]->uuid())->Shutdown();
+  // Restart master to cleanup cache of dead servers from its list of candidate
+  // servers to trigger placement of new replicas on healthy servers.
+  cluster_->master()->Shutdown();
+  ASSERT_OK(cluster_->master()->Restart());
+
+  LOG(INFO) << "Forcing unsafe config change on tserver " << leader_ts->uuid();
+  const string& leader_addr = Substitute(
+      "$0:$1",
+      leader_ts->registration->common().private_rpc_addresses(0).host(),
+      leader_ts->registration->common().private_rpc_addresses(0).port());
+  const vector<string> peer_uuid_list = {leader_ts->uuid()};
+  ASSERT_OK(RunUnsafeChangeConfig(this, tablet_id_, leader_addr, peer_uuid_list));
+
+  // Check that new config is populated to a new follower.
+  TServerDetails* new_follower = nullptr;
+  vector<TServerDetails*> all_tservers = TServerDetailsVector(tablet_servers_);
+  for (const auto& ts : all_tservers) {
+    if (!ContainsKey(active_tablet_servers, ts->uuid())) {
+      new_follower = ts;
+      break;
+    }
+  }
+  ASSERT_TRUE(new_follower != nullptr);
+
+  // Master may try to add the servers which are down until tserver_unresponsive_timeout_ms,
+  // so it is safer to wait until consensus metadata has 3 voters on new_follower.
+  ASSERT_OK(WaitUntilCommittedConfigNumVotersIs(3, new_follower, tablet_id_, kTimeout));
+
+  // Wait for the master to be notified of the config change.
+  LOG(INFO) << "Waiting for Master to see new config...";
+  ASSERT_OK(itest::WaitForReplicasReportedToMaster(
+      cluster_.get(), 3, tablet_id_, kTimeout, itest::WAIT_FOR_LEADER, &has_leader,
+      &tablet_locations));
+  LOG(INFO) << "Tablet locations:\n" << yb::ToString(tablet_locations);
+  for (const master::TabletLocationsPB_ReplicaPB& replica : tablet_locations.replicas()) {
+    ASSERT_NE(replica.ts_info().permanent_uuid(), followers[0]->uuid());
+    ASSERT_NE(replica.ts_info().permanent_uuid(), followers[1]->uuid());
+  }
+}
+
+// Test unsafe config change when the unsafe config contains 2 nodes.
+// 1. Instantiate external minicluster with 1 tablet having 3 replicas and 5 TS.
+// 2. Shut down leader.
+// 3. Trigger unsafe config change on follower1 having follower1 and follower2 in the config.
+// 4. Wait until the new config is populated on new_leader and master.
+// 5. Verify that new config does not contain old leader.
+TEST_F(YBTsCliUnsafeChangeTest, TestUnsafeChangeConfigForConfigWithTwoNodes) {
+  MonoDelta kTimeout = MonoDelta::FromSeconds(30);
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_num_tablet_servers) = 4;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_num_replicas) = 3;
+  std::vector<std::string> master_flags;
+  std::vector<std::string> ts_flags;
+  master_flags.push_back("--enable_load_balancing=true");
+  BuildAndStart(ts_flags, master_flags);
+
+  // Determine the list of tablet servers currently in the config.
+  itest::TabletServerMapUnowned active_tablet_servers;
+  auto iter = tablet_replicas_.equal_range(tablet_id_);
+  for (auto it = iter.first; it != iter.second; ++it) {
+    InsertOrDie(&active_tablet_servers, it->second->uuid(), it->second);
+  }
+
+  // Get a baseline config reported to the master.
+  LOG(INFO) << "Waiting for Master to see the current replicas...";
+  master::TabletLocationsPB tablet_locations;
+  bool has_leader;
+  ASSERT_OK(itest::WaitForReplicasReportedToMaster(
+      cluster_.get(), 3, tablet_id_, kTimeout, itest::WAIT_FOR_LEADER, &has_leader,
+      &tablet_locations));
+  LOG(INFO) << "Tablet locations:\n" << yb::ToString(tablet_locations);
+  ASSERT_TRUE(has_leader) << yb::ToString(tablet_locations);
+
+  TServerDetails* leader_ts;
+  ASSERT_OK(FindTabletLeader(active_tablet_servers, tablet_id_, kTimeout, &leader_ts));
+  vector<TServerDetails*> followers;
+  ASSERT_OK(FindTabletFollowers(active_tablet_servers, tablet_id_, kTimeout, &followers));
+  // Wait for initial NO_OP to be committed by the leader.
+  ASSERT_OK(WaitForOpFromCurrentTerm(leader_ts, tablet_id_, OpIdType::COMMITTED_OPID, kTimeout));
+
+  // Shut down leader and prepare 2-node config.
+  cluster_->tablet_server_by_uuid(leader_ts->uuid())->Shutdown();
+  // Restart master to cleanup cache of dead servers from its list of candidate
+  // servers to trigger placement of new replicas on healthy servers.
+  cluster_->master()->Shutdown();
+  ASSERT_OK(cluster_->master()->Restart());
+
+  LOG(INFO) << "Forcing unsafe config change on tserver " << followers[1]->uuid();
+  const string& follower1_addr = Substitute(
+      "$0:$1",
+      followers[1]->registration->common().private_rpc_addresses(0).host(),
+      followers[1]->registration->common().private_rpc_addresses(0).port());
+  const vector<string> peer_uuid_list = {
+      followers[0]->uuid(),
+      followers[1]->uuid(),
+  };
+  ASSERT_OK(RunUnsafeChangeConfig(this, tablet_id_, follower1_addr, peer_uuid_list));
+
+  // Find a remaining node which will be picked for re-replication.
+  vector<TServerDetails*> all_tservers = TServerDetailsVector(tablet_servers_);
+  TServerDetails* new_node = nullptr;
+  for (TServerDetails* ts : all_tservers) {
+    if (!ContainsKey(active_tablet_servers, ts->uuid())) {
+      new_node = ts;
+      break;
+    }
+  }
+  ASSERT_TRUE(new_node != nullptr);
+
+  // Master may try to add the servers which are down until tserver_unresponsive_timeout_ms,
+  // so it is safer to wait until consensus metadata has 3 voters on follower1.
+  ASSERT_OK(WaitUntilCommittedConfigNumVotersIs(3, new_node, tablet_id_, kTimeout));
+
+  // Wait for the master to be notified of the config change.
+  LOG(INFO) << "Waiting for Master to see new config...";
+  ASSERT_OK(itest::WaitForReplicasReportedToMaster(
+      cluster_.get(), 3, tablet_id_, kTimeout, itest::WAIT_FOR_LEADER, &has_leader,
+      &tablet_locations));
+  LOG(INFO) << "Tablet locations:\n" << yb::ToString(tablet_locations);
+  for (const master::TabletLocationsPB_ReplicaPB& replica : tablet_locations.replicas()) {
+    ASSERT_NE(replica.ts_info().permanent_uuid(), leader_ts->uuid());
+  }
+}
+
+// Test unsafe config change on a 5-replica tablet when the unsafe config contains 2 nodes.
+// 1. Instantiate external minicluster with 1 tablet having 5 replicas and 8 TS.
+// 2. Shut down leader and 2 followers.
+// 3. Trigger unsafe config change on a surviving follower with those
+//    2 surviving followers in the new config.
+// 4. Wait until the new config is populated on new_leader and master.
+// 5. Verify that new config does not contain old leader and old followers.
+TEST_F(YBTsCliUnsafeChangeTest, TestUnsafeChangeConfigWithFiveReplicaConfig) {
+  MonoDelta kTimeout = MonoDelta::FromSeconds(30);
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_num_tablet_servers) = 8;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_num_replicas) = 5;
+  std::vector<std::string> master_flags;
+  std::vector<std::string> ts_flags;
+  master_flags.push_back("--enable_load_balancing=true");
+  BuildAndStart(ts_flags, master_flags);
+
+  vector<ExternalTabletServer*> external_tservers;
+  vector<TServerDetails*> tservers = TServerDetailsVector(tablet_servers_);
+  for (TServerDetails* ts : tservers) {
+    external_tservers.push_back(cluster_->tablet_server_by_uuid(ts->uuid()));
+  }
+
+  // Determine the list of tablet servers currently in the config.
+  itest::TabletServerMapUnowned active_tablet_servers;
+  auto iter = tablet_replicas_.equal_range(tablet_id_);
+  for (auto it = iter.first; it != iter.second; ++it) {
+    InsertOrDie(&active_tablet_servers, it->second->uuid(), it->second);
+  }
+
+  // Get a baseline config reported to the master.
+  LOG(INFO) << "Waiting for Master to see the current replicas...";
+  master::TabletLocationsPB tablet_locations;
+  bool has_leader;
+  ASSERT_OK(itest::WaitForReplicasReportedToMaster(
+      cluster_.get(), 5, tablet_id_, kTimeout, itest::WAIT_FOR_LEADER, &has_leader,
+      &tablet_locations));
+  LOG(INFO) << "Tablet locations:\n" << yb::ToString(tablet_locations);
+  ASSERT_TRUE(has_leader) << yb::ToString(tablet_locations);
+
+  TServerDetails* leader_ts;
+  ASSERT_OK(FindTabletLeader(active_tablet_servers, tablet_id_, kTimeout, &leader_ts));
+  ASSERT_OK(itest::WaitUntilCommittedOpIdIndexIs(1, leader_ts, tablet_id_, kTimeout));
+  vector<TServerDetails*> followers;
+  ASSERT_OK(FindTabletFollowers(active_tablet_servers, tablet_id_, kTimeout, &followers));
+  ASSERT_EQ(followers.size(), 4);
+  // Wait for initial NO_OP to be committed by the leader.
+  ASSERT_OK(WaitForOpFromCurrentTerm(leader_ts, tablet_id_, OpIdType::COMMITTED_OPID, kTimeout));
+
+  cluster_->tablet_server_by_uuid(followers[2]->uuid())->Shutdown();
+  cluster_->tablet_server_by_uuid(followers[3]->uuid())->Shutdown();
+  cluster_->tablet_server_by_uuid(leader_ts->uuid())->Shutdown();
+  // Restart master to cleanup cache of dead servers from its list of candidate
+  // servers to trigger placement of new replicas on healthy servers.
+  cluster_->master()->Shutdown();
+  ASSERT_OK(cluster_->master()->Restart());
+
+  LOG(INFO) << "Forcing unsafe config change on tserver " << followers[1]->uuid();
+  const string& follower1_addr = Substitute(
+      "$0:$1",
+      followers[1]->registration->common().private_rpc_addresses(0).host(),
+      followers[1]->registration->common().private_rpc_addresses(0).port());
+  const vector<string> peer_uuid_list = {
+      followers[0]->uuid(),
+      followers[1]->uuid(),
+  };
+  ASSERT_OK(RunUnsafeChangeConfig(this, tablet_id_, follower1_addr, peer_uuid_list));
+
+  // Find a remaining node which will be picked for re-replication.
+  vector<TServerDetails*> all_tservers = TServerDetailsVector(tablet_servers_);
+  TServerDetails* new_node = nullptr;
+  for (TServerDetails* ts : all_tservers) {
+    if (!ContainsKey(active_tablet_servers, ts->uuid())) {
+      new_node = ts;
+      break;
+    }
+  }
+  ASSERT_TRUE(new_node != nullptr);
+
+  // Master may try to add the servers which are down until tserver_unresponsive_timeout_ms,
+  // so it is safer to wait until consensus metadata has 5 voters back on new_node.
+  ASSERT_OK(WaitUntilCommittedConfigNumVotersIs(5, new_node, tablet_id_, kTimeout));
+
+  // Wait for the master to be notified of the config change.
+  LOG(INFO) << "Waiting for Master to see new config...";
+  ASSERT_OK(itest::WaitForReplicasReportedToMaster(
+      cluster_.get(), 5, tablet_id_, kTimeout, itest::WAIT_FOR_LEADER, &has_leader,
+      &tablet_locations));
+  LOG(INFO) << "Tablet locations:\n" << yb::ToString(tablet_locations);
+  for (const master::TabletLocationsPB_ReplicaPB& replica : tablet_locations.replicas()) {
+    ASSERT_NE(replica.ts_info().permanent_uuid(), leader_ts->uuid());
+    ASSERT_NE(replica.ts_info().permanent_uuid(), followers[2]->uuid());
+    ASSERT_NE(replica.ts_info().permanent_uuid(), followers[3]->uuid());
+  }
+}
+
+// Test unsafe config change when there is a pending config on a surviving leader.
+// 1. Instantiate external minicluster with 1 tablet having 3 replicas and 5 TS.
+// 2. Shut down both the followers.
+// 3. Trigger a regular config change on the leader which remains pending on leader.
+// 4. Trigger unsafe config change on the surviving leader.
+// 5. Wait until the new config is populated on leader and master.
+// 6. Verify that new config does not contain old followers and a standby node
+//    has populated the new config.
+TEST_F(YBTsCliUnsafeChangeTest, TestUnsafeChangeConfigLeaderWithPendingConfig) {
+  MonoDelta kTimeout = MonoDelta::FromSeconds(30);
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_num_tablet_servers) = 5;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_num_replicas) = 3;
+  std::vector<std::string> master_flags;
+  std::vector<std::string> ts_flags;
+  master_flags.push_back("--enable_load_balancing=true");
+  BuildAndStart(ts_flags, master_flags);
+
+  // Determine the list of tablet servers currently in the config.
+  itest::TabletServerMapUnowned active_tablet_servers;
+  auto iter = tablet_replicas_.equal_range(tablet_id_);
+  for (auto it = iter.first; it != iter.second; ++it) {
+    InsertOrDie(&active_tablet_servers, it->second->uuid(), it->second);
+  }
+
+  // Get a baseline config reported to the master.
+  LOG(INFO) << "Waiting for Master to see the current replicas...";
+  master::TabletLocationsPB tablet_locations;
+  bool has_leader;
+  ASSERT_OK(itest::WaitForReplicasReportedToMaster(
+      cluster_.get(), 3, tablet_id_, kTimeout, itest::WAIT_FOR_LEADER, &has_leader,
+      &tablet_locations));
+  LOG(INFO) << "Tablet locations:\n" << yb::ToString(tablet_locations);
+  ASSERT_TRUE(has_leader) << yb::ToString(tablet_locations);
+
+  TServerDetails* leader_ts;
+  ASSERT_OK(FindTabletLeader(active_tablet_servers, tablet_id_, kTimeout, &leader_ts));
+  vector<TServerDetails*> followers;
+  ASSERT_OK(FindTabletFollowers(active_tablet_servers, tablet_id_, kTimeout, &followers));
+  ASSERT_EQ(followers.size(), 2);
+  // Wait for initial NO_OP to be committed by the leader.
+  ASSERT_OK(WaitForOpFromCurrentTerm(leader_ts, tablet_id_, OpIdType::COMMITTED_OPID, kTimeout));
+
+  // Shut down servers follower1 and follower2,
+  // so that leader can't replicate future config change ops.
+  cluster_->tablet_server_by_uuid(followers[0]->uuid())->Shutdown();
+  cluster_->tablet_server_by_uuid(followers[1]->uuid())->Shutdown();
+
+  // Now try to replicate a ChangeConfig operation. This should get stuck and time out
+  // because the server can't replicate any operations.
+  Status s =
+      RemoveServer(leader_ts, tablet_id_, followers[1], -1, MonoDelta::FromSeconds(2), nullptr);
+  ASSERT_TRUE(s.IsTimedOut());
+
+  LOG(INFO) << "Change Config Op timed out, Sending a Replace config "
+            << "command when change config op is pending on the leader.";
+  const string& leader_addr = Substitute(
+      "$0:$1",
+      leader_ts->registration->common().private_rpc_addresses(0).host(),
+      leader_ts->registration->common().private_rpc_addresses(0).port());
+  const vector<string> peer_uuid_list = {leader_ts->uuid()};
+  ASSERT_OK(RunUnsafeChangeConfig(this, tablet_id_, leader_addr, peer_uuid_list));
+
+  // Restart master to cleanup cache of dead servers from its list of candidate
+  // servers to trigger placement of new replicas on healthy servers.
+  cluster_->master()->Shutdown();
+  ASSERT_OK(cluster_->master()->Restart());
+
+  // Find a remaining node which will be picked for re-replication.
+  vector<TServerDetails*> all_tservers = TServerDetailsVector(tablet_servers_);
+  TServerDetails* new_node = nullptr;
+  for (TServerDetails* ts : all_tservers) {
+    if (!ContainsKey(active_tablet_servers, ts->uuid())) {
+      new_node = ts;
+      break;
+    }
+  }
+  ASSERT_TRUE(new_node != nullptr);
+
+  // Master may try to add the servers which are down until tserver_unresponsive_timeout_ms,
+  // so it is safer to wait until consensus metadata has 3 voters on new_node.
+  ASSERT_OK(WaitUntilCommittedConfigNumVotersIs(3, new_node, tablet_id_, kTimeout));
+
+  // Wait for the master to be notified of the config change.
+  LOG(INFO) << "Waiting for Master to see new config...";
+  ASSERT_OK(itest::WaitForReplicasReportedToMaster(
+      cluster_.get(), 3, tablet_id_, kTimeout, itest::WAIT_FOR_LEADER, &has_leader,
+      &tablet_locations));
+  LOG(INFO) << "Tablet locations:\n" << yb::ToString(tablet_locations);
+  for (const master::TabletLocationsPB_ReplicaPB& replica : tablet_locations.replicas()) {
+    ASSERT_NE(replica.ts_info().permanent_uuid(), followers[0]->uuid());
+    ASSERT_NE(replica.ts_info().permanent_uuid(), followers[1]->uuid());
+  }
+}
+
+// Test unsafe config change when there is a pending config on a surviving follower.
+// 1. Instantiate external minicluster with 1 tablet having 3 replicas and 5 TS.
+// 2. Shut down both the followers.
+// 3. Trigger a regular config change on the leader which remains pending on leader.
+// 4. Trigger a leader_step_down command such that leader is forced to become follower.
+// 5. Trigger unsafe config change on the follower.
+// 6. Wait until the new config is populated on leader and master.
+// 7. Verify that new config does not contain old followers and a standby node
+//    has populated the new config.
+TEST_F(YBTsCliUnsafeChangeTest, TestUnsafeChangeConfigFollowerWithPendingConfig) {
+  MonoDelta kTimeout = MonoDelta::FromSeconds(30);
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_num_tablet_servers) = 5;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_num_replicas) = 3;
+  std::vector<std::string> master_flags;
+  std::vector<std::string> ts_flags;
+  master_flags.push_back("--enable_load_balancing=true");
+  BuildAndStart(ts_flags, master_flags);
+
+  // Determine the list of tablet servers currently in the config.
+  itest::TabletServerMapUnowned active_tablet_servers;
+  auto iter = tablet_replicas_.equal_range(tablet_id_);
+  for (auto it = iter.first; it != iter.second; ++it) {
+    InsertOrDie(&active_tablet_servers, it->second->uuid(), it->second);
+  }
+
+  // Get a baseline config reported to the master.
+  LOG(INFO) << "Waiting for Master to see the current replicas...";
+  master::TabletLocationsPB tablet_locations;
+  bool has_leader;
+  ASSERT_OK(itest::WaitForReplicasReportedToMaster(
+      cluster_.get(), 3, tablet_id_, kTimeout, itest::WAIT_FOR_LEADER, &has_leader,
+      &tablet_locations));
+  LOG(INFO) << "Tablet locations:\n" << yb::ToString(tablet_locations);
+  ASSERT_TRUE(has_leader) << yb::ToString(tablet_locations);
+
+  TServerDetails* leader_ts;
+  ASSERT_OK(FindTabletLeader(active_tablet_servers, tablet_id_, kTimeout, &leader_ts));
+  vector<TServerDetails*> followers;
+  ASSERT_OK(FindTabletFollowers(active_tablet_servers, tablet_id_, kTimeout, &followers));
+  // Wait for initial NO_OP to be committed by the leader.
+  ASSERT_OK(WaitForOpFromCurrentTerm(leader_ts, tablet_id_, OpIdType::COMMITTED_OPID, kTimeout));
+
+  // Shut down servers follower1 and follower2,
+  // so that leader can't replicate future config change ops.
+  cluster_->tablet_server_by_uuid(followers[0]->uuid())->Shutdown();
+  cluster_->tablet_server_by_uuid(followers[1]->uuid())->Shutdown();
+  // Restart master to cleanup cache of dead servers from its
+  // list of candidate servers to place the new replicas.
+  cluster_->master()->Shutdown();
+  ASSERT_OK(cluster_->master()->Restart());
+
+  // Now try to replicate a ChangeConfig operation. This should get stuck and time out
+  // because the server can't replicate any operations.
+  Status s =
+      RemoveServer(leader_ts, tablet_id_, followers[1], -1, MonoDelta::FromSeconds(2), nullptr);
+  ASSERT_TRUE(s.IsTimedOut());
+
+  // Force leader to step down, best effort command since the leadership
+  // could change anytime during cluster lifetime.
+  //  string stderr;
+  ASSERT_OK(CallAdmin("leader_stepdown", tablet_id_));
+  //  s = Subprocess::Call({GetybCtlAbsolutePath(), "tablet", "leader_step_down",
+  //                        cluster_->master()->bound_rpc_addr().ToString(),
+  //                        tablet_id_},
+  //                       "", nullptr, &stderr);
+  //  bool not_currently_leader = stderr.find(
+  //      Status::IllegalState("").CodeAsString()) != string::npos;
+  //  ASSERT_TRUE(s.ok() || not_currently_leader);
+
+  LOG(INFO) << "Change Config Op timed out, Sending a Replace config "
+            << "command when change config op is pending on the leader.";
+  const string& leader_addr = Substitute(
+      "$0:$1",
+      leader_ts->registration->common().private_rpc_addresses(0).host(),
+      leader_ts->registration->common().private_rpc_addresses(0).port());
+  const vector<string> peer_uuid_list = {leader_ts->uuid()};
+  ASSERT_OK(RunUnsafeChangeConfig(this, tablet_id_, leader_addr, peer_uuid_list));
+
+  // Find a remaining node which will be picked for re-replication.
+  vector<TServerDetails*> all_tservers = TServerDetailsVector(tablet_servers_);
+  TServerDetails* new_node = nullptr;
+  for (TServerDetails* ts : all_tservers) {
+    if (!ContainsKey(active_tablet_servers, ts->uuid())) {
+      new_node = ts;
+      break;
+    }
+  }
+  ASSERT_TRUE(new_node != nullptr);
+
+  // Master may try to add the servers which are down until tserver_unresponsive_timeout_ms,
+  // so it is safer to wait until consensus metadata has 3 voters on new_node.
+  ASSERT_OK(WaitUntilCommittedConfigNumVotersIs(3, new_node, tablet_id_, kTimeout));
+
+  // Wait for the master to be notified of the config change.
+  LOG(INFO) << "Waiting for Master to see new config...";
+  ASSERT_OK(itest::WaitForReplicasReportedToMaster(
+      cluster_.get(), 3, tablet_id_, kTimeout, itest::WAIT_FOR_LEADER, &has_leader,
+      &tablet_locations));
+  LOG(INFO) << "Tablet locations:\n" << yb::ToString(tablet_locations);
+  for (const master::TabletLocationsPB_ReplicaPB& replica : tablet_locations.replicas()) {
+    ASSERT_NE(replica.ts_info().permanent_uuid(), followers[1]->uuid());
+    ASSERT_NE(replica.ts_info().permanent_uuid(), followers[0]->uuid());
+  }
+}
+
+// Test unsafe config change when there are back to back pending configs on leader logs.
+// 1. Instantiate external minicluster with 1 tablet having 3 replicas and 5 TS.
+// 2. Shut down both the followers.
+// 3. Trigger a regular config change on the leader which remains pending on leader.
+// 4. Set a fault crash flag to trigger upon next commit of config change.
+// 5. Trigger unsafe config change on the surviving leader which should trigger
+//    the fault while the old config change is being committed.
+// 6. Shutdown and restart the leader and verify that tablet bootstrapped on leader.
+// 7. Verify that a new node has populated the new config with 3 voters.
+TEST_F(YBTsCliUnsafeChangeTest, TestUnsafeChangeConfigWithPendingConfigsOnWAL) {
+  MonoDelta kTimeout = MonoDelta::FromSeconds(30);
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_num_tablet_servers) = 5;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_num_replicas) = 3;
+  std::vector<std::string> master_flags;
+  std::vector<std::string> ts_flags;
+  master_flags.push_back("--enable_load_balancing=true");
+  BuildAndStart(ts_flags, master_flags);
+
+  // Determine the list of tablet servers currently in the config.
+  itest::TabletServerMapUnowned active_tablet_servers;
+  auto iter = tablet_replicas_.equal_range(tablet_id_);
+  for (auto it = iter.first; it != iter.second; ++it) {
+    InsertOrDie(&active_tablet_servers, it->second->uuid(), it->second);
+  }
+
+  // Get a baseline config reported to the master.
+  LOG(INFO) << "Waiting for Master to see the current replicas...";
+  master::TabletLocationsPB tablet_locations;
+  bool has_leader;
+  ASSERT_OK(itest::WaitForReplicasReportedToMaster(
+      cluster_.get(), 3, tablet_id_, kTimeout, itest::WAIT_FOR_LEADER, &has_leader,
+      &tablet_locations));
+  LOG(INFO) << "Tablet locations:\n" << yb::ToString(tablet_locations);
+  ASSERT_TRUE(has_leader) << yb::ToString(tablet_locations);
+
+  TServerDetails* leader_ts;
+  ASSERT_OK(FindTabletLeader(active_tablet_servers, tablet_id_, kTimeout, &leader_ts));
+  vector<TServerDetails*> followers;
+  ASSERT_OK(FindTabletFollowers(active_tablet_servers, tablet_id_, kTimeout, &followers));
+  // Wait for initial NO_OP to be committed by the leader.
+  ASSERT_OK(WaitForOpFromCurrentTerm(leader_ts, tablet_id_, OpIdType::COMMITTED_OPID, kTimeout));
+
+  // Shut down servers follower1 and follower2,
+  // so that leader can't replicate future config change ops.
+  cluster_->tablet_server_by_uuid(followers[0]->uuid())->Shutdown();
+  cluster_->tablet_server_by_uuid(followers[1]->uuid())->Shutdown();
+
+  // Now try to replicate a ChangeConfig operation. This should get stuck and time out
+  // because the server can't replicate any operations.
+  Status s =
+      RemoveServer(leader_ts, tablet_id_, followers[1], -1, MonoDelta::FromSeconds(2), nullptr);
+  ASSERT_TRUE(s.IsTimedOut());
+
+  LOG(INFO) << "Change Config Op timed out, Sending a Replace config "
+            << "command when change config op is pending on the leader.";
+  const string& leader_addr = Substitute(
+      "$0:$1",
+      leader_ts->registration->common().private_rpc_addresses(0).host(),
+      leader_ts->registration->common().private_rpc_addresses(0).port());
+  const vector<string> peer_uuid_list = {leader_ts->uuid()};
+  ASSERT_OK(RunUnsafeChangeConfig(this, tablet_id_, leader_addr, peer_uuid_list));
+
+  // Inject the crash via TEST_fault_crash_before_cmeta_flush flag.
+  // Tablet will find 2 pending configs back to back during bootstrap,
+  // one from ChangeConfig (RemoveServer) and another from UnsafeChangeConfig.
+  ASSERT_OK(cluster_->SetFlag(
+      cluster_->tablet_server_by_uuid(leader_ts->uuid()),
+      "TEST_fault_crash_before_cmeta_flush", "1.0"));
+
+  // Find a remaining node which will be picked for re-replication.
+  vector<TServerDetails*> all_tservers = TServerDetailsVector(tablet_servers_);
+  TServerDetails* new_node = nullptr;
+  for (TServerDetails* ts : all_tservers) {
+    if (!ContainsKey(active_tablet_servers, ts->uuid())) {
+      new_node = ts;
+      break;
+    }
+  }
+  ASSERT_TRUE(new_node != nullptr);
+  // Restart master to cleanup cache of dead servers from its list of candidate
+  // servers to trigger placement of new replicas on healthy servers.
+  cluster_->master()->Shutdown();
+  ASSERT_OK(cluster_->master()->Restart());
+
+  auto ts_process = cluster_->tablet_server_by_uuid(leader_ts->uuid());
+  ASSERT_OK(cluster_->WaitForTSToCrash(ts_process, kTimeout));
+  // ASSERT_OK(cluster_->tablet_server_by_uuid(leader_ts->uuid())->WaitForInjectedCrash(kTimeout));
+
+  cluster_->tablet_server_by_uuid(leader_ts->uuid())->Shutdown();
+  ASSERT_OK(cluster_->tablet_server_by_uuid(leader_ts->uuid())->Restart());
+  vector<tserver::ListTabletsResponsePB::StatusAndSchemaPB> tablets_ignored;
+  ASSERT_OK(WaitForNumTabletsOnTS(leader_ts, 1, kTimeout, &tablets_ignored));
+  ASSERT_OK(WaitUntilCommittedConfigNumVotersIs(3, new_node, tablet_id_, kTimeout));
+
+  // Wait for the master to be notified of the config change.
+  ASSERT_OK(itest::WaitForReplicasReportedToMaster(
+      cluster_.get(), 3, tablet_id_, kTimeout, itest::WAIT_FOR_LEADER, &has_leader,
+      &tablet_locations));
+  LOG(INFO) << "Tablet locations:\n" << yb::ToString(tablet_locations);
+  for (const master::TabletLocationsPB_ReplicaPB& replica : tablet_locations.replicas()) {
+    ASSERT_NE(replica.ts_info().permanent_uuid(), followers[0]->uuid());
+    ASSERT_NE(replica.ts_info().permanent_uuid(), followers[1]->uuid());
+  }
+}
+
+// Test unsafe config change on a 5-replica tablet when the mulitple pending configs
+// on the surviving node.
+// 1. Instantiate external minicluster with 1 tablet having 5 replicas and 9 TS.
+// 2. Shut down all the followers.
+// 3. Trigger unsafe config changes on the surviving leader with those
+//    dead followers in the new config.
+// 4. Wait until the new config is populated on the master and the new leader.
+// 5. Verify that new config does not contain old followers.
+TEST_F(YBTsCliUnsafeChangeTest, TestUnsafeChangeConfigWithMultiplePendingConfigs) {
+  MonoDelta kTimeout = MonoDelta::FromSeconds(30);
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_num_tablet_servers) = 9;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_num_replicas) = 5;
+  // Retire the dead servers early with these settings.
+  std::vector<std::string> master_flags;
+  std::vector<std::string> ts_flags;
+  master_flags.push_back("--enable_load_balancing=true");
+  BuildAndStart(ts_flags, master_flags);
+
+  vector<TServerDetails*> tservers = TServerDetailsVector(tablet_servers_);
+  vector<ExternalTabletServer*> external_tservers;
+  for (TServerDetails* ts : tservers) {
+    external_tservers.push_back(cluster_->tablet_server_by_uuid(ts->uuid()));
+  }
+
+  // Determine the list of tablet servers currently in the config.
+  itest::TabletServerMapUnowned active_tablet_servers;
+  auto iter = tablet_replicas_.equal_range(tablet_id_);
+  for (auto it = iter.first; it != iter.second; ++it) {
+    InsertOrDie(&active_tablet_servers, it->second->uuid(), it->second);
+  }
+
+  // Get a baseline config reported to the master.
+  LOG(INFO) << "Waiting for Master to see the current replicas...";
+  master::TabletLocationsPB tablet_locations;
+  bool has_leader;
+  ASSERT_OK(itest::WaitForReplicasReportedToMaster(
+      cluster_.get(), 5, tablet_id_, kTimeout, itest::WAIT_FOR_LEADER, &has_leader,
+      &tablet_locations));
+  LOG(INFO) << "Tablet locations:\n" << yb::ToString(tablet_locations);
+  ASSERT_TRUE(has_leader) << yb::ToString(tablet_locations);
+
+  TServerDetails* leader_ts;
+  ASSERT_OK(FindTabletLeader(active_tablet_servers, tablet_id_, kTimeout, &leader_ts));
+  vector<TServerDetails*> followers;
+  for (const auto& elem : active_tablet_servers) {
+    if (elem.first == leader_ts->uuid()) {
+      continue;
+    }
+    followers.push_back(elem.second);
+    cluster_->tablet_server_by_uuid(elem.first)->Shutdown();
+  }
+  ASSERT_EQ(4, followers.size());
+
+  // Shutdown master to cleanup cache of dead servers from its list of candidate
+  // servers to trigger placement of new replicas on healthy servers when we restart later.
+  cluster_->master()->Shutdown();
+
+  const string& leader_addr = Substitute(
+      "$0:$1",
+      leader_ts->registration->common().private_rpc_addresses(0).host(),
+      leader_ts->registration->common().private_rpc_addresses(0).port());
+
+  // This should keep the multiple pending configs on the node since we are
+  // adding all the dead followers to the new config, and then eventually we write
+  // just one surviving node to the config.
+  // New config write sequences are: {ABCDE}, {ABCD}, {ABC}, {AB}, {A},
+  // A being the leader node where config is written and rest of the nodes are
+  // dead followers.
+  for (int num_replicas = static_cast<int>(followers.size()); num_replicas >= 0; num_replicas--) {
+    vector<string> peer_uuid_list;
+    peer_uuid_list.push_back(leader_ts->uuid());
+    for (int i = 0; i < num_replicas; i++) {
+      peer_uuid_list.push_back(followers[i]->uuid());
+    }
+    ASSERT_OK(RunUnsafeChangeConfig(this, tablet_id_, leader_addr, peer_uuid_list));
+  }
+
+  ASSERT_OK(WaitUntilCommittedConfigNumVotersIs(1, leader_ts, tablet_id_, kTimeout));
+  ASSERT_OK(cluster_->master()->Restart());
+
+  // Find a remaining node which will be picked for re-replication.
+  vector<TServerDetails*> all_tservers = TServerDetailsVector(tablet_servers_);
+  TServerDetails* new_node = nullptr;
+  for (TServerDetails* ts : all_tservers) {
+    if (!ContainsKey(active_tablet_servers, ts->uuid())) {
+      new_node = ts;
+      break;
+    }
+  }
+  ASSERT_TRUE(new_node != nullptr);
+
+  // Master may try to add the servers which are down until tserver_unresponsive_timeout_ms,
+  // so it is safer to wait until consensus metadata has 5 voters on new_node.
+  ASSERT_OK(WaitUntilCommittedConfigNumVotersIs(5, new_node, tablet_id_, kTimeout));
+
+  // Wait for the master to be notified of the config change.
+  LOG(INFO) << "Waiting for Master to see new config...";
+  ASSERT_OK(itest::WaitForReplicasReportedToMaster(
+      cluster_.get(), 5, tablet_id_, kTimeout, itest::WAIT_FOR_LEADER, &has_leader,
+      &tablet_locations));
+  LOG(INFO) << "Tablet locations:\n" << yb::ToString(tablet_locations);
+  for (const master::TabletLocationsPB_ReplicaPB& replica : tablet_locations.replicas()) {
+    // Verify that old followers aren't part of new config.
+    for (const auto& old_follower : followers) {
+      ASSERT_NE(replica.ts_info().permanent_uuid(), old_follower->uuid());
+    }
+  }
+}
+
+// Flush / Compact CLI tests
+
+TEST_F_EX(YBTsCliTest, FlushTablet, YBTsCliIntegrationTest) {
+  ASSERT_NO_FATALS(BuildAndStart());
+  ASSERT_OK(CallTSCli("flush_tablet", tablet_id_));
+}
+
+TEST_F_EX(YBTsCliTest, CompactTablet, YBTsCliIntegrationTest) {
+  ASSERT_NO_FATALS(BuildAndStart());
+  ASSERT_OK(CallTSCli("compact_tablet", tablet_id_));
+}
+
+TEST_F_EX(YBTsCliTest, FlushAllTablets, YBTsCliIntegrationTest) {
+  ASSERT_NO_FATALS(BuildAndStart());
+  ASSERT_OK(CallTSCli("flush_all_tablets"));
+}
+
+TEST_F_EX(YBTsCliTest, CompactAllTablets, YBTsCliIntegrationTest) {
+  ASSERT_NO_FATALS(BuildAndStart());
+  ASSERT_OK(CallTSCli("compact_all_tablets"));
+}
+
+TEST_F_EX(YBTsCliTest, CompactTabletExcludeVectorIndexes, YBTsCliIntegrationTest) {
+  ASSERT_NO_FATALS(BuildAndStart());
+  ASSERT_OK(CallTSCli("--exclude_vector_indexes", "compact_tablet", tablet_id_));
+}
+
+TEST_F_EX(YBTsCliTest, CompactAllTabletsExcludeVectorIndexes, YBTsCliIntegrationTest) {
+  ASSERT_NO_FATALS(BuildAndStart());
+  ASSERT_OK(CallTSCli("--exclude_vector_indexes", "compact_all_tablets"));
+}
+
+TEST_F_EX(YBTsCliTest, FlushTabletExcludeVectorIndexesRejected, YBTsCliIntegrationTest) {
+  ASSERT_NO_FATALS(BuildAndStart());
+  auto result = CallTSCli("--exclude_vector_indexes", "flush_tablet", tablet_id_);
+  ASSERT_NOK(result);
+  ASSERT_STR_CONTAINS(result.status().ToString(), "exclude-vector-indexes");
+}
+
+TEST_F_EX(YBTsCliTest, TestDumpTabletData, YBTsCliIntegrationTest) {
+  ASSERT_NO_FATALS(BuildAndStart());
+
+  TestYcqlWorkload workload(cluster_.get());
+  workload.Setup();
+  workload.set_table_name(kTableName);
+  workload.set_num_write_threads(1);
+  workload.set_write_batch_size(1);
+  workload.Start();
+  workload.WaitInserted(10);
+  workload.StopAndJoin();
+
+  const auto file_path =
+      JoinPathSegments(GetTestDataDirectory(), Format("dump_$0.txt", tablet_id_));
+
+  std::vector<std::string> basic_argv = {
+      GetTsCliToolPath(), "--server_address",
+      yb::ToString(cluster_->tablet_server(0)->bound_rpc_addr()), "dump_tablet_data", tablet_id_};
+  auto argv = basic_argv;
+  argv.push_back(file_path);
+
+  std::string output;
+  ASSERT_OK(Subprocess::Call(argv, &output));
+  LOG(INFO) << "Output: " << output;
+
+  const auto row_count_prefix = "Row count: ";
+  auto row_count =
+      std::stoull(output.substr(output.find(row_count_prefix) + strlen(row_count_prefix)));
+
+  auto env = Env::Default();
+  faststring file_contents;
+  ASSERT_OK(ReadFileToString(env, file_path, &file_contents));
+  auto string_contents = file_contents.ToString();
+  LOG(INFO) << "File contents: " << string_contents;
+  uint64_t payload_count = 0;
+  size_t pos = string_contents.find(TestWorkloadOptions::kDefaultPayload, 0);
+
+  while (pos != std::string::npos) {
+    payload_count++;
+    pos = string_contents.find(
+        TestWorkloadOptions::kDefaultPayload, pos + TestWorkloadOptions::kDefaultPayload.length());
+  }
+  ASSERT_EQ(payload_count, row_count);
+}
+
+namespace {
+
+// The hybrid time for "now", from this machine's wall clock.
+uint64_t NowHybridTime(MonoDelta offset = MonoDelta::kZero) {
+  return HybridTime::FromMicros(DateTime::TimestampNow().ToInt64() + offset.ToMicroseconds())
+      .ToUint64();
+}
+
+// Pulls one of dump_tablet_data's "<prefix>: <number>" output lines out of its stdout.
+Result<uint64_t> ExtractDumpValue(const std::string& output, const std::string& prefix) {
+  auto pos = output.find(prefix);
+  SCHECK_NE(
+      pos, std::string::npos, NotFound, Format("'$0' missing from output: $1", prefix, output));
+  return std::stoull(output.substr(pos + prefix.size()));
+}
+
+}  // namespace
+
+// Tests for dump_tablet_data against a replica that has not reached the requested read time. It
+// must report the shortfall rather than hash only what it has applied.
+class YBTsCliDumpReadTimeTest : public YBTsCliIntegrationTest {
+ protected:
+  const MonoDelta kTimeout = MonoDelta::FromSeconds(30);
+
+  // Brings up the cluster with a populated tablet and resolves its leader and followers.
+  void StartClusterWithData() {
+    ASSERT_NO_FATALS(BuildAndStart());
+
+    TestYcqlWorkload workload(cluster_.get());
+    workload.Setup();
+    workload.set_table_name(kTableName);
+    workload.set_num_write_threads(1);
+    workload.set_write_batch_size(1);
+    workload.Start();
+    workload.WaitInserted(10);
+    workload.StopAndJoin();
+
+    auto range = tablet_replicas_.equal_range(tablet_id_);
+    for (auto it = range.first; it != range.second; ++it) {
+      InsertOrDie(&active_tablet_servers_, it->second->uuid(), it->second);
+    }
+    ASSERT_OK(FindTabletLeader(active_tablet_servers_, tablet_id_, kTimeout, &leader_));
+    ASSERT_OK(FindTabletFollowers(active_tablet_servers_, tablet_id_, kTimeout, &followers_));
+    ASSERT_FALSE(followers_.empty());
+  }
+
+  ExternalTabletServer* Server(TServerDetails* details) {
+    return cluster_->tablet_server_by_uuid(details->uuid());
+  }
+
+  // Runs `dump_tablet_data <tablet_id> HASH_ONLY <read_ht>` against one replica. read_ht 0 sends no
+  // read time; a nullopt read_time_wait_ms sends no bound.
+  Result<std::string> DumpHash(
+      TServerDetails* target, uint64_t read_ht, std::optional<uint32_t> read_time_wait_ms,
+      std::optional<int64_t> rpc_timeout_ms = std::nullopt) {
+    std::vector<std::string> argv = {
+        GetTsCliToolPath(), "-server_address", yb::ToString(Server(target)->bound_rpc_addr())};
+    if (read_time_wait_ms) {
+      argv.push_back(Format("-read_time_wait_ms=$0", *read_time_wait_ms));
+    }
+    if (rpc_timeout_ms) {
+      argv.push_back(Format("-timeout_ms=$0", *rpc_timeout_ms));
+    }
+    argv.insert(
+        argv.end(), {"dump_tablet_data", tablet_id_, "HASH_ONLY", std::to_string(read_ht)});
+    return CallAdminVec(argv);
+  }
+
+  // Same dump over the RPC, where the structured error is visible.
+  Result<tserver::DumpTabletDataResponsePB> DumpViaRpc(
+      TServerDetails* target, uint64_t read_ht, std::optional<uint32_t> max_wait_ms,
+      std::optional<MonoDelta> rpc_timeout = std::nullopt) {
+    tserver::DumpTabletDataRequestPB req;
+    tserver::DumpTabletDataResponsePB resp;
+    rpc::RpcController rpc;
+    rpc.set_timeout(rpc_timeout.value_or(kTimeout));
+    req.set_tablet_id(tablet_id_);
+    if (read_ht) {
+      req.set_read_ht(read_ht);
+    }
+    if (max_wait_ms) {
+      req.set_max_wait_ms(*max_wait_ms);
+    }
+    RETURN_NOT_OK(target->tserver_proxy->DumpTabletData(req, &resp, &rpc));
+    return resp;
+  }
+
+  // The bound a dump waits under when the request does not carry one of its own.
+  Status SetServerWaitBound(TServerDetails* target, int64_t wait_ms) {
+    return cluster_->SetFlag(
+        Server(target), "dump_tablet_data_max_read_time_wait_ms", std::to_string(wait_ms));
+  }
+
+  // How far ahead of the server's clock a read time may be before it is rejected outright.
+  Status SetServerMaxReadTimeAhead(TServerDetails* target, int64_t ahead_ms) {
+    return cluster_->SetFlag(
+        Server(target), "dump_tablet_data_max_read_time_ahead_ms", std::to_string(ahead_ms));
+  }
+
+  // Freezes a follower's safe time. The leader keeps its majority through the other follower, so
+  // the group makes progress and the frozen replica falls behind.
+  Status SetFollowerFrozen(TServerDetails* follower, bool frozen) {
+    return cluster_->SetFlag(
+        Server(follower), "TEST_follower_reject_update_consensus_requests",
+        frozen ? "true" : "false");
+  }
+
+  // Freezes a follower, then pauses so a read time taken afterwards is clearly past its safe time.
+  void FreezeAndLetFallBehind(TServerDetails* follower) {
+    ASSERT_OK(SetFollowerFrozen(follower, true));
+    SleepFor(MonoDelta::FromSeconds(2) * kTimeMultiplier);
+  }
+
+  itest::TabletServerMapUnowned active_tablet_servers_;
+  TServerDetails* leader_ = nullptr;
+  std::vector<TServerDetails*> followers_;
+};
+
+// A read time every replica has passed is answered right away, and they agree on the hash.
+TEST_F_EX(YBTsCliTest, DumpTabletDataReadTimeAlreadySafe, YBTsCliDumpReadTimeTest) {
+  ASSERT_NO_FATALS(StartClusterWithData());
+
+  const auto read_ht = NowHybridTime();
+  const auto leader_output = ASSERT_RESULT(DumpHash(leader_, read_ht, std::nullopt));
+  const auto leader_hash = ASSERT_RESULT(ExtractDumpValue(leader_output, "XOR hash: "));
+  const auto leader_rows = ASSERT_RESULT(ExtractDumpValue(leader_output, "Row count: "));
+
+  for (auto* follower : followers_) {
+    const auto output = ASSERT_RESULT(DumpHash(follower, read_ht, std::nullopt));
+    ASSERT_EQ(ASSERT_RESULT(ExtractDumpValue(output, "XOR hash: ")), leader_hash);
+    ASSERT_EQ(ASSERT_RESULT(ExtractDumpValue(output, "Row count: ")), leader_rows);
+  }
+}
+
+// With a wait of zero, a replica behind the read time reports the shortfall instead of answering
+// with a partial view.
+TEST_F_EX(YBTsCliTest, DumpTabletDataReadTimeNotReachedFailsFast, YBTsCliDumpReadTimeTest) {
+  ASSERT_NO_FATALS(StartClusterWithData());
+
+  auto* lagging = followers_[0];
+  ASSERT_NO_FATALS(FreezeAndLetFallBehind(lagging));
+
+  const auto read_ht = NowHybridTime();
+  const auto start = MonoTime::Now();
+  const auto result = DumpHash(lagging, read_ht, /* read_time_wait_ms= */ 0);
+  ASSERT_NOK(result);
+  const auto message = result.status().ToString();
+  ASSERT_STR_CONTAINS(message, "is not yet safe on this replica");
+  ASSERT_STR_CONTAINS(message, "behind by");
+  // A wait of zero means exactly that.
+  ASSERT_LT(MonoTime::Now() - start, MonoDelta::FromSeconds(10) * kTimeMultiplier);
+
+  // The leader, which is caught up, still answers for the same read time.
+  ASSERT_RESULT(DumpHash(leader_, read_ht, std::nullopt));
+}
+
+// Given time to wait, a replica that is behind catches up and answers instead of failing. Waiting
+// is the default: callers ask for "now", which safe time always trails.
+TEST_F_EX(YBTsCliTest, DumpTabletDataWaitsForReadTime, YBTsCliDumpReadTimeTest) {
+  ASSERT_NO_FATALS(StartClusterWithData());
+
+  auto* lagging = followers_[0];
+  ASSERT_NO_FATALS(FreezeAndLetFallBehind(lagging));
+  const auto read_ht = NowHybridTime();
+
+  // Unfreeze only after the dump is in flight, so the request has to wait rather than find the
+  // replica caught up on the first look.
+  TestThreadHolder thread_holder;
+  thread_holder.AddThreadFunctor([this, lagging] {
+    SleepFor(MonoDelta::FromSeconds(2) * kTimeMultiplier);
+    EXPECT_OK(SetFollowerFrozen(lagging, false));
+  });
+
+  const auto output = ASSERT_RESULT(DumpHash(lagging, read_ht, /* read_time_wait_ms= */ 60000));
+  thread_holder.JoinAll();
+
+  // Having waited, it answers for read_ht with the same data the leader reports.
+  const auto leader_output = ASSERT_RESULT(DumpHash(leader_, read_ht, std::nullopt));
+  ASSERT_EQ(
+      ASSERT_RESULT(ExtractDumpValue(output, "XOR hash: ")),
+      ASSERT_RESULT(ExtractDumpValue(leader_output, "XOR hash: ")));
+}
+
+// A read time far beyond the server's clock is a caller mistake, not replica lag.
+// dump_tablet_data_max_read_time_ahead_ms alone decides that, so neither the requested wait nor
+// --timeout_ms can change the answer.
+TEST_F_EX(YBTsCliTest, DumpTabletDataReadTimeTooFarInFuture, YBTsCliDumpReadTimeTest) {
+  ASSERT_NO_FATALS(StartClusterWithData());
+
+  // Set explicitly, so this case does not move with the flag's default.
+  ASSERT_OK(SetServerMaxReadTimeAhead(leader_, 10000));
+  // Well past that, yet well inside every timeout below.
+  const auto kGap = MonoDelta::FromSeconds(60);
+
+  // Waits and RPC timeouts either side of each other, scaled together so their ordering holds under
+  // sanitizers. The last two cases are where a deadline-relative or a wait-relative rule would give
+  // the retryable error instead.
+  const std::pair<uint32_t, int64_t> kCases[] = {
+      {1000, 5000}, {1000, 60000}, {10000, 5000}, {0, 30000}};
+  for (const auto& [wait_ms, rpc_timeout_ms] : kCases) {
+    const auto start = MonoTime::Now();
+    const auto result = DumpHash(
+        leader_, NowHybridTime(kGap), wait_ms * kTimeMultiplier,
+        rpc_timeout_ms * kTimeMultiplier);
+    SCOPED_TRACE(Format("wait_ms: $0, rpc_timeout_ms: $1", wait_ms, rpc_timeout_ms));
+    ASSERT_NOK(result);
+    ASSERT_STR_CONTAINS(result.status().ToString(), "ahead of this server's clock");
+    ASSERT_STR_NOT_CONTAINS(result.status().ToString(), "is not yet safe on this replica");
+    // Rejected on sight, without sitting out even the wait it asked for.
+    ASSERT_LT(MonoTime::Now() - start, MonoDelta::FromSeconds(30) * kTimeMultiplier);
+  }
+
+  // The error code says permanent, so a caller retrying on READ_TIME_NOT_REACHED stops.
+  const auto resp = ASSERT_RESULT(DumpViaRpc(leader_, NowHybridTime(kGap), /* max_wait_ms= */ 0));
+  ASSERT_TRUE(resp.has_error()) << resp.ShortDebugString();
+  ASSERT_NE(resp.error().code(), tserver::TabletServerErrorPB::READ_TIME_NOT_REACHED);
+  ASSERT_TRUE(StatusFromPB(resp.error().status()).IsInvalidArgument())
+      << StatusFromPB(resp.error().status());
+}
+
+// A read time the clock will reach shortly is ordinary lag, however short the wait. It stays
+// retryable. Only a gap past dump_tablet_data_max_read_time_ahead_ms is a caller mistake.
+TEST_F_EX(YBTsCliTest, DumpTabletDataReadTimeModestlyInFuture, YBTsCliDumpReadTimeTest) {
+  ASSERT_NO_FATALS(StartClusterWithData());
+
+  ASSERT_OK(SetServerMaxReadTimeAhead(leader_, 60000));
+  // Inside that, so not a caller mistake. Past both waits below, so not yet safe either.
+  const auto kGap = MonoDelta::FromSeconds(10);
+
+  for (const uint32_t wait_ms : {0, 1000}) {
+    const auto result = DumpHash(leader_, NowHybridTime(kGap), wait_ms);
+    SCOPED_TRACE(Format("wait_ms: $0", wait_ms));
+    ASSERT_NOK(result);
+    ASSERT_STR_CONTAINS(result.status().ToString(), "is not yet safe on this replica");
+    ASSERT_STR_NOT_CONTAINS(result.status().ToString(), "ahead of this server's clock");
+  }
+
+  const auto resp = ASSERT_RESULT(DumpViaRpc(leader_, NowHybridTime(kGap), /* max_wait_ms= */ 0));
+  ASSERT_TRUE(resp.has_error()) << resp.ShortDebugString();
+  ASSERT_EQ(resp.error().code(), tserver::TabletServerErrorPB::READ_TIME_NOT_REACHED);
+  ASSERT_TRUE(StatusFromPB(resp.error().status()).IsTryAgain())
+      << StatusFromPB(resp.error().status());
+}
+
+// A dump with no read time reads at the replica's own safe time, so it must neither wait nor fail.
+// That holds on a frozen replica and with a zero wait: the wait only governs an explicit read time.
+TEST_F_EX(YBTsCliTest, DumpTabletDataWithoutReadTimeNeverWaits, YBTsCliDumpReadTimeTest) {
+  ASSERT_NO_FATALS(StartClusterWithData());
+
+  auto* lagging = followers_[0];
+  // Leaves this replica behind the present, so a dump that compared against the present would wait.
+  ASSERT_NO_FATALS(FreezeAndLetFallBehind(lagging));
+
+  const auto start = MonoTime::Now();
+
+  auto output = ASSERT_RESULT(DumpHash(lagging, /* read_ht= */ 0, std::nullopt));
+  // Only safe time is frozen, so the replica still hashes the data it holds. Not compared against
+  // the leader: without an explicit read time each answers at its own safe time.
+  ASSERT_GT(ASSERT_RESULT(ExtractDumpValue(output, "Row count: ")), 0ULL);
+
+  output = ASSERT_RESULT(DumpHash(lagging, /* read_ht= */ 0, /* read_time_wait_ms= */ 0));
+  ASSERT_GT(ASSERT_RESULT(ExtractDumpValue(output, "Row count: ")), 0ULL);
+
+  // Neither call had anything to wait for.
+  ASSERT_LT(MonoTime::Now() - start, MonoDelta::FromSeconds(30) * kTimeMultiplier);
+
+  // The caught-up leader behaves the same way, wait bound or not.
+  ASSERT_RESULT(DumpHash(leader_, /* read_ht= */ 0, /* read_time_wait_ms= */ 0));
+}
+
+// The wait a request asks for is the wait it gets. A replica that stays behind fails on that
+// schedule, not at the RPC deadline.
+TEST_F_EX(YBTsCliTest, DumpTabletDataReadTimeWaitBoundedByRequest, YBTsCliDumpReadTimeTest) {
+  ASSERT_NO_FATALS(StartClusterWithData());
+
+  auto* lagging = followers_[0];
+  // Park the server-side default above both the bound under test and the RPC deadline. Only the
+  // bound the request carries can then end the wait early.
+  ASSERT_OK(SetServerWaitBound(lagging, 120000));
+  ASSERT_NO_FATALS(FreezeAndLetFallBehind(lagging));
+
+  constexpr uint32_t kWaitMs = 1000;
+  const auto start = MonoTime::Now();
+  auto result = DumpHash(lagging, NowHybridTime(), kWaitMs);
+  const auto elapsed = MonoTime::Now() - start;
+  ASSERT_NOK(result);
+  // An unrelated failure could take about the right amount of time.
+  ASSERT_STR_CONTAINS(result.status().ToString(), "is not yet safe on this replica");
+
+  // Well short of the 120s server default and the 60s RPC deadline, either of which would apply if
+  // the request's bound were dropped. Not scaled by kTimeMultiplier: the server's wait is
+  // wall-clock.
+  ASSERT_GE(elapsed, MonoDelta::FromMilliseconds(kWaitMs) / 2);
+  ASSERT_LT(elapsed, MonoDelta::FromSeconds(30));
+}
+
+// A wait far beyond the RPC deadline is clamped to it, less dump_tablet_data_deadline_margin_ms.
+// The margin is what lets the caller see the shortfall instead of a generic RPC timeout.
+TEST_F_EX(YBTsCliTest, DumpTabletDataReadTimeWaitClampedToDeadline, YBTsCliDumpReadTimeTest) {
+  ASSERT_NO_FATALS(StartClusterWithData());
+
+  auto* lagging = followers_[0];
+  // As above, park the server-side default out of the way. Only the deadline can then end the wait
+  // before the ten minutes the request asks for.
+  ASSERT_OK(SetServerWaitBound(lagging, 120000));
+  ASSERT_NO_FATALS(FreezeAndLetFallBehind(lagging));
+
+  constexpr int64_t kRpcTimeoutMs = 5000;
+  auto start = MonoTime::Now();
+  const auto result = DumpHash(
+      lagging, NowHybridTime(), /* read_time_wait_ms= */ 600000, kRpcTimeoutMs);
+  auto elapsed = MonoTime::Now() - start;
+  ASSERT_NOK(result);
+  ASSERT_STR_CONTAINS(result.status().ToString(), "is not yet safe on this replica");
+  // It waited out most of the 5s deadline rather than the ten minutes it asked for. The lower
+  // bound also rules out a margin so wide the wait never happens.
+  ASSERT_GE(elapsed, MonoDelta::FromSeconds(2));
+  ASSERT_LT(elapsed, MonoDelta::FromSeconds(20));
+
+  // The same over the RPC, where the error code is visible.
+  start = MonoTime::Now();
+  const auto resp = ASSERT_RESULT(DumpViaRpc(
+      lagging, NowHybridTime(), /* max_wait_ms= */ 600000,
+      MonoDelta::FromMilliseconds(kRpcTimeoutMs)));
+  elapsed = MonoTime::Now() - start;
+  ASSERT_TRUE(resp.has_error()) << resp.ShortDebugString();
+  ASSERT_EQ(resp.error().code(), tserver::TabletServerErrorPB::READ_TIME_NOT_REACHED);
+  ASSERT_GE(elapsed, MonoDelta::FromSeconds(2));
+  ASSERT_LT(elapsed, MonoDelta::FromSeconds(20));
+}
+
+// A request that carries no bound of its own is governed by the server's
+// dump_tablet_data_max_read_time_wait_ms. The CLI always sends a bound, so this goes over the RPC.
+TEST_F_EX(YBTsCliTest, DumpTabletDataReadTimeWaitBoundedByServerDefault, YBTsCliDumpReadTimeTest) {
+  ASSERT_NO_FATALS(StartClusterWithData());
+
+  auto* lagging = followers_[0];
+  ASSERT_OK(SetServerWaitBound(lagging, 1000));
+  ASSERT_NO_FATALS(FreezeAndLetFallBehind(lagging));
+
+  auto start = MonoTime::Now();
+  auto resp = ASSERT_RESULT(DumpViaRpc(lagging, NowHybridTime(), /* max_wait_ms= */ std::nullopt));
+  auto elapsed = MonoTime::Now() - start;
+  ASSERT_TRUE(resp.has_error()) << resp.ShortDebugString();
+  ASSERT_EQ(resp.error().code(), tserver::TabletServerErrorPB::READ_TIME_NOT_REACHED);
+  // Ignoring the flag returns the same error code, just after the 30s RPC deadline, so only the
+  // elapsed time tells the two apart. Not scaled by kTimeMultiplier: that would put the bound back
+  // above the deadline.
+  ASSERT_GE(elapsed, MonoDelta::FromMilliseconds(500));
+  ASSERT_LT(elapsed, MonoDelta::FromSeconds(10));
+
+  // Zero on the server means the same fail-fast that zero in the request does.
+  ASSERT_OK(SetServerWaitBound(lagging, 0));
+  start = MonoTime::Now();
+  resp = ASSERT_RESULT(DumpViaRpc(lagging, NowHybridTime(), /* max_wait_ms= */ std::nullopt));
+  elapsed = MonoTime::Now() - start;
+  ASSERT_TRUE(resp.has_error()) << resp.ShortDebugString();
+  ASSERT_EQ(resp.error().code(), tserver::TabletServerErrorPB::READ_TIME_NOT_REACHED);
+  // Nothing to wait for at zero, so this is round-trip time. A bound as loose as the one above
+  // would pass even if zero started waiting.
+  ASSERT_LT(elapsed, MonoDelta::FromSeconds(3));
+}
+
+// The failure is structured, not just prose: TryAgain plus READ_TIME_NOT_REACHED is how a caller
+// tells "this replica is behind" from "these replicas have diverged".
+TEST_F_EX(YBTsCliTest, DumpTabletDataReadTimeNotReachedErrorCode, YBTsCliDumpReadTimeTest) {
+  ASSERT_NO_FATALS(StartClusterWithData());
+
+  auto* lagging = followers_[0];
+  ASSERT_NO_FATALS(FreezeAndLetFallBehind(lagging));
+
+  const auto read_ht = NowHybridTime();
+  const auto resp = ASSERT_RESULT(DumpViaRpc(lagging, read_ht, /* max_wait_ms= */ 0));
+  ASSERT_TRUE(resp.has_error()) << resp.ShortDebugString();
+  ASSERT_EQ(resp.error().code(), tserver::TabletServerErrorPB::READ_TIME_NOT_REACHED);
+  const auto status = StatusFromPB(resp.error().status());
+  ASSERT_TRUE(status.IsTryAgain()) << status;
+
+  // Everything a consistency checker keys off: the requested time, where this replica stood, the
+  // gap, and how long it waited. Labels only: the hybrid times render differently per build.
+  const auto message = status.ToString();
+  ASSERT_STR_CONTAINS(message, "Requested read time");
+  ASSERT_STR_CONTAINS(message, "is not yet safe on this replica");
+  ASSERT_STR_CONTAINS(message, "safe time");
+  ASSERT_STR_CONTAINS(message, "behind by");
+  ASSERT_STR_CONTAINS(message, "waited");
+
+  // The caught-up leader answers the same read time, so the error above is about that replica. It
+  // sends no bound: safe time trails the present even on a healthy leader.
+  const auto leader_resp = ASSERT_RESULT(DumpViaRpc(leader_, read_ht, std::nullopt));
+  ASSERT_FALSE(leader_resp.has_error()) << leader_resp.ShortDebugString();
+  ASSERT_GT(leader_resp.row_count(), 0ULL);
+}
+
+} // namespace tools
+} // namespace yb

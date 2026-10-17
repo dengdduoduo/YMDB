@@ -1,0 +1,104 @@
+{
+  "db": "yb",
+  "dataset": "ds200",
+  "num_queries": 10,
+  "tservers": 1,
+  "import_time_s": 3.362301826477051,
+  "times_ms": [
+    285.3434085845947,
+    215.88540077209473,
+    205.61814308166504,
+    228.86419296264648,
+    287.26673126220703,
+    197.38507270812988,
+    207.57651329040527,
+    224.18761253356934,
+    195.79648971557617,
+    196.89679145812988
+  ],
+  "errors": [],
+  "row_counts": [
+    19,
+    8,
+    0,
+    15,
+    200,
+    20,
+    11,
+    8,
+    24,
+    10
+  ],
+  "details": [
+    {
+      "id": 655,
+      "template": "RND_UNION",
+      "category": "Random UNION",
+      "time_ms": 285.3434085845947
+    },
+    {
+      "id": 115,
+      "template": "RND_LIMIT",
+      "category": "Random LIMIT",
+      "time_ms": 215.88540077209473
+    },
+    {
+      "id": 26,
+      "template": "RND_JOIN",
+      "category": "Random Join",
+      "time_ms": 205.61814308166504
+    },
+    {
+      "id": 282,
+      "template": "RND_LIMIT",
+      "category": "Random LIMIT",
+      "time_ms": 228.86419296264648
+    },
+    {
+      "id": 251,
+      "template": "RND_ORDER_DESC",
+      "category": "Random ORDER",
+      "time_ms": 287.26673126220703
+    },
+    {
+      "id": 229,
+      "template": "RND_UNION",
+      "category": "Random UNION",
+      "time_ms": 197.38507270812988
+    },
+    {
+      "id": 143,
+      "template": "RND_FILTER_sameTerm",
+      "category": "Random FILTER",
+      "time_ms": 207.57651329040527
+    },
+    {
+      "id": 105,
+      "template": "RND_FILTER_eq",
+      "category": "Random FILTER",
+      "time_ms": 224.18761253356934
+    },
+    {
+      "id": 559,
+      "template": "RND_UNION",
+      "category": "Random UNION",
+      "time_ms": 195.79648971557617
+    },
+    {
+      "id": 90,
+      "template": "RND_PATH_inverse",
+      "category": "Random Path",
+      "time_ms": 196.89679145812988
+    }
+  ],
+  "stats": {
+    "count": 10,
+    "min": 195.79648971557617,
+    "max": 287.26673126220703,
+    "mean": 224.48203563690186,
+    "p50": 211.73095703125,
+    "p90": 285.53574085235596,
+    "p95": 286.4012360572815,
+    "p99": 287.0936322212219
+  }
+}

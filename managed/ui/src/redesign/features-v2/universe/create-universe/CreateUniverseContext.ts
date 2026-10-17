@@ -1,0 +1,254 @@
+/*
+ * Created on Tue Mar 25 2025
+ *
+ * Copyright 2021 YugabyteDB, Inc. and Contributors
+ * Licensed under the Polyform Free Trial License 1.0.0 (the "License")
+ * You may not use this file except in compliance with the License. You may obtain a copy of the License at
+ * http://github.com/YugaByte/yugabyte-db/blob/master/licenses/POLYFORM-FREE-TRIAL-LICENSE-1.0.0.txt
+ */
+
+import { createContext } from 'react';
+import { GeneralSettingsProps } from './steps/general-settings/dtos';
+import {
+  FaultToleranceType,
+  ResilienceAndRegionsProps,
+  ResilienceFormMode,
+  ResilienceType
+} from './steps/resilence-regions/dtos';
+import { NodeAvailabilityProps } from './steps/nodes-availability/dtos';
+import { InstanceSettingProps } from './steps/hardware-settings/dtos';
+import { DatabaseSettingsProps } from './steps/database-settings/dtos';
+import { CertType, SecuritySettingsProps } from './steps/security-settings/dtos';
+import { OtherAdvancedProps, ProxyAdvancedProps } from './steps/advanced-settings/dtos';
+import {
+  FAULT_TOLERANCE_TYPE,
+  NODE_COUNT,
+  REGIONS_FIELD,
+  RESILIENCE_FACTOR,
+  RESILIENCE_FORM_MODE,
+  RESILIENCE_TYPE
+} from './fields/FieldNames';
+import { ArchitectureType } from '@app/components/configRedesign/providerRedesign/constants';
+import { CloudType } from '@app/redesign/helpers/dtos';
+import { DEFAULT_COMMUNICATION_PORTS } from './helpers/constants';
+import {
+  applyConnectionPoolingPortsToAdvanced,
+  applyConnectionPoolingPortsToDatabase,
+  clearConnectionPoolingPortOverrides,
+  DEFAULT_CONNECTION_POOLING_PORTS,
+  resolveConnectionPoolingPorts,
+  shouldSyncConnectionPoolingPorts
+} from './helpers/syncConnectionPoolingPorts';
+
+export enum CreateUniverseSteps {
+  GENERAL_SETTINGS = 1,
+  RESILIENCE_AND_REGIONS = 2,
+  NODES_AVAILABILITY = 3,
+  INSTANCE = 4,
+  DATABASE = 5,
+  SECURITY = 6,
+  ADVANCED_PROXY = 7,
+  ADVANCED_OTHER = 8,
+  REVIEW = 9
+}
+
+export type createUniverseFormProps = {
+  activeStep: number;
+  generalSettings?: GeneralSettingsProps;
+  resilienceAndRegionsSettings?: ResilienceAndRegionsProps;
+  nodesAvailabilitySettings?: NodeAvailabilityProps;
+  instanceSettings?: InstanceSettingProps;
+  databaseSettings?: DatabaseSettingsProps;
+  securitySettings?: SecuritySettingsProps;
+  proxySettings?: ProxyAdvancedProps;
+  otherAdvancedSettings?: OtherAdvancedProps;
+  resilienceType?: ResilienceType;
+};
+
+export const initialCreateUniverseFormState: createUniverseFormProps = {
+  activeStep: CreateUniverseSteps.GENERAL_SETTINGS,
+  resilienceAndRegionsSettings: {
+    [RESILIENCE_TYPE]: ResilienceType.REGULAR,
+    [RESILIENCE_FORM_MODE]: ResilienceFormMode.GUIDED,
+    [REGIONS_FIELD]: [],
+    [RESILIENCE_FACTOR]: 1,
+    [FAULT_TOLERANCE_TYPE]: FaultToleranceType.AZ_LEVEL,
+    [NODE_COUNT]: 1
+  },
+  nodesAvailabilitySettings: {
+    availabilityZones: {},
+    useDedicatedNodes: false
+  },
+  databaseSettings: {
+    ysql: {
+      enable: true,
+      enable_auth: false,
+      password: ''
+    },
+    ycql: {
+      enable: true,
+      enable_auth: false,
+      password: ''
+    },
+    gFlags: [],
+    enableConnectionPooling: false,
+    overrideCPPorts: false,
+    ...DEFAULT_CONNECTION_POOLING_PORTS,
+    enablePGCompatibitilty: false
+  },
+  instanceSettings: {
+    arch: ArchitectureType.X86_64,
+    imageBundleUUID: '',
+    useSpotInstance: false,
+    instanceType: null,
+    masterInstanceType: null,
+    deviceInfo: null,
+    masterDeviceInfo: null,
+    tserverK8SNodeResourceSpec: null,
+    masterK8SNodeResourceSpec: null,
+    keepMasterTserverSame: true,
+    enableEbsVolumeEncryption: false,
+    ebsKmsConfigUUID: null
+  },
+  securitySettings: {
+    enableClientToNodeEncryption: true,
+    enableNodeToNodeEncryption: true,
+    enableIPV6: false,
+    enableExposingService: false,
+    assignPublicIP: false
+  },
+  resilienceType: ResilienceType.REGULAR,
+  proxySettings: {
+    enableProxyServer: false,
+    secureWebProxy: false,
+    secureWebProxyServer: '',
+    secureWebProxyPort: undefined,
+    webProxy: false,
+    webProxyServer: '',
+    webProxyPort: undefined,
+    byPassProxyList: false,
+    byPassProxyListValues: []
+  },
+  otherAdvancedSettings: {
+    ...(DEFAULT_COMMUNICATION_PORTS as any),
+    instanceTags: [],
+    awsArnString: '',
+    useSystemd: true,
+    accessKeyCode: '',
+    universeOverrides: '',
+    azOverrides: {}
+  }
+};
+
+export const CreateUniverseContext = createContext<createUniverseFormProps>(
+  initialCreateUniverseFormState
+);
+
+export const createUniverseFormMethods = (context: createUniverseFormProps) => ({
+  moveToNextPage: () => ({
+    ...context,
+    activeStep: context.activeStep + 1
+  }),
+  moveToPreviousPage: () => ({
+    ...context,
+    activeStep: Math.max(context.activeStep - 1, 1)
+  }),
+  setActiveStep: (step: CreateUniverseSteps) => ({
+    ...context,
+    activeStep: step
+  }),
+  saveGeneralSettings: (data: GeneralSettingsProps) => ({
+    ...context,
+    generalSettings: data
+  }),
+  saveResilienceAndRegionsSettings: (data: ResilienceAndRegionsProps) => ({
+    ...context,
+    resilienceAndRegionsSettings: data
+  }),
+  saveNodesAvailabilitySettings: (data: NodeAvailabilityProps) => ({
+    ...context,
+    nodesAvailabilitySettings: data
+  }),
+  saveInstanceSettings: (data: InstanceSettingProps) => ({
+    ...context,
+    instanceSettings: data
+  }),
+  saveDatabaseSettings: (data: DatabaseSettingsProps) => {
+    const providerCode =
+      context.generalSettings?.providerConfiguration?.code ?? context.generalSettings?.cloud;
+    // K8s cannot override ports — clear any stale override state.
+    const databaseSettings =
+      providerCode === CloudType.kubernetes ? clearConnectionPoolingPortOverrides(data) : data;
+    let otherAdvancedSettings = context.otherAdvancedSettings;
+
+    if (shouldSyncConnectionPoolingPorts(providerCode)) {
+      // YSQL always syncs. Internal YSQL syncs while CP is on; otherwise it is the default.
+      otherAdvancedSettings = applyConnectionPoolingPortsToAdvanced(
+        otherAdvancedSettings,
+        resolveConnectionPoolingPorts(databaseSettings, databaseSettings.enableConnectionPooling)
+      );
+    } else if (otherAdvancedSettings) {
+      otherAdvancedSettings = {
+        ...otherAdvancedSettings,
+        ...DEFAULT_CONNECTION_POOLING_PORTS
+      };
+    }
+
+    return {
+      ...context,
+      databaseSettings,
+      otherAdvancedSettings
+    };
+  },
+  saveSecuritySettings: (data: SecuritySettingsProps) => ({
+    ...context,
+    securitySettings: data
+  }),
+  saveProxySettings: (data: ProxyAdvancedProps) => ({
+    ...context,
+    proxySettings: data
+  }),
+  saveOtherAdvancedSettings: (data: OtherAdvancedProps) => {
+    const providerCode =
+      context.generalSettings?.providerConfiguration?.code ?? context.generalSettings?.cloud;
+    const syncedPorts = resolveConnectionPoolingPorts(
+      data,
+      context.databaseSettings?.enableConnectionPooling
+    );
+    // K8s hides DeploymentPortsField — keep default communication ports.
+    const otherAdvancedSettings =
+      providerCode === CloudType.kubernetes
+        ? {
+            ...data,
+            ...DEFAULT_COMMUNICATION_PORTS
+          }
+        : {
+            ...data,
+            ...syncedPorts
+          };
+
+    return {
+      ...context,
+      otherAdvancedSettings,
+      databaseSettings: shouldSyncConnectionPoolingPorts(providerCode)
+        ? applyConnectionPoolingPortsToDatabase(context.databaseSettings, syncedPorts)
+        : context.databaseSettings
+    };
+  },
+  setResilienceType: (resilienceType: ResilienceType) => ({
+    ...context,
+    resilienceType
+  })
+});
+
+export type CreateUniverseContextMethods = [
+  createUniverseFormProps,
+  ReturnType<typeof createUniverseFormMethods>
+];
+
+// Navigate between pages. Nodes step resolves `true` when validation passed and submit ran; `false` when invalid.
+export type StepsRef = {
+  onNext: () => void | Promise<boolean | void>;
+  onPrev: () => void;
+  setValue?: (name: string, value: unknown) => void;
+};

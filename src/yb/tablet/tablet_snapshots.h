@@ -1,0 +1,273 @@
+// Copyright (c) YugabyteDB, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
+// in compliance with the License.  You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software distributed under the License
+// is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express
+// or implied.  See the License for the specific language governing permissions and limitations
+// under the License.
+//
+
+#pragma once
+
+#include <memory>
+#include <mutex>
+#include <unordered_map>
+
+#include "yb/common/hybrid_time.h"
+#include "yb/common/opid.h"
+#include "yb/common/snapshot.h"
+
+#include "yb/tablet/restore_util.h"
+#include "yb/tablet/tablet_fwd.h"
+#include "yb/tablet/tablet_component.h"
+
+#include "yb/docdb/docdb_fwd.h"
+
+#include "yb/rpc/scheduler.h"
+
+#include "yb/util/monotime.h"
+#include "yb/util/status_fwd.h"
+#include "yb/util/threadpool.h"
+
+namespace rocksdb {
+
+class DB;
+
+}
+
+namespace yb {
+
+class Env;
+class FsManager;
+class RWOperationCounter;
+class rw_semaphore;
+
+namespace rpc {
+class Scheduler;
+}
+
+namespace tablet {
+
+class TabletRestorePatch;
+
+YB_DEFINE_ENUM(CreateCheckpointIn, (kSubDir)(kUseSuffix));
+
+struct CreateSnapshotData {
+  HybridTime snapshot_hybrid_time;
+  HybridTime hybrid_time;
+  OpId op_id;
+  std::string snapshot_dir;
+  SnapshotScheduleId schedule_id;
+};
+
+class TabletSnapshots : public TabletComponent {
+ public:
+  explicit TabletSnapshots(Tablet* tablet);
+  ~TabletSnapshots();
+
+  Status Open();
+
+  void SetCleanupPool(ThreadPool* thread_pool, rpc::Scheduler* scheduler);
+  void StartShutdown();
+  void CompleteShutdown();
+
+  // Create snapshot for this tablet.
+  Status Create(SnapshotOperation* operation);
+
+  Status Create(const CreateSnapshotData& data);
+
+  // Restore snapshot for this tablet. In addition to backup/restore, this is used for initial
+  // syscatalog RocksDB creation without the initdb overhead.
+  Status Restore(SnapshotOperation* operation);
+
+  // Delete snapshot for this tablet.
+  Status Delete(const SnapshotOperation& operation);
+
+  Status RestoreFinished(SnapshotOperation* operation);
+
+  // Prepares the operation context for a snapshot operation.
+  Status Prepare(SnapshotOperation* operation);
+
+  Result<std::string> RestoreToTemporary(const TxnSnapshotId& snapshot_id, HybridTime restore_at);
+
+  //------------------------------------------------------------------------------------------------
+  // Create a RocksDB checkpoint in the provided directory. Only used when table_type_ ==
+  // YQL_TABLE_TYPE.
+  // Parameter `create_checkpoint_in` specifies whether to create sub-components checkpoint inside
+  // <dir>/<sub-component-storage> or <dir>.<sub-component-storage>
+  // Parameter `use_try_lock` if true, will use try_lock instead of blocking lock. If the lock
+  // cannot be acquired, the function will return early. Currently only used by remote bootstrap
+  // caller to avoid multiple RPC threads blocking on the same checkpoint in case it takes longer
+  // than RPC timeouts.
+  // In case of failure, the caller is responsible for cleanup.
+  YB_STRONGLY_TYPED_BOOL(UseTryLock);
+  Status CreateCheckpoint(
+      const std::string& dir,
+      CreateCheckpointIn create_checkpoint_in = CreateCheckpointIn::kSubDir,
+      UseTryLock use_try_lock = UseTryLock::kFalse);
+
+  // Returns the location of the last rocksdb checkpoint. Used for tests only.
+  std::string TEST_LastRocksDBCheckpointDir() { return TEST_last_rocksdb_checkpoint_dir_; }
+
+  Status CreateDirectories(const std::string& rocksdb_dir, FsManager* fs);
+
+  HybridTime AllowedHistoryCutoff();
+
+  static std::string SnapshotsDirName(const std::string& rocksdb_dir);
+
+  static bool IsTempSnapshotDir(const std::string& dir);
+
+  static bool IsDeletedSnapshotDir(const std::string& dir);
+
+  // Reconstructs the active snapshot path from an OpId-qualified deleted snapshot path.
+  static Result<std::string> ActiveSnapshotDirFromDeletedSnapshotDir(
+      const std::string& deleted_snapshot_dir);
+
+  static std::string DeletedSnapshotDir(
+      const std::string& snapshot_dir, const OpId& delete_op_id);
+
+  static bool IsLastSnapshotTimeFilePath(const std::string& dir);
+
+ private:
+  struct RestoreMetadata;
+  struct ColocatedTableMetadata;
+  struct Metrics;
+
+  // Restore the RocksDB checkpoint from the provided directory.
+  // Only used when table_type_ == YQL_TABLE_TYPE.
+  Status RestoreCheckpoint(
+      const std::string& snapshot_dir, HybridTime restore_at, const RestoreMetadata& metadata,
+      const docdb::ConsensusFrontier& frontier, bool is_pitr_restore, const OpId& op_id);
+
+  // Applies specified snapshot operation.
+  Status Apply(SnapshotOperation* operation);
+
+  Status CleanupSnapshotDir(const std::string& dir);
+  Env& env();
+  FsManager* fs_manager();
+
+  Status RestorePartialRows(SnapshotOperation* operation);
+
+  Result<TabletRestorePatch> GenerateRestoreWriteBatch(
+      const tserver::TabletSnapshotOpRequestPB& request, docdb::DocWriteBatch* write_batch);
+
+  Result<docdb::CotableIdsMap> GetCotableIdsMap(const std::string& snapshot_dir);
+
+  enum class TombstoneState {
+    // Neither the active nor the tombstone directory exists: deletion is fully finished.
+    kComplete,
+    // The active directory was renamed to the tombstone and the parent directory was synced:
+    // logical deletion is durable, and only physical cleanup of the tombstone remains.
+    kTombstoned,
+    // Both the active and the tombstone directory exist (e.g. a stale tombstone from an earlier
+    // attempt): the tombstone must be removed before the active directory can be renamed.
+    kBothPresent,
+    // A transient failure (directory check, rename, or parent sync) occurred: retry later.
+    kRetry,
+  };
+
+  struct PendingSnapshotDeletion {
+    std::string active_dir;
+    std::string tombstone_dir;
+    MonoTime first_pending_at = MonoTime::Now();
+    // True until the active directory is durably tombstoned (renamed and parent-synced).
+    bool logical_pending = true;
+    // True while the tombstone directory still needs physical removal, including the parent sync
+    // that makes the removal durable.
+    bool physical_pending = false;
+    // True when the tombstone directory was recursively deleted but the parent-directory fsync
+    // that makes the removal durable still needs to be redone. Only the cleanup phase needs this
+    // flag: a failed parent sync while tombstoning leaves logical_pending set, and the retry
+    // re-drives that sync inside TryTombstoneSnapshotDir.
+    bool parent_sync_pending = false;
+    uint64_t epoch = 0;
+  };
+
+  TombstoneState TryTombstoneSnapshotDir(PendingSnapshotDeletion* deletion);
+  bool CleanupTombstonedSnapshot(PendingSnapshotDeletion* deletion);
+  void ScanDeletedSnapshotDirs();
+  void ScheduleCleanup(PendingSnapshotDeletion deletion);
+  void SubmitCleanup();
+  void RunCleanup();
+  void ScheduleRetry();
+  void PublishPendingDeletionState(const PendingSnapshotDeletion& deletion);
+  void UpdatePendingMetricsUnlocked() REQUIRES(cleanup_mutex_);
+  uint64_t OldestPendingDeletionAgeMs();
+
+  Status DoCreateCheckpoint(const std::string& dir, CreateCheckpointIn create_checkpoint_in);
+
+  std::string TEST_last_rocksdb_checkpoint_dir_;
+  std::unique_ptr<Metrics> metrics_;
+
+  // Protects the cleanup token, retry tracker, and pending deletion requests. Filesystem work runs
+  // without this mutex, and only the serial token may call RunCleanup.
+  std::mutex cleanup_mutex_;
+  std::unique_ptr<ThreadPoolToken> cleanup_token_ GUARDED_BY(cleanup_mutex_);
+  std::unordered_map<std::string, PendingSnapshotDeletion> pending_deletions_
+      GUARDED_BY(cleanup_mutex_);
+  rpc::ScheduledTaskTracker retry_task_tracker_;
+  uint64_t next_pending_deletion_epoch_ GUARDED_BY(cleanup_mutex_) = 0;
+  uint32_t retry_attempt_ GUARDED_BY(cleanup_mutex_) = 0;
+  bool cleanup_task_scheduled_ GUARDED_BY(cleanup_mutex_) = false;
+  bool retry_scheduled_ GUARDED_BY(cleanup_mutex_) = false;
+  bool shutting_down_ GUARDED_BY(cleanup_mutex_) = false;
+  // Declared after all state used by the function gauge so it detaches first during destruction.
+  std::shared_ptr<void> metrics_detacher_;
+
+  std::mutex last_snapshot_ht_mutex_;
+  std::unordered_map<SnapshotScheduleId, HybridTime> last_snapshot_ht_
+      GUARDED_BY(last_snapshot_ht_mutex_);
+};
+
+struct SequencesDataInfo {
+  SequencesDataInfo(std::optional<int64_t> last_value, std::optional<bool> is_called)
+    : last_value(last_value), is_called(is_called) {}
+
+  SequencesDataInfo(const SequencesDataInfo& other) {
+    last_value = other.last_value;
+    is_called = other.is_called;
+  }
+
+  std::optional<int64_t> last_value = std::nullopt;
+  std::optional<bool> is_called = std::nullopt;
+};
+
+std::ostream& operator<<(std::ostream& out, const SequencesDataInfo& value);
+
+class TabletRestorePatch : public RestorePatch {
+ public:
+  TabletRestorePatch(
+      FetchState* existing_state, FetchState* restoring_state,
+      docdb::DocWriteBatch* doc_batch, tablet::TableInfo* table_info, int64_t db_oid)
+      : RestorePatch(existing_state, restoring_state, doc_batch, table_info),
+        db_oid_(db_oid) {}
+
+  Status Finish() override;
+
+ private:
+  Result<bool> ShouldSkipEntry(const Slice& key, const Slice& value) override;
+
+  Status ProcessCommonEntry(
+      const Slice& key, const Slice& existing_value, const Slice& restoring_value) override;
+
+  Status ProcessRestoringOnlyEntry(
+      const Slice& restoring_key, const Slice& restoring_value) override;
+
+  Status ProcessExistingOnlyEntry(
+      const Slice& existing_key, const Slice& existing_value) override;
+
+  Status UpdateColumnValueInMap(const Slice& key, const Slice& value,
+      std::map<dockv::DocKey, SequencesDataInfo>* key_to_seq_info_map);
+
+  int64_t db_oid_;
+
+  std::map<dockv::DocKey, SequencesDataInfo> existing_key_to_seq_info_map_;
+  std::map<dockv::DocKey, SequencesDataInfo> restoring_key_to_seq_info_map_;
+};
+
+} // namespace tablet
+} // namespace yb

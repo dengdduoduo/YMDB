@@ -1,0 +1,371 @@
+// Copyright (c) YugabyteDB, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
+// in compliance with the License.  You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software distributed under the License
+// is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express
+// or implied.  See the License for the specific language governing permissions and limitations
+// under the License.
+
+#include <chrono>
+
+#include "yb/integration-tests/yb_mini_cluster_test_base.h"
+
+#include "yb/util/countdown_latch.h"
+#include "yb/util/test_thread_holder.h"
+
+#include "yb/yql/pgwrapper/libpq_test_base.h"
+#include "yb/yql/pgwrapper/libpq_utils.h"
+#include "yb/yql/pgwrapper/pg_test_utils.h"
+
+using namespace std::chrono_literals;
+
+namespace yb::pgwrapper {
+namespace {
+
+Status SuppressAllowedErrors(const Status& s) {
+  if (HasTransactionError(s) || IsRetryable(s)) {
+    return Status::OK();
+  }
+  // Concurrent CREATE INDEXes can race on WaitForBackendsCatalogVersion -- one waits for the
+  // others' backends to reach the new catalog version, which can exceed the per-RPC deadline.
+  if (s.message().Contains("waiting for postgres backends to catch up") ||
+      s.message().Contains("WaitForBackendsCatalogVersion RPC")) {
+    return Status::OK();
+  }
+  return s;
+}
+
+Status RunIndexCreationQueries(PGConn* conn, const std::string& table_name) {
+  constexpr const char* kQueries[] = {
+      "DROP TABLE IF EXISTS $0",
+      "CREATE TABLE IF NOT EXISTS $0(k int PRIMARY KEY, v int)",
+      "CREATE INDEX IF NOT EXISTS $0_v ON $0(v)",
+  };
+  // Cap retries. Every DDL bumps the catalog version (#28253), so with 4 threads cycling
+  // DROP -> CREATE TABLE -> CREATE INDEX, a CREATE INDEX -- which internally waits for backends
+  // to catch up to multiple catalog versions, governed by
+  // ysql_yb_wait_for_backends_catalog_version_timeout (30s) -- is very likely to be invalidated
+  // by a peer's DDL and time out. An unbounded retry then livelocks the test past the 10-minute
+  // gtest timeout. The test only needs to verify that no unexpected errors are produced; it does
+  // not require CREATE INDEX to actually succeed.
+  constexpr int kMaxAttempts = 10;
+  for (int attempt = 0; attempt < kMaxAttempts; ++attempt) {
+    RETURN_NOT_OK(SuppressAllowedErrors(conn->ExecuteFormat(kQueries[0], table_name)));
+
+    // CREATE TABLE may fail due to catalog version mismatch.
+    // If it fails, retry from DROP so that CREATE INDEX is not attempted against a missing
+    // relation (which would surface as a non-suppressible error).
+    auto create_status = conn->ExecuteFormat(kQueries[1], table_name);
+    RETURN_NOT_OK(SuppressAllowedErrors(create_status));
+    if (!create_status.ok()) {
+      continue;
+    }
+
+    // The code path under test (DDL transaction commit in the middle of CREATE INDEX) has been
+    // exercised. A suppressed error here is an acceptable outcome.
+    RETURN_NOT_OK(SuppressAllowedErrors(conn->ExecuteFormat(kQueries[2], table_name)));
+    return Status::OK();
+  }
+  return Status::OK();
+}
+
+} // namespace
+
+class PgDDLConcurrencyTest : public LibPqTestBase {
+ public:
+  int GetNumMasters() const override { return 3; }
+
+ protected:
+  void UpdateMiniClusterOptions(ExternalMiniClusterOptions* options) override {
+    options->extra_tserver_flags.push_back(
+        "--wait_for_ysql_backends_catalog_version_client_master_rpc_timeout_ms=5000");
+    options->extra_tserver_flags.push_back(
+        "--ysql_yb_wait_for_backends_catalog_version_timeout=30000");
+    LibPqTestBase::UpdateMiniClusterOptions(options);
+  }
+};
+
+/*
+ * Index creation commits DDL transaction at the middle.
+ * Check that this behavior works properly and doesn't produces unexpected errors
+ * in case transaction can't be committed (due to massive retry errors
+ * caused by aggressive running of DDL in parallel).
+ */
+TEST_F(PgDDLConcurrencyTest, IndexCreation) {
+  TestThreadHolder thread_holder;
+  constexpr size_t kThreadsCount = 3;
+  CountDownLatch start_latch(kThreadsCount + 1);
+  for (size_t i = 0; i < kThreadsCount; ++i) {
+    thread_holder.AddThreadFunctor(
+        [this, &stop = thread_holder.stop_flag(), idx = i, &start_latch] {
+          const auto table_name = Format("t$0", idx);
+          // TODO (#19975): Enable read committed isolation
+          auto conn = ASSERT_RESULT(SetDefaultTransactionIsolation(
+              Connect(), IsolationLevel::SNAPSHOT_ISOLATION));
+          start_latch.CountDown();
+          start_latch.Wait();
+          while (!stop.load(std::memory_order_acquire)) {
+            ASSERT_OK(RunIndexCreationQueries(&conn, table_name));
+          }
+        });
+  }
+
+  const std::string table_name("t");
+  // TODO (#19975): Enable read committed isolation
+  auto conn = ASSERT_RESULT(SetDefaultTransactionIsolation(
+      Connect(), IsolationLevel::SNAPSHOT_ISOLATION));
+  start_latch.CountDown();
+  start_latch.Wait();
+  for (size_t i = 0; i < 3; ++i) {
+    ASSERT_OK(RunIndexCreationQueries(&conn, table_name));
+  }
+}
+
+/*
+ * Test concurrent temp table creation across multiple threads.
+ * Each thread creates its own connection and continuously creates temp tables
+ * until the test completes.
+ * Stress test to check read restart errors (see GH #29704).
+ */
+TEST_F(PgDDLConcurrencyTest, TempTableCreation) {
+  TestThreadHolder thread_holder;
+  constexpr size_t kThreadsCount = 10;
+  CountDownLatch start_latch(kThreadsCount);
+  for (size_t i = 0; i < kThreadsCount; ++i) {
+    thread_holder.AddThreadFunctor(
+        [this, &stop = thread_holder.stop_flag(), &start_latch] {
+          start_latch.CountDown();
+          start_latch.Wait();
+          while (!stop.load(std::memory_order_acquire)) {
+            auto conn = ASSERT_RESULT(SetDefaultTransactionIsolation(
+                Connect(), IsolationLevel::SNAPSHOT_ISOLATION));
+            ASSERT_OK(conn.Execute("CREATE TEMP TABLE temp_table(k int, v int)"));
+          }
+        });
+  }
+
+  thread_holder.WaitAndStop(10s * kTimeMultiplier);
+}
+
+class PgDDLConcurrencyWithObjectLockingTest : public PgDDLConcurrencyTest {
+ protected:
+  void UpdateMiniClusterOptions(ExternalMiniClusterOptions* options) override {
+    options->extra_tserver_flags.push_back(
+        "--enable_object_locking_for_table_locks=true");
+    options->extra_tserver_flags.push_back(
+        "--ysql_yb_ddl_transaction_block_enabled=true");
+    options->extra_tserver_flags.push_back("--ysql_enable_concurrent_ddl=true");
+    AppendFlagToAllowedPreviewFlagsCsv(
+        options->extra_tserver_flags, "ysql_enable_concurrent_ddl");
+    PgDDLConcurrencyTest::UpdateMiniClusterOptions(options);
+  }
+};
+
+// https://github.com/yugabyte/yugabyte-db/issues/28532
+TEST_F(PgDDLConcurrencyWithObjectLockingTest, TableDrop) {
+  TestThreadHolder thread_holder;
+  auto conn1 = CHECK_RESULT(Connect());
+  ASSERT_OK(conn1.Execute("CREATE TABLE sample (i INT)"));
+  ASSERT_OK(conn1.Execute("BEGIN ISOLATION LEVEL REPEATABLE READ"));
+  ASSERT_OK(conn1.Execute("DROP TABLE sample"));
+  thread_holder.AddThreadFunctor(
+      [this] {
+    auto conn2 = CHECK_RESULT(Connect());
+    ASSERT_OK(conn2.Execute("BEGIN ISOLATION LEVEL REPEATABLE READ"));
+    // Verify that we get the same error message as native PG.
+    // Prior to the fix, we get "ERROR:  cache lookup failed for relation 16384"
+    ASSERT_NOK_STR_CONTAINS(conn2.Execute("DROP TABLE sample"), "table \"sample\" does not exist");
+  });
+  // With object locking, this sleep will block the DROP statement on conn2 for 5 seconds.
+  SleepFor(5s);
+  ASSERT_OK(conn1.Execute("COMMIT"));
+  thread_holder.Stop();
+}
+
+// https://github.com/yugabyte/yugabyte-db/issues/28563
+TEST_F(PgDDLConcurrencyWithObjectLockingTest, TableDropCascade) {
+  TestThreadHolder thread_holder;
+  auto conn1 = CHECK_RESULT(Connect());
+  ASSERT_OK(conn1.Execute("CREATE TABLE dd (i INT)"));
+  ASSERT_OK(conn1.Execute("CREATE MATERIALIZED VIEW mat AS SELECT * FROM dd"));
+  ASSERT_OK(conn1.Execute("BEGIN ISOLATION LEVEL REPEATABLE READ"));
+  ASSERT_OK(conn1.Execute("DROP TABLE dd CASCADE"));
+  thread_holder.AddThreadFunctor(
+      [this] {
+    auto conn2 = CHECK_RESULT(Connect());
+    ASSERT_OK(conn2.Execute("BEGIN ISOLATION LEVEL REPEATABLE READ"));
+    // Verify that we get the same error message as native PG.
+    // Prior to the fix, we get "ERROR:  could not open relation with OID 16387"
+    ASSERT_NOK_STR_CONTAINS(conn2.Execute("REFRESH MATERIALIZED VIEW mat"),
+                            "relation \"mat\" does not exist");
+  });
+  // With object locking, this sleep will block the REFRESH statement on conn2 for 5 seconds.
+  SleepFor(5s);
+  ASSERT_OK(conn1.Execute("COMMIT"));
+  thread_holder.Stop();
+}
+
+/*
+ * Test ANALYZE running concurrently with catalog version incrementing DDL operations.
+ * This test verifies that ANALYZE can handle concurrent DDL without producing
+ * serialization errors or other unexpected failures.
+ * Unlike other tests, this does NOT suppress serialization errors to verify
+ * that the operations can complete successfully.
+ */
+TEST_F(PgDDLConcurrencyWithObjectLockingTest, AnalyzeWithConcurrentDDL) {
+  auto setup_conn = ASSERT_RESULT(Connect());
+  ASSERT_OK(setup_conn.Execute("CREATE TABLE analyze_test(k int PRIMARY KEY, v int)"));
+  ASSERT_OK(setup_conn.Execute(
+      "INSERT INTO analyze_test SELECT i, i * 2 FROM generate_series(1, 1000) i"));
+
+  TestThreadHolder thread_holder;
+  CountDownLatch start_latch(1);
+
+  thread_holder.AddThreadFunctor([this, &stop = thread_holder.stop_flag(), &start_latch] {
+    auto conn = ASSERT_RESULT(
+        SetDefaultTransactionIsolation(Connect(), IsolationLevel::SNAPSHOT_ISOLATION));
+    start_latch.CountDown();
+    start_latch.Wait();
+    while (!stop.load(std::memory_order_acquire)) {
+      ASSERT_OK(conn.Execute("ANALYZE analyze_test"));
+    }
+  });
+
+  auto ddl_conn =
+      ASSERT_RESULT(SetDefaultTransactionIsolation(Connect(), IsolationLevel::SNAPSHOT_ISOLATION));
+  start_latch.Wait();
+
+  auto deadline = std::chrono::steady_clock::now() + 10s * kTimeMultiplier;
+  while (std::chrono::steady_clock::now() < deadline) {
+    ASSERT_OK(ddl_conn.Execute("ALTER TABLE analyze_test ADD COLUMN temp_col INT"));
+    ASSERT_OK(ddl_conn.Execute("ALTER TABLE analyze_test DROP COLUMN temp_col"));
+  }
+
+  thread_holder.Stop();
+}
+
+/*
+ * Concurrent clients invoke a plpgsql function that creates and mutates temp
+ * tables (CREATE / INSERT / ALTER / UPDATE / SELECT INTO pattern from GH #19242).
+ */
+TEST_F(PgDDLConcurrencyWithObjectLockingTest, TempTablePlpgsqlConcurrent) {
+  auto setup_conn = ASSERT_RESULT(Connect());
+  ASSERT_OK(setup_conn.Execute(
+      "CREATE TABLE account(id int PRIMARY KEY, customer_id int, balance int)"));
+  ASSERT_OK(setup_conn.Execute(
+      "INSERT INTO account SELECT i, i % 10, i * 10 FROM generate_series(1, 100) i"));
+  ASSERT_OK(setup_conn.Execute(R"(
+      CREATE OR REPLACE FUNCTION test_proc(account_ids int[], in_customer_id int)
+      RETURNS TABLE(id int, customer_id int, balance int, adjusted int)
+      LANGUAGE plpgsql AS $$
+      BEGIN
+        DROP TABLE IF EXISTS temp_t1, temp_t2, temp_t3;
+        CREATE TEMP TABLE temp_t1(id int, customer_id int, balance int);
+        CREATE TEMP TABLE temp_t2(id int, customer_id int, balance int, adjusted int);
+        CREATE TEMP TABLE temp_t3(id int, customer_id int, balance int, adjusted int);
+
+        IF account_ids IS NOT NULL THEN
+          INSERT INTO temp_t1
+          SELECT a.id, a.customer_id, a.balance
+          FROM account a
+          WHERE a.id = ANY (account_ids);
+        ELSE
+          INSERT INTO temp_t1
+          SELECT a.id, a.customer_id, a.balance
+          FROM account a
+          WHERE a.customer_id = in_customer_id;
+        END IF;
+
+        ALTER TABLE temp_t1 ADD COLUMN adjusted int;
+        -- Qualify columns: RETURNS TABLE creates OUT params with the same names.
+        UPDATE temp_t1 SET adjusted = temp_t1.balance + 1;
+
+        INSERT INTO temp_t2
+        SELECT t.id, t.customer_id, t.balance, t.adjusted FROM temp_t1 t;
+
+        INSERT INTO temp_t3
+        SELECT t2.id, t2.customer_id, t2.balance, t2.adjusted
+        FROM temp_t2 t2
+        JOIN account a ON a.id = t2.id;
+
+        RETURN QUERY SELECT t3.id, t3.customer_id, t3.balance, t3.adjusted
+                     FROM temp_t3 t3
+                     ORDER BY t3.id;
+      END;
+      $$)"));
+
+  TestThreadHolder thread_holder;
+  constexpr size_t kThreadsCount = 10;
+  CountDownLatch start_latch(kThreadsCount);
+
+  for (size_t i = 0; i < kThreadsCount; ++i) {
+    thread_holder.AddThreadFunctor(
+        [this, &stop = thread_holder.stop_flag(), &start_latch, idx = i] {
+          auto conn = ASSERT_RESULT(Connect());
+          start_latch.CountDown();
+          start_latch.Wait();
+          while (!stop.load(std::memory_order_acquire)) {
+            // Alternate between the two branches of the function to exercise
+            // both fill paths under concurrency.
+            const std::string query = (idx % 2 == 0)
+                ? "SELECT * FROM test_proc(ARRAY[1, 2, 3, 4, 5], NULL)"
+                : Format("SELECT * FROM test_proc(NULL, $0)", idx % 10);
+            Status status;
+            // Retry transient transaction / catalog-version errors.
+            for (int attempt = 0; attempt < 10; ++attempt) {
+              auto rows = conn.FetchRows<int32_t, int32_t, int32_t, int32_t>(query);
+              if (rows.ok()) {
+                ASSERT_FALSE(rows->empty());
+                status = Status::OK();
+                break;
+              }
+              status = rows.status();
+              if (status.message().Contains("does not exist")) {
+                FAIL() << "Temp relation missing under concurrent plpgsql use: " << status;
+              }
+              if (!(HasTransactionError(status) || IsRetryable(status))) {
+                FAIL() << "Unexpected error calling test_proc: " << status;
+              }
+            }
+            ASSERT_OK(status);
+          }
+        });
+  }
+
+  thread_holder.WaitAndStop(20s * kTimeMultiplier);
+}
+
+class PgDDLConcurrencyWithObjectLockingTestRF1 : public PgDDLConcurrencyWithObjectLockingTest {
+ public:
+  int GetNumMasters() const override { return 1; }
+  int GetNumTabletServers() const override { return 1; }
+ protected:
+  void UpdateMiniClusterOptions(ExternalMiniClusterOptions* options) override {
+    PgDDLConcurrencyWithObjectLockingTest::UpdateMiniClusterOptions(options);
+    options->replication_factor = 1;
+    options->extra_tserver_flags.push_back("--ysql_enable_concurrent_ddl=false");
+  }
+};
+
+TEST_F(PgDDLConcurrencyWithObjectLockingTestRF1, YB_DISABLE_TEST_IN_SANITIZERS(CreateTables)) {
+  TestThreadHolder thread_holder;
+  thread_holder.AddThreadFunctor( [this] {
+    auto conn = CHECK_RESULT(Connect());
+    for (int i = 0; i < 500; i++) {
+      ASSERT_OK(SuppressAllowedErrors(conn.ExecuteFormat("create table s_$0 (id int)", i)));
+    }
+  });
+  thread_holder.AddThreadFunctor( [this] {
+    auto conn = CHECK_RESULT(Connect());
+    for (int i = 0; i < 500; i++) {
+      ASSERT_OK(SuppressAllowedErrors(conn.ExecuteFormat("create table t_$0 (id int)", i)));
+    }
+  });
+  thread_holder.JoinAll();
+}
+
+} // namespace yb::pgwrapper

@@ -1,0 +1,25 @@
+PREFIX : <http://www.firstPrefix.com/>
+SELECT *
+WHERE {
+    :subjectFirstPrefix :predicateFirstPrefix ?o .
+    FILTER (true
+        && ABS(-1) = 1
+        && ABS(-1.0) = 1
+        && ABS(-1e0) = 1
+
+        && ABS(1) = 1
+        && ABS(1.0) = 1
+        && ABS(1e0) = 1
+
+        && ABS(-9734) = 9734
+        && ABS(-9734.0) = 9734
+        && ABS(-9734e0) = 9734
+
+        && ABS(9734) = 9734
+        && ABS(9734.0) = 9734
+        && ABS(9734e0) = 9734
+
+        && ABS(9734123123.87934256) = 9734123123.87934256
+        && ABS(-9734123123.87934256) = 9734123123.87934256
+    )
+}

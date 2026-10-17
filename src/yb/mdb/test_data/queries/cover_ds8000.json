@@ -1,0 +1,134 @@
+[
+  {
+    "id": 1,
+    "template": "RND_BGP",
+    "category": "Random BGP",
+    "query": "SELECT ?s ?o WHERE { ?s <http://example.org/reviews> ?o }"
+  },
+  {
+    "id": 2,
+    "template": "RND_JOIN",
+    "category": "Random Join",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/collaboratesWith> ?o . ?o <http://example.org/aligns> ?z }"
+  },
+  {
+    "id": 3,
+    "template": "RND_FILTER_isIRI",
+    "category": "Random FILTER",
+    "query": "SELECT ?s ?o WHERE { ?s <http://example.org/tests> ?o . FILTER(isIRI(?s)) }"
+  },
+  {
+    "id": 4,
+    "template": "RND_FILTER_BOUND",
+    "category": "Random FILTER",
+    "query": "SELECT ?s ?o WHERE { ?s <http://example.org/evaluates> ?o . FILTER(BOUND(?o)) }"
+  },
+  {
+    "id": 5,
+    "template": "RND_FILTER_REGEX",
+    "category": "Random FILTER",
+    "query": "SELECT ?s ?l WHERE { ?s rdfs:label ?l . FILTER(REGEX(?l, \"Product\")) }"
+  },
+  {
+    "id": 6,
+    "template": "RND_FILTER_STRSTARTS",
+    "category": "Random FILTER",
+    "query": "SELECT ?s ?l WHERE { ?s rdfs:label ?l . FILTER(STRSTARTS(?l, \"Product\")) }"
+  },
+  {
+    "id": 7,
+    "template": "RND_FILTER_CONTAINS",
+    "category": "Random FILTER",
+    "query": "SELECT ?s ?l WHERE { ?s rdfs:label ?l . FILTER(CONTAINS(?l, \"an\")) }"
+  },
+  {
+    "id": 8,
+    "template": "RND_FILTER_eq",
+    "category": "Random FILTER",
+    "query": "SELECT ?s ?o WHERE { ?s <http://example.org/tests> ?o . FILTER(?s != ?o) }"
+  },
+  {
+    "id": 9,
+    "template": "RND_FILTER_sameTerm",
+    "category": "Random FILTER",
+    "query": "SELECT ?s ?o WHERE { ?s <http://example.org/clusters> ?o . FILTER(sameTerm(?s, ?s)) }"
+  },
+  {
+    "id": 10,
+    "template": "RND_OPTIONAL",
+    "category": "Random OPTIONAL",
+    "query": "SELECT ?s ?o ?z WHERE { ?s <http://example.org/serializes> ?o . OPTIONAL { ?o <http://example.org/tests> ?z } }"
+  },
+  {
+    "id": 11,
+    "template": "RND_UNION",
+    "category": "Random UNION",
+    "query": "SELECT ?s ?o WHERE { { ?s <http://example.org/provides> ?o } UNION { ?s <http://example.org/certifies> ?o } }"
+  },
+  {
+    "id": 12,
+    "template": "RND_PATH_star",
+    "category": "Random Path",
+    "query": "SELECT ?s ?o WHERE { ?s <http://example.org/reports>* ?o }"
+  },
+  {
+    "id": 13,
+    "template": "RND_PATH_plus",
+    "category": "Random Path",
+    "query": "SELECT ?s ?o WHERE { ?s <http://example.org/mentors>+ ?o }"
+  },
+  {
+    "id": 14,
+    "template": "RND_PATH_inverse",
+    "category": "Random Path",
+    "query": "SELECT ?s ?o WHERE { ?s ^<http://example.org/analyzes> ?o }"
+  },
+  {
+    "id": 15,
+    "template": "RND_ORDER_ASC",
+    "category": "Random ORDER",
+    "query": "SELECT ?s ?o WHERE { ?s <http://example.org/aligns> ?o } ORDER BY ASC(?s)"
+  },
+  {
+    "id": 16,
+    "template": "RND_ORDER_DESC",
+    "category": "Random ORDER",
+    "query": "SELECT ?s ?o WHERE { ?s <http://example.org/certifies> ?o } ORDER BY DESC(?s)"
+  },
+  {
+    "id": 17,
+    "template": "RND_DISTINCT",
+    "category": "Random DISTINCT",
+    "query": "SELECT DISTINCT ?s ?o WHERE { ?s <http://example.org/developedBy> ?o }"
+  },
+  {
+    "id": 18,
+    "template": "RND_LIMIT",
+    "category": "Random LIMIT",
+    "query": "SELECT ?s ?o WHERE { ?s <http://example.org/distributes> ?o } LIMIT 5"
+  },
+  {
+    "id": 19,
+    "template": "RND_LIMIT_OFFSET",
+    "category": "Random LIMIT",
+    "query": "SELECT ?s ?o WHERE { ?s <http://example.org/ranks> ?o } LIMIT 5 OFFSET 5"
+  },
+  {
+    "id": 20,
+    "template": "RND_RDF_TYPE",
+    "category": "Random BGP",
+    "query": "SELECT ?s ?t WHERE { ?s rdf:type ?t }"
+  },
+  {
+    "id": 21,
+    "template": "RND_ASK",
+    "category": "Random ASK",
+    "query": "ASK WHERE { ?s ?p ?o }"
+  },
+  {
+    "id": 22,
+    "template": "RND_SELECT_ALL",
+    "category": "Random SELECT",
+    "query": "SELECT * WHERE { ?s ?p ?o } LIMIT 10"
+  }
+]

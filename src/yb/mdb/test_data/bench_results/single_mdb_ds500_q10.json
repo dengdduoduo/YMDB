@@ -1,0 +1,104 @@
+{
+  "db": "mdb",
+  "dataset": "ds500",
+  "num_queries": 10,
+  "tservers": 0,
+  "import_time_s": 0.046175241470336914,
+  "times_ms": [
+    4.338979721069336,
+    2.618551254272461,
+    2.605915069580078,
+    1.4832019805908203,
+    3.6096572875976562,
+    2.910614013671875,
+    1.6224384307861328,
+    2.274036407470703,
+    2.138853073120117,
+    2.705812454223633
+  ],
+  "errors": [],
+  "row_counts": [
+    11,
+    11,
+    0,
+    16,
+    12,
+    5,
+    26,
+    8,
+    7,
+    5
+  ],
+  "details": [
+    {
+      "id": 1310,
+      "template": "RND_OPTIONAL",
+      "category": "Random OPTIONAL",
+      "time_ms": 4.338979721069336
+    },
+    {
+      "id": 229,
+      "template": "RND_BGP",
+      "category": "Random BGP",
+      "time_ms": 2.618551254272461
+    },
+    {
+      "id": 52,
+      "template": "RND_JOIN",
+      "category": "Random Join",
+      "time_ms": 2.605915069580078
+    },
+    {
+      "id": 1519,
+      "template": "RND_UNION",
+      "category": "Random UNION",
+      "time_ms": 1.4832019805908203
+    },
+    {
+      "id": 564,
+      "template": "RND_OPTIONAL",
+      "category": "Random OPTIONAL",
+      "time_ms": 3.6096572875976562
+    },
+    {
+      "id": 502,
+      "template": "RND_LIMIT_OFFSET",
+      "category": "Random LIMIT",
+      "time_ms": 2.910614013671875
+    },
+    {
+      "id": 458,
+      "template": "RND_UNION",
+      "category": "Random UNION",
+      "time_ms": 1.6224384307861328
+    },
+    {
+      "id": 286,
+      "template": "RND_OPTIONAL",
+      "category": "Random OPTIONAL",
+      "time_ms": 2.274036407470703
+    },
+    {
+      "id": 1509,
+      "template": "RND_JOIN",
+      "category": "Random Join",
+      "time_ms": 2.138853073120117
+    },
+    {
+      "id": 210,
+      "template": "RND_FILTER_isIRI",
+      "category": "Random FILTER",
+      "time_ms": 2.705812454223633
+    }
+  ],
+  "stats": {
+    "count": 10,
+    "min": 1.4832019805908203,
+    "max": 4.338979721069336,
+    "mean": 2.6308059692382812,
+    "p50": 2.6122331619262695,
+    "p90": 3.6825895309448238,
+    "p95": 4.010784626007079,
+    "p99": 4.273340702056885
+  }
+}

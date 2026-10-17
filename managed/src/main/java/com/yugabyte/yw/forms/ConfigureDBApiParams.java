@@ -1,0 +1,341 @@
+// Copyright (c) YugabyteDB, Inc.
+
+package com.yugabyte.yw.forms;
+
+import static play.mvc.Http.Status.BAD_REQUEST;
+
+import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
+import com.fasterxml.jackson.databind.annotation.JsonDeserialize;
+import com.yugabyte.yw.commissioner.Common.CloudType;
+import com.yugabyte.yw.commissioner.tasks.UniverseTaskBase.ServerType;
+import com.yugabyte.yw.common.PlatformServiceException;
+import com.yugabyte.yw.common.config.RuntimeConfGetter;
+import com.yugabyte.yw.common.config.UniverseConfKeys;
+import com.yugabyte.yw.common.gflags.SpecificGFlags;
+import com.yugabyte.yw.common.inject.StaticInjectorHolder;
+import com.yugabyte.yw.common.password.PasswordPolicyService;
+import com.yugabyte.yw.controllers.handlers.UniverseCRUDHandler;
+import com.yugabyte.yw.controllers.handlers.UniverseTableHandler;
+import com.yugabyte.yw.forms.UniverseDefinitionTaskParams.UserIntent.MultiTenancyConfig;
+import com.yugabyte.yw.models.Customer;
+import com.yugabyte.yw.models.PitrConfig;
+import com.yugabyte.yw.models.Schedule;
+import com.yugabyte.yw.models.Universe;
+import com.yugabyte.yw.models.XClusterConfig;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.UUID;
+import javax.annotation.Nullable;
+import org.apache.commons.lang3.StringUtils;
+import org.yb.CommonTypes.TableType;
+
+@JsonIgnoreProperties(ignoreUnknown = true)
+@JsonDeserialize(converter = ConfigureDBApiParams.Converter.class)
+public class ConfigureDBApiParams extends UpgradeTaskParams {
+
+  public boolean enableYSQL;
+
+  public boolean enableConnectionPooling;
+
+  public boolean enableYSQLAuth;
+
+  public String ysqlPassword;
+
+  public boolean enableYCQL;
+
+  public boolean enableYCQLAuth;
+
+  public String ycqlPassword;
+
+  public ServerType configureServer;
+
+  @Nullable public MultiTenancyConfig multiTenancy;
+
+  public Map<UUID, SpecificGFlags> connectionPoolingGflags = new HashMap<>();
+
+  @Override
+  public void verifyParams(Universe universe, boolean isFirstTry) {
+    Cluster primaryCluster = universe.getUniverseDetails().getPrimaryCluster();
+    UserIntent userIntent = primaryCluster.userIntent;
+    CommunicationPorts universePorts = universe.getUniverseDetails().communicationPorts;
+    if (CommunicationPorts.hasDuplicatePorts(universePorts)) {
+      throw new PlatformServiceException(BAD_REQUEST, "All ports must be different.");
+    }
+    boolean changeInYsql =
+        (enableYSQL != userIntent.enableYSQL)
+            || (enableYSQLAuth != userIntent.enableYSQLAuth)
+            || (!StringUtils.isEmpty(ysqlPassword))
+            || (communicationPorts.ysqlServerHttpPort != universePorts.ysqlServerHttpPort)
+            || (communicationPorts.ysqlServerRpcPort != universePorts.ysqlServerRpcPort);
+    boolean changeInYcql =
+        (enableYCQL != userIntent.enableYCQL)
+            || (enableYCQLAuth != userIntent.enableYCQLAuth)
+            || (!StringUtils.isEmpty(ycqlPassword))
+            || (communicationPorts.yqlServerHttpPort != universePorts.yqlServerHttpPort)
+            || (communicationPorts.yqlServerRpcPort != universePorts.yqlServerRpcPort);
+
+    if (!enableYCQL && !enableYSQL) {
+      throw new PlatformServiceException(
+          BAD_REQUEST, "Need to enable at least one endpoint among YSQL and YCQL");
+    }
+
+    // Validate consistency across primary and read only clusters.
+    for (Cluster readOnlyCluster : universe.getUniverseDetails().getReadOnlyClusters()) {
+      UniverseCRUDHandler.validateConsistency(primaryCluster, readOnlyCluster);
+    }
+
+    RuntimeConfGetter runtimeConfGetter =
+        StaticInjectorHolder.injector().instanceOf(RuntimeConfGetter.class);
+
+    if (configureServer.equals(ServerType.YSQLSERVER)) {
+      if (changeInYcql) {
+        throw new PlatformServiceException(
+            BAD_REQUEST, "Cannot configure YCQL along with YSQL at a time.");
+      } else if (enableYSQL && !userIntent.enableYSQL) {
+        throw new PlatformServiceException(
+            BAD_REQUEST, "Cannot enable YSQL if it was disabled earlier.");
+      } else if ((communicationPorts.ysqlServerHttpPort != universePorts.ysqlServerHttpPort
+              || communicationPorts.ysqlServerRpcPort != universePorts.ysqlServerRpcPort)
+          && userIntent.providerType.equals(CloudType.kubernetes)) {
+        throw new PlatformServiceException(
+            BAD_REQUEST, "Cannot change YSQL ports on k8s universe.");
+      } else if ((enableYSQLAuth != userIntent.enableYSQLAuth)
+          && StringUtils.isEmpty(ysqlPassword)) {
+        throw new PlatformServiceException(
+            BAD_REQUEST, "Required password to configure YSQL auth.");
+      } else if (enableYSQL
+          && (enableYSQLAuth == userIntent.enableYSQLAuth && !enableYSQLAuth)
+          && !StringUtils.isEmpty(ysqlPassword)) {
+        throw new PlatformServiceException(
+            BAD_REQUEST, "Cannot set password while YSQL auth is disabled.");
+      } else if (communicationPorts.ysqlServerHttpPort == communicationPorts.ysqlServerRpcPort
+          || communicationPorts.ysqlServerRpcPort == communicationPorts.internalYsqlServerRpcPort
+          || communicationPorts.internalYsqlServerRpcPort
+              == communicationPorts.ysqlServerHttpPort) {
+        throw new PlatformServiceException(BAD_REQUEST, "All YSQL ports must be different.");
+      } else if (!enableYSQL) {
+        if (!runtimeConfGetter.getConfForScope(universe, UniverseConfKeys.allowDisableDBApis)) {
+          throw new PlatformServiceException(
+              BAD_REQUEST,
+              "Disabling YSQL is not allowed. Please set yb.configure_db_api.allow_disable to allow"
+                  + " disable DB API");
+        }
+        // Ensure that user deletes all backup schedules, xcluster configs
+        // and pitr configs before disabling YSQL.
+        if (PitrConfig.getByUniverseUUID(universe.getUniverseUUID()).stream()
+            .anyMatch(p -> p.getTableType().equals(TableType.PGSQL_TABLE_TYPE))) {
+          throw new PlatformServiceException(
+              BAD_REQUEST, "Cannot disable YSQL if pitr config exists");
+        }
+        if (Schedule.getAllSchedulesByOwnerUUID(universe.getUniverseUUID()).stream()
+            .anyMatch(
+                s ->
+                    s.getTaskParams().has("backupType")
+                        && s.getTaskParams()
+                            .get("backupType")
+                            .asText()
+                            .equals(TableType.PGSQL_TABLE_TYPE.toString()))) {
+          throw new PlatformServiceException(
+              BAD_REQUEST, "Cannot disable YSQL if backup schedules are active");
+        }
+        if (XClusterConfig.getByUniverseUuid(universe.getUniverseUUID()).stream()
+            .anyMatch(
+                config -> config.getTableTypeAsCommonType().equals(TableType.PGSQL_TABLE_TYPE))) {
+          throw new PlatformServiceException(
+              BAD_REQUEST, "Cannot disable YSQL if xcluster config exists");
+        }
+        if (enableConnectionPooling) {
+          throw new PlatformServiceException(
+              BAD_REQUEST, "Cannot disable YSQL if connection pooling is enabled");
+        }
+      }
+      validateMultiTenancy(universe, enableYSQL, runtimeConfGetter);
+    } else if (configureServer.equals(ServerType.YQLSERVER)) {
+      if (changeInYsql) {
+        throw new PlatformServiceException(
+            BAD_REQUEST, "Cannot configure YSQL along with YCQL at a time.");
+      } else if (!enableYCQL && enableYCQLAuth) {
+        throw new PlatformServiceException(
+            BAD_REQUEST, "Cannot enable YCQL auth when API is disabled.");
+      } else if ((communicationPorts.yqlServerHttpPort != universePorts.yqlServerHttpPort
+          || communicationPorts.yqlServerRpcPort != universePorts.yqlServerRpcPort)) {
+        throw new PlatformServiceException(
+            BAD_REQUEST, "Cannot change YCQL ports on k8s universe.");
+      } else if ((enableYCQLAuth != userIntent.enableYCQLAuth)
+          && StringUtils.isEmpty(ycqlPassword)) {
+        throw new PlatformServiceException(
+            BAD_REQUEST, "Required password to configure YCQL auth.");
+      } else if (enableYCQL
+          && (enableYCQLAuth == userIntent.enableYCQLAuth && !enableYCQLAuth)
+          && !StringUtils.isEmpty(ycqlPassword)) {
+        throw new PlatformServiceException(
+            BAD_REQUEST, "Cannot set password while YCQL auth is disabled.");
+      } else if (communicationPorts.yqlServerHttpPort == communicationPorts.yqlServerRpcPort) {
+        throw new PlatformServiceException(BAD_REQUEST, "All YCQL ports must be different.");
+      } else if (!runtimeConfGetter.getConfForScope(
+              universe, UniverseConfKeys.multitenancySkipYcqlPrecheck)
+          && enableYCQL
+          && userIntent.isQosEnabled()) {
+        throw new PlatformServiceException(
+            BAD_REQUEST,
+            String.format(
+                "Universe %s cannot enable YCQL endpoint as multi-tenancy is enabled.",
+                universe.getName()));
+      } else if (!enableYCQL) {
+        if (!runtimeConfGetter.getConfForScope(universe, UniverseConfKeys.allowDisableDBApis)) {
+          throw new PlatformServiceException(
+              BAD_REQUEST,
+              "Disabling YCQL is not allowed. Please set yb.configure_db_api.allow_disable to allow"
+                  + " disable DB API");
+        }
+        // Ensure that all backup schedules, xcluster configs
+        // and pitr configs are deleted before disabling YCQL.
+        if (PitrConfig.getByUniverseUUID(universe.getUniverseUUID()).stream()
+            .anyMatch(p -> p.getTableType().equals(TableType.YQL_TABLE_TYPE))) {
+          throw new PlatformServiceException(
+              BAD_REQUEST, "Cannot disable YCQL if pitr config exists");
+        }
+        if (Schedule.getAllSchedulesByOwnerUUID(universe.getUniverseUUID()).stream()
+            .anyMatch(
+                s ->
+                    s.getTaskParams().has("backupType")
+                        && s.getTaskParams()
+                            .get("backupType")
+                            .asText()
+                            .equals(TableType.YQL_TABLE_TYPE.toString()))) {
+          throw new PlatformServiceException(
+              BAD_REQUEST, "Cannot disable YCQL if backup schedules are active");
+        }
+        if (XClusterConfig.getByUniverseUuid(universe.getUniverseUUID()).stream()
+            .anyMatch(
+                config -> config.getTableTypeAsCommonType().equals(TableType.YQL_TABLE_TYPE))) {
+          throw new PlatformServiceException(
+              BAD_REQUEST, "Cannot disable YCQL if xcluster config exists");
+        }
+      }
+    } else {
+      throw new PlatformServiceException(
+          BAD_REQUEST, "Cannot configure server type " + configureServer);
+    }
+  }
+
+  public void validatePassword(PasswordPolicyService policyService) {
+    if (enableYSQLAuth && !StringUtils.isEmpty(ysqlPassword)) {
+      policyService.checkPasswordPolicy(null, ysqlPassword);
+    }
+    if (enableYCQLAuth && !StringUtils.isEmpty(ycqlPassword)) {
+      policyService.checkPasswordPolicy(null, ycqlPassword);
+    }
+  }
+
+  public void validateYSQLTables(Universe universe, UniverseTableHandler tableHandler) {
+    if (enableYSQL) {
+      return;
+    }
+    // Validate ysql tables exists only while disabling YSQL.
+    Customer customer = Customer.get(universe.getCustomerId());
+    List<TableInfoForm.TableInfoResp> tables =
+        tableHandler.listTables(
+            customer.getUuid(),
+            universe.getUniverseUUID(),
+            false /*includeParentTableInfo */,
+            false /* excludeColocatedTables */,
+            false /* includeColocatedParentTables */,
+            false /* xClusterSupportedOnly */);
+    if (tables.stream().anyMatch(t -> t.tableType.equals(TableType.PGSQL_TABLE_TYPE))) {
+      throw new PlatformServiceException(BAD_REQUEST, "Cannot disable YSQL if any tables exists");
+    }
+  }
+
+  public void validateYCQLTables(Universe universe, UniverseTableHandler tableHandler) {
+    if (enableYCQL) {
+      return;
+    }
+    // Validate ycql tables exists only while disabling YCQL.
+    Customer customer = Customer.get(universe.getCustomerId());
+    List<TableInfoForm.TableInfoResp> tables =
+        tableHandler.listTables(
+            customer.getUuid(),
+            universe.getUniverseUUID(),
+            false /*includeParentTableInfo */,
+            false /* excludeColocatedTables */,
+            false /* includeColocatedParentTables */,
+            false /* xClusterSupportedOnly */);
+    if (tables.stream().anyMatch(t -> t.tableType.equals(TableType.YQL_TABLE_TYPE))) {
+      throw new PlatformServiceException(BAD_REQUEST, "Cannot disable YCQL if any tables exists");
+    }
+  }
+
+  private void validateMultiTenancy(
+      Universe universe, boolean enableYSQL, RuntimeConfGetter runtimeConfGetter) {
+    if (multiTenancy == null) {
+      return;
+    }
+    if (multiTenancy.isEnableQos()) {
+      if (!runtimeConfGetter.getConfForScope(universe, UniverseConfKeys.allowMultiTenancy)) {
+        throw new PlatformServiceException(
+            BAD_REQUEST,
+            "Multi-tenancy is not allowed. Please set runtime flag"
+                + " 'yb.universe.allow_multi_tenancy' to true.");
+      }
+      if (!enableYSQL) {
+        throw new PlatformServiceException(
+            BAD_REQUEST,
+            String.format(
+                "Universe %s will undergo disable YSQL, cannot enable multi-tenancy",
+                universe.getName()));
+      }
+      boolean skipYcqlPrecheck =
+          runtimeConfGetter.getConfForScope(
+              universe, UniverseConfKeys.multitenancySkipYcqlPrecheck);
+      if (!skipYcqlPrecheck
+          && universe.getUniverseDetails().getPrimaryCluster().userIntent.enableYCQL) {
+        throw new PlatformServiceException(
+            BAD_REQUEST,
+            String.format(
+                "Universe %s has YCQL endpoint enabled, cannot enable multi-tenancy",
+                universe.getName()));
+      }
+      if (com.yugabyte.yw.common.Util.compareYBVersions(
+              universe.getUniverseDetails().getPrimaryCluster().userIntent.ybSoftwareVersion,
+              com.yugabyte.yw.common.Util.MULTITENANCY_SUPPORTED_DB_VERSION_STABLE,
+              com.yugabyte.yw.common.Util.MULTITENANCY_SUPPORTED_DB_VERSION_PREVIEW,
+              true)
+          < 0) {
+        throw new PlatformServiceException(
+            BAD_REQUEST,
+            "Current software version is below minimum supported DB version for multi-tenancy.");
+      }
+      for (Cluster cluster : universe.getUniverseDetails().clusters) {
+        if (cluster.userIntent.providerType == CloudType.kubernetes) {
+          throw new PlatformServiceException(
+              BAD_REQUEST, "Multi-tenancy QoS is not supported for Kubernetes universes.");
+        }
+        if (cluster.userIntent.providerType != CloudType.onprem
+            && !cluster.userIntent.isCpuCgroupConfigured()) {
+          throw new PlatformServiceException(
+              BAD_REQUEST,
+              "CPU cgroup must be configured on the universe before enabling QoS. "
+                  + "Ensure cgroup provisioning is completed first.");
+        }
+      }
+      if (multiTenancy.getQosMaxDbCpuPercent() != null
+          && (multiTenancy.getQosMaxDbCpuPercent() <= 0.0
+              || multiTenancy.getQosMaxDbCpuPercent() > 100.0)) {
+        throw new PlatformServiceException(
+            BAD_REQUEST, "QoS max db cpu percent should be between 0 and 100( inclusive ).");
+      }
+    }
+  }
+
+  public boolean hasMultiTenancyChange(Universe universe) {
+    if (multiTenancy == null) {
+      return false;
+    }
+    UserIntent userIntent = universe.getUniverseDetails().getPrimaryCluster().userIntent;
+    return !multiTenancy.equals(userIntent.getMultiTenancy());
+  }
+
+  public static class Converter extends BaseConverter<ConfigureDBApiParams> {}
+}

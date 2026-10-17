@@ -1,0 +1,49 @@
+// Copyright (c) YugabyteDB, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
+// in compliance with the License.  You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software distributed under the License
+// is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express
+// or implied.  See the License for the specific language governing permissions and limitations
+// under the License.
+//
+
+#pragma once
+
+#include <cstdint>
+
+#include "yb/util/flags.h"
+
+static constexpr int kAutoDetectNumShardsPerTServer = -1;
+
+// Default for dump_tablet_data_max_read_time_wait_ms and for the --read_time_wait_ms flags of
+// yb-ts-cli and yb-admin. Shared so the CLIs cannot drift from the server default.
+static constexpr uint32_t kDumpTabletDataMaxReadTimeWaitMsDefault = 5000;
+
+DECLARE_int32(yb_num_shards_per_tserver);
+DECLARE_int32(ysql_num_shards_per_tserver);
+DECLARE_bool(enable_ysql);
+DECLARE_bool(ysql_disable_index_backfill);
+DECLARE_bool(log_ysql_catalog_versions);
+DECLARE_bool(ysql_enable_pg_per_database_oid_allocator);
+DECLARE_bool(yb_enable_cdc_consistent_snapshot_streams);
+DECLARE_bool(ysql_yb_enable_replication_slot_consumption);
+DECLARE_uint32(wait_for_ysql_backends_catalog_version_client_master_rpc_margin_ms);
+DECLARE_bool(TEST_hide_details_for_pg_regress);
+DECLARE_bool(TEST_check_catalog_version_overflow);
+DECLARE_int32(ysql_clone_pg_schema_rpc_timeout_ms);
+DECLARE_int32(master_ts_rpc_timeout_ms);
+DECLARE_bool(enable_object_locking_for_table_locks);
+DECLARE_bool(ysql_yb_enable_invalidation_messages);
+DECLARE_bool(enable_qos);
+DECLARE_bool(is_yb_managed);
+
+namespace yb {
+
+// Performs the initialization of the common flags, as needed.
+void InitCommonFlags();
+
+} // namespace yb

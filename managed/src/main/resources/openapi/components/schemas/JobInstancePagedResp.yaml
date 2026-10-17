@@ -1,0 +1,5 @@
+title: JobInstancePagedResp
+description: Paged API query response for job instance.
+type: object
+x-data-container: PaginationResp
+x-data-item: JobInstanceInfo
