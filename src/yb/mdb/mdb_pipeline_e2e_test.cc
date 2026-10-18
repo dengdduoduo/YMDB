@@ -14,9 +14,11 @@
 #include <gtest/gtest.h>
 
 #include <iomanip>
+#include <future>
 #include <memory>
 #include <set>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -508,6 +510,125 @@ TEST_F(MdbOrderByRegressionTest, MissingIriTextIsReportedInsteadOfSortingIds) {
   RdfYBModel::Instance().InsertTriple(1, 10, 50);
   RdfYBModel::Instance().InsertTriple(2, 10, 50);
   EXPECT_THROW(ReadRows("SELECT ?s WHERE { ?s ?p ?o } ORDER BY ?s"), QueryException);
+}
+
+TEST(MdbQueryContextTest, NestedScopesRestoreOwnerAfterException) {
+  auto* legacy = &get_query_ctx();
+  QueryContext outer;
+  QueryContext inner;
+  {
+    QueryContextScope outer_scope(outer);
+    EXPECT_EQ(get_query_ctx().get_or_create_var("outer").id, 0);
+    try {
+      QueryContextScope inner_scope(inner);
+      EXPECT_EQ(get_query_ctx().get_or_create_var("inner").id, 0);
+      throw std::runtime_error("stop inner query");
+    } catch (const std::runtime_error&) {
+    }
+    EXPECT_EQ(&get_query_ctx(), &outer);
+    EXPECT_EQ(outer.get_var_size(), 1);
+    EXPECT_EQ(inner.get_var_size(), 1);
+  }
+  EXPECT_EQ(&get_query_ctx(), legacy);
+}
+
+TEST(MdbQueryContextTest, ExplicitOwnerSurvivesThreadHandoff) {
+  QueryContext context;
+  {
+    QueryContextScope scope(context);
+    EXPECT_EQ(get_query_ctx().get_or_create_var("first").id, 0);
+  }
+  auto next = std::async(std::launch::async, [&context] {
+    QueryContextScope scope(context);
+    return get_query_ctx().get_or_create_var("second").id;
+  });
+  EXPECT_EQ(next.get(), 1);
+  QueryContextScope resumed(context);
+  EXPECT_EQ(get_query_ctx().get_or_create_var("first").id, 0);
+  EXPECT_EQ(get_query_ctx().get_var_size(), 2);
+}
+
+TEST(MdbQueryContextTest, ConcurrentOwnersDoNotShareVariables) {
+  QueryContext left;
+  QueryContext right;
+  std::promise<void> ready;
+  std::promise<void> release;
+  auto released = release.get_future();
+  auto worker = std::async(std::launch::async, [&] {
+    QueryContextScope scope(left);
+    get_query_ctx().get_or_create_var("left");
+    ready.set_value();
+    released.wait();
+    return get_query_ctx().get_var_size();
+  });
+  ready.get_future().wait();
+  {
+    QueryContextScope scope(right);
+    EXPECT_EQ(get_query_ctx().get_or_create_var("right").id, 0);
+    get_query_ctx().get_or_create_var("another");
+  }
+  release.set_value();
+  EXPECT_EQ(worker.get(), 1);
+  EXPECT_EQ(right.get_var_size(), 2);
+}
+
+TEST(MdbQueryContextTest, PublicEntryUsesFreshVariablesAndRestoresCaller) {
+  QueryContext caller;
+  QueryContextScope caller_scope(caller);
+  caller.get_or_create_var("unrelated");
+  caller.get_or_create_var("prior");
+  struct Capture {
+    std::vector<std::string> names;
+    std::vector<size_t> variable_counts;
+  };
+  auto callback = [](const char* name, const char*, void* arg) {
+    auto& capture = *static_cast<Capture*>(arg);
+    capture.names.emplace_back(name);
+    capture.variable_counts.push_back(get_query_ctx().get_var_size());
+  };
+  for (const auto* query : {"SELECT ?a WHERE { VALUES ?a { 1 } }",
+                            "SELECT ?b WHERE { VALUES ?b { 2 } }"}) {
+    Capture result;
+    ASSERT_EQ(YBCMdbExecuteSparql(query, callback, &result), 0);
+    EXPECT_EQ(result.names, (std::vector<std::string>{"v0"}));
+    EXPECT_EQ(result.variable_counts, (std::vector<size_t>{1}));
+    EXPECT_EQ(&get_query_ctx(), &caller);
+    EXPECT_EQ(caller.get_var_size(), 2);
+  }
+}
+
+TEST(MdbQueryContextTest, PublicEntryRejectsReentryAndRecoversFromCallbackFailure) {
+  int nested_status = 0;
+  auto nested = [](const char*, const char*, void* arg) {
+    auto noop = [](const char*, const char*, void*) {};
+    *static_cast<int*>(arg) = YBCMdbExecuteSparql(
+        "SELECT ?inner WHERE { VALUES ?inner { 2 } }", noop, nullptr);
+  };
+  ASSERT_EQ(YBCMdbExecuteSparql(
+      "SELECT ?outer WHERE { VALUES ?outer { 1 } }", nested, &nested_status), 0);
+  EXPECT_EQ(nested_status, 1);
+  QueryContext caller;
+  QueryContextScope scope(caller);
+  auto throwing = [](const char*, const char*, void*) { throw std::runtime_error("callback failed"); };
+  EXPECT_EQ(YBCMdbExecuteSparql(
+      "SELECT ?a WHERE { VALUES ?a { 1 } }", throwing, nullptr), 1);
+  EXPECT_EQ(&get_query_ctx(), &caller);
+  int count = 0;
+  auto counting = [](const char*, const char*, void* arg) { ++*static_cast<int*>(arg); };
+  EXPECT_EQ(YBCMdbExecuteSparql(
+      "SELECT ?b WHERE { VALUES ?b { 2 } }", counting, &count), 0);
+  EXPECT_EQ(count, 1);
+}
+
+TEST(MdbQueryContextTest, PublicEntryHonorsProjectionAndColumnOrder) {
+  std::vector<std::string> names;
+  auto callback = [](const char* name, const char*, void* arg) {
+    static_cast<std::vector<std::string>*>(arg)->emplace_back(name);
+  };
+  ASSERT_EQ(YBCMdbExecuteSparql(
+      "SELECT ?b ?a WHERE { VALUES (?a ?b ?hidden) { (1 2 3) (4 5 6) } }",
+      callback, &names), 0);
+  EXPECT_EQ(names, (std::vector<std::string>{"v1", "v0", "v1", "v0"}));
 }
 
 }  // namespace yb::mdb

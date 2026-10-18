@@ -87,7 +87,37 @@ private:
     std::uniform_real_distribution<double> distribution_{0.0, 1.0};
 };
 
+namespace query_context_detail {
+// A compatibility bridge for legacy visitors/operators. This pointer never
+// owns the context: the query/task must keep its explicit owner alive and
+// activate it on each executing thread. A context must not execute on two
+// threads concurrently.
+inline thread_local QueryContext* active = nullptr;
+}  // namespace query_context_detail
+
+class QueryContextScope {
+public:
+    explicit QueryContextScope(QueryContext& context)
+        : previous_(query_context_detail::active) {
+        query_context_detail::active = &context;
+    }
+
+    ~QueryContextScope() { query_context_detail::active = previous_; }
+
+    QueryContextScope(const QueryContextScope&) = delete;
+    QueryContextScope& operator=(const QueryContextScope&) = delete;
+
+private:
+    QueryContext* previous_;
+};
+
 inline QueryContext& get_query_ctx() {
-    static QueryContext ctx;
-    return ctx;
+    if (query_context_detail::active) {
+        return *query_context_detail::active;
+    }
+    // Legacy direct parser/iterator callers still need one scope spanning
+    // parsing and execution. Keep their old behavior until they are migrated;
+    // this fallback is not a concurrent-query API.
+    static QueryContext legacy_context;
+    return legacy_context;
 }

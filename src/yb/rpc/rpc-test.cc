@@ -47,9 +47,12 @@
 #include "yb/gutil/strings/human_readable.h"
 
 #include "yb/rpc/compressed_stream.h"
+#include "yb/rpc/circular_read_buffer.h"
+#include "yb/rpc/connection.h"
 #include "yb/rpc/network_error.h"
 #include "yb/rpc/proxy.h"
 #include "yb/rpc/rpc_controller.h"
+#include "yb/rpc/rpc_util.h"
 #include "yb/rpc/secure_stream.h"
 #include "yb/rpc/serialization.h"
 #include "yb/rpc/tcp_stream.h"
@@ -148,6 +151,78 @@ class TestRpc : public RpcTestBase {
     }, f);
   }
 };
+
+namespace {
+
+struct CloseDuringReadState {
+  std::atomic<int> calls{0};
+  std::atomic<int> reads_after_close{0};
+  std::atomic<bool> destroyed{false};
+};
+
+class CloseDuringReadContext : public YBInboundConnectionContext {
+ public:
+  CloseDuringReadContext(
+      size_t size, const MemTrackerPtr& buffer_tracker, const MemTrackerPtr& call_tracker,
+      std::shared_ptr<CloseDuringReadState> state)
+      : YBInboundConnectionContext(size, buffer_tracker, call_tracker),
+        state_(std::move(state)), buffer_(size, buffer_tracker) {}
+
+  ~CloseDuringReadContext() override { state_->destroyed = true; }
+
+ private:
+  Result<ProcessCallsResult> ProcessCalls(
+      const ConnectionPtr& connection, const IoVecs& data, ReadBufferFull) override {
+    ++state_->calls;
+    // Remove the reactor's owner while its stream is still in a read callback.
+    // The old implementation destroyed this context before consuming the result.
+    static_cast<StreamContext&>(*connection).Destroy(
+        STATUS(Aborted, "Test closes connection while parsing"));
+    closed_ = true;
+    return ProcessCallsResult{.consumed = IoVecsFullSize(data), .buffer = Slice()};
+  }
+
+  StreamReadBuffer& ReadBuffer() override {
+    if (closed_) ++state_->reads_after_close;
+    return buffer_;
+  }
+
+  std::shared_ptr<CloseDuringReadState> state_;
+  CircularReadBuffer buffer_;
+  bool closed_ = false;
+};
+
+class CloseDuringReadFactory final : public ConnectionContextFactory {
+ public:
+  explicit CloseDuringReadFactory(std::shared_ptr<CloseDuringReadState> state)
+      : ConnectionContextFactory(0, "CloseDuringRead", nullptr), state_(std::move(state)) {}
+
+  std::unique_ptr<ConnectionContext> Create(size_t size) override {
+    return std::make_unique<CloseDuringReadContext>(size, buffer_tracker_, call_tracker_, state_);
+  }
+
+ private:
+  std::shared_ptr<CloseDuringReadState> state_;
+};
+
+} // namespace
+
+TEST_F(TestRpc, CloseConnectionDuringReadCallback) {
+  auto state = std::make_shared<CloseDuringReadState>();
+  auto server = CreateAutoShutdownMessengerHolder("CloseDuringRead");
+  auto listen = ASSERT_RESULT(ParseEndpoint("127.0.0.1:0", 0));
+  Endpoint bound;
+  ASSERT_OK(server->ListenAddress(std::make_shared<CloseDuringReadFactory>(state), listen, &bound));
+  ASSERT_OK(server->StartAcceptor());
+  Socket socket;
+  ASSERT_OK(socket.Init(0));
+  ASSERT_OK(socket.Connect(bound));
+  const uint8_t data[] = {'Y', 'B', 1, 0};
+  ASSERT_OK(socket.BlockingWrite(data, sizeof(data), MonoTime::Now() + 5s));
+  ASSERT_OK(WaitFor([&] { return state->destroyed.load(); }, 5s, "Closed read context cleanup"));
+  EXPECT_EQ(state->calls.load(), 1);
+  EXPECT_EQ(state->reads_after_close.load(), 0);
+}
 
 namespace {
 

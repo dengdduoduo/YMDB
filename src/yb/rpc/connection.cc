@@ -418,8 +418,12 @@ void Connection::ParseReceived() {
 }
 
 Result<size_t> Connection::ProcessReceived(ReadBufferFull read_buffer_full) {
+  auto self = shared_from_this();
   auto result = context_->ProcessCalls(
-      shared_from_this(), ReadBuffer().AppendedVecs(), read_buffer_full);
+      self, ReadBuffer().AppendedVecs(), read_buffer_full);
+  // Shutdown resets the read buffer. Do not consume the old parse result if a
+  // call closed the connection while it was being processed.
+  if (shutdown_completed()) return ShutdownStatus();
   VLOG_WITH_PREFIX(4) << "context_->ProcessCalls result: " << AsString(result);
   if (PREDICT_FALSE(!result.ok())) {
     LOG_WITH_PREFIX(WARNING) << "Command sequence failure: " << result.status();

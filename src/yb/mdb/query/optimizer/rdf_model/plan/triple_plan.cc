@@ -261,6 +261,16 @@ std::unique_ptr<BindingIter> TriplePlan::get_binding_iter() const {
 
     yb::mdb::DocDBRangeCache* cache = nullptr;
 
+    if (model.IsConnected() && model.UseStreamingReads()) {
+        auto* read_context = yb::mdb::DocDBReadContextScope::Current();
+        if (!read_context) throw QueryException("Streaming scan requires a query read context");
+        return std::make_unique<DocDBScan>(
+            nullptr, perm_index, std::move(ranges), 3,
+            subject, predicate, object, subject_assigned, predicate_assigned, object_assigned,
+            check_c0_eq_c1, check_c1_eq_c2, check_c0_eq_c2,
+            model.GetTable(perm_index), read_context);
+    }
+
     uint64_t assigned_c0 = 0;
     bool c0_known = false;
     switch (perm_index) {
@@ -300,7 +310,7 @@ std::unique_ptr<BindingIter> TriplePlan::get_binding_iter() const {
     }
 
     return std::make_unique<DocDBScan>(
-        *cache, perm_index,
+        cache, perm_index,
         std::move(ranges), 3,
         subject, predicate, object,
         subject_assigned, predicate_assigned, object_assigned,

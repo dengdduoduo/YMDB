@@ -15,6 +15,8 @@
 
 #include <fstream>
 #include <memory>
+#include <mutex>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -60,6 +62,8 @@
 #include "yb/mdb/import/nt_parser.h"
 #include "yb/mdb/model/rdf_yb_model.h"
 #include "yb/mdb/storage/yb_client_compat.h"
+#include "yb/mdb/storage/rdf_table_schema.h"
+#include "yb/mdb/storage/docdb_read_context.h"
 #include "yb/server/hybrid_clock.h"
 #include "yb/util/logging.h"
 #include "yb/util/status.h"
@@ -77,6 +81,28 @@ std::unordered_map<uint64_t, ObjectId> g_gmap_to_pack;
 std::unordered_map<uint64_t, uint64_t> g_pack_to_gmap;
 
 namespace {
+
+// Parsing still touches shared term maps. Serialize the public adapter until
+// those maps are query-owned too; callbacks must not re-enter this adapter.
+std::mutex adapter_mutex;
+thread_local bool adapter_entered = false;
+
+class AdapterScope {
+ public:
+  AdapterScope() : lock_(adapter_mutex, std::defer_lock) {
+    if (!adapter_entered) {
+      lock_.lock();
+      adapter_entered = true;
+    }
+  }
+  ~AdapterScope() {
+    if (lock_.owns_lock()) adapter_entered = false;
+  }
+  bool entered() const { return lock_.owns_lock(); }
+
+ private:
+  std::unique_lock<std::mutex> lock_;
+};
 
 std::unique_ptr<yb::mdb::IdMap> g_id_map;
 
@@ -212,6 +238,8 @@ void RebindOpId(Id& id) {
   auto it = g_pack_to_gmap.find(oid);
   if (it != g_pack_to_gmap.end()) {
     id = ObjectId(it->second);
+  } else if (yb::mdb::RdfYBModel::Instance().UseStreamingReads()) {
+    id = ObjectId::get_not_found();
   }
 }
 
@@ -335,6 +363,8 @@ int ExecuteSparql(
     YBCMdbRowCallback row_callback,
     void* ctx)
 {
+  QueryContext query_context;
+  QueryContextScope query_scope(query_context);
   QueryParser qp(query_text);
   if (qp.parser.getNumberOfSyntaxErrors() > 0) {
     return 1;
@@ -357,15 +387,33 @@ int ExecuteSparql(
 
   op = QueryParser::rewrite(std::move(op));
 
-  if (!g_pack_to_gmap.empty()) {
+  if (!g_pack_to_gmap.empty() || yb::mdb::RdfYBModel::Instance().UseStreamingReads()) {
     RebindOpIds(op);
   }
 
   auto& model = yb::mdb::RdfYBModel::Instance();
-  bool use_snapshot = model.UseTransactions();
-  if (use_snapshot) {
-    (void)model.BeginReadSnapshot();
+  std::unique_ptr<yb::mdb::DocDBReadContext> read_context;
+  std::optional<yb::mdb::DocDBReadContextScope> read_scope;
+  const bool use_stream = model.IsConnected() && model.UseStreamingReads();
+  const bool use_snapshot = model.IsConnected() && model.UseTransactions() && !use_stream;
+  if (use_stream) {
+    auto result = model.NewQueryReadContext();
+    if (!result.ok()) {
+      LOG(WARNING) << "Cannot start MDB streaming read: " << result.status();
+      return 1;
+    }
+    read_context = std::move(*result);
+    read_scope.emplace(*read_context);
+  } else if (use_snapshot) {
+    auto status = model.BeginReadSnapshot();
+    if (!status.ok()) {
+      LOG(WARNING) << "Cannot start MDB read: " << status;
+      return 1;
+    }
   }
+  auto snapshot_cleanup = yb::ScopeExit([&] {
+    if (use_snapshot) model.EndReadSnapshot();
+  });
 
   BindingIterConstructor optimizer;
   op->accept_visitor(optimizer);
@@ -425,9 +473,6 @@ int ExecuteSparql(
         }
       }
 
-      if (use_snapshot) {
-        model.EndReadSnapshot();
-      }
       return 0;
     }
   }
@@ -439,14 +484,21 @@ int ExecuteSparql(
   Binding binding(get_query_ctx().get_var_size());
   iter->begin(binding);
 
+  std::vector<VarId> output_vars;
+  if (const auto* select = dynamic_cast<const OpSelect*>(op.get())) {
+    output_vars = select->vars;
+  } else {
+    for (std::size_t i = 0; i < binding.size; ++i) output_vars.emplace_back(i);
+  }
+
   while (iter->next()) {
-    for (std::size_t i = 0; i < binding.size; i++) {
-      const auto& oid = binding[VarId(i)];
+    for (const auto& var : output_vars) {
+      const auto& oid = binding[var];
       if (oid.is_null()) {
         continue;
       }
 
-      auto var_name = get_query_ctx().get_var_name(VarId(i));
+      auto var_name = get_query_ctx().get_var_name(var);
       if (var_name.empty()) {
         continue;
       }
@@ -454,10 +506,6 @@ int ExecuteSparql(
       auto value_str = IdToString(oid.id);
       row_callback(var_name.c_str(), value_str.c_str(), ctx);
     }
-  }
-
-  if (use_snapshot) {
-    model.EndReadSnapshot();
   }
 
   return 0;
@@ -563,6 +611,8 @@ int YBCMdbExecuteSparql(
     YBCMdbRowCallback row_callback,
     void* ctx)
 {
+  AdapterScope scope;
+  if (!scope.entered()) return 1;
   if (query_text == nullptr || row_callback == nullptr) {
     return 1;
   }
@@ -577,10 +627,20 @@ int YBCMdbExecuteSparql(
     }
   }
 
-  return ExecuteSparql(query_str, row_callback, ctx);
+  try {
+    return ExecuteSparql(query_str, row_callback, ctx);
+  } catch (const std::exception& error) {
+    LOG(WARNING) << "MDB query failed: " << error.what();
+    return 1;
+  } catch (...) {
+    LOG(WARNING) << "MDB query failed with an unknown exception";
+    return 1;
+  }
 }
 
 int YBCMdbInitCluster(const char* master_addrs, const char* keyspace) {
+  AdapterScope scope;
+  if (!scope.entered()) return 1;
   if (master_addrs == nullptr || keyspace == nullptr) {
     return 1;
   }
@@ -622,13 +682,7 @@ int YBCMdbInitCluster(const char* master_addrs, const char* keyspace) {
         yb::mdb::RdfYBModel::kTableNames[i]);
 
     yb::client::YBSchemaBuilder builder;
-    builder.AddColumn("c0")->Type(yb::DataType::INT64)->HashPrimaryKey()->NotNull();
-    builder.AddColumn("c1")->Type(yb::DataType::INT64)->PrimaryKey()->NotNull();
-    builder.AddColumn("c2")->Type(yb::DataType::INT64)->PrimaryKey()->NotNull();
-
-    yb::TableProperties table_properties;
-    table_properties.SetTransactional(true);
-    builder.SetTableProperties(table_properties);
+    yb::mdb::ConfigureRdfTableSchema(&builder);
 
     yb::client::TableHandle tmp;
     auto status = tmp.Create(table_name, 1, g_yb_client.get(), &builder);
@@ -665,6 +719,8 @@ int YBCMdbInitCluster(const char* master_addrs, const char* keyspace) {
 }
 
 int YBCMdbImportFile(const char* file_path) {
+  AdapterScope scope;
+  if (!scope.entered()) return 1;
   if (file_path == nullptr) {
     return 1;
   }

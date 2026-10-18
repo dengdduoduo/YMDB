@@ -76,6 +76,10 @@ class StreamReadBuffer {
 
 class StreamContext {
  public:
+  // Retain the owning connection across stream event callbacks. Processing a
+  // call may close the connection and release the reactor's last reference.
+  virtual ConnectionPtr GetConnection() = 0;
+
   virtual void UpdateLastActivity() = 0;
   virtual void UpdateLastRead() = 0;
   virtual void UpdateLastWrite() = 0;

@@ -25,6 +25,18 @@ namespace yb::mdb {
 Status ScatterExecutor::Execute(const DistributedPlan& plan,
                                 std::vector<FragmentResultSet>* results) {
   results->clear();
+  // The local iterator currently ignores tablet bounds. Reject the entire
+  // plan before producing any rows; DISTINCT cannot repair incorrect input
+  // ownership for joins, aggregates, or bag-valued query results.
+  for (const auto& fragment : plan.fragments()) {
+    if (!fragment.tablet_id.empty() || !fragment.partition_start.empty() ||
+        !fragment.partition_end.empty()) {
+      return STATUS(NotSupported, "Tablet-scoped MDB fragment execution is not implemented");
+    }
+  }
+  if (plan.num_fragments() > 1) {
+    return STATUS(NotSupported, "MDB fragments require disjoint input ownership");
+  }
   results->reserve(plan.num_fragments());
 
   for (const auto& fragment : plan.fragments()) {

@@ -116,6 +116,8 @@ class Connection final : public StreamContext, public std::enable_shared_from_th
 
   ~Connection();
 
+  ConnectionPtr GetConnection() override { return shared_from_this(); }
+
   CoarseTimePoint last_activity_time() const {
     return last_activity_time_.load(std::memory_order_acquire);
   }

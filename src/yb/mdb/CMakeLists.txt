@@ -33,6 +33,8 @@ set(MDB_STORAGE_SRCS
     model/rdf_yb_model.cc
     storage/docdb_key_encoder.cc
     storage/docdb_range_cache.cc
+    storage/docdb_scan_cursor.cc
+    storage/docdb_read_context.cc
     storage/leapfrog_docdb_iter.cc
 )
 
@@ -182,6 +184,8 @@ YB_TEST_TARGET_LINK_LIBRARIES(mdb_distributed_test yb_mdb)
 
 ADD_YB_TEST(mdb_distributed_integration_test)
 YB_TEST_TARGET_LINK_LIBRARIES(mdb_distributed_integration_test yb_mdb integration-tests)
+# This test now includes the same conversion headers as the pipeline test.
+target_compile_options(mdb_distributed_integration_test PRIVATE -Wno-shorten-64-to-32)
 
 # ---- MDB CLI Tool ----
 add_executable(mdb_cli tools/mdb_cli.cc)

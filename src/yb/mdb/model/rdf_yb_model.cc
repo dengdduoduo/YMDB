@@ -30,6 +30,7 @@
 #include "yb/common/transaction.h"
 #include "yb/gutil/macros.h"
 #include "yb/mdb/storage/yb_client_compat.h"
+#include "yb/mdb/storage/docdb_read_context.h"
 #include "yb/server/clock.h"
 #include "yb/util/status.h"
 
@@ -268,6 +269,14 @@ Status RdfYBModel::BeginReadSnapshot() {
   return Status::OK();
 }
 
+Result<std::unique_ptr<DocDBReadContext>> RdfYBModel::NewQueryReadContext() {
+  if (!connected_) return STATUS(IllegalState, "MDB model is not connected");
+  if (!use_transactions_) return STATUS(NotSupported, "Streaming reads require transactions");
+  auto context = VERIFY_RESULT(DocDBReadContext::Create(client_, txn_manager_.get()));
+  context->page_rows = streaming_page_rows_;
+  return context;
+}
+
 void RdfYBModel::EndReadSnapshot() {
   if (read_session_) {
     LOG(INFO) << "End read snapshot";
@@ -287,6 +296,8 @@ void RdfYBModel::ClearAll() {
     tables_[i] = client::TableHandle();
   }
   write_session_.reset();
+  // Abort callbacks reference the manager. Drain them while its Impl still exists.
+  if (txn_manager_) txn_manager_->Shutdown();
   txn_manager_.reset();
   client_ = nullptr;
   term_dictionary_ = PersistentIdMap();

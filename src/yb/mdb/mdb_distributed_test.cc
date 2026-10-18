@@ -157,6 +157,45 @@ TEST(ScatterExecutorTest, EmptyPlan) {
   ASSERT_EQ(results.size(), 0);
 }
 
+TEST(ScatterExecutorTest, RejectTabletBeforeExecutingAnyFragment) {
+  ScatterExecutor executor;
+  DistributedPlan plan;
+  // A local fragment first ensures validation happens before any execution.
+  plan.AddFragment(TabletFragment{});
+  TabletFragment fragment{};
+  fragment.tablet_id = "tablet_a";
+  plan.AddFragment(std::move(fragment));
+  std::vector<ScatterExecutor::FragmentResultSet> results(1);
+  const auto status = executor.Execute(plan, &results);
+  ASSERT_TRUE(status.IsNotSupported()) << status;
+  ASSERT_TRUE(results.empty());
+}
+
+TEST(ScatterExecutorTest, RejectUnprovenInputOwnership) {
+  ScatterExecutor executor;
+  DistributedPlan plan;
+  plan.AddFragment(TabletFragment{});
+  plan.AddFragment(TabletFragment{});
+  std::vector<ScatterExecutor::FragmentResultSet> results;
+  const auto status = executor.Execute(plan, &results);
+  ASSERT_TRUE(status.IsNotSupported()) << status;
+  ASSERT_TRUE(results.empty());
+}
+
+TEST(ScatterExecutorTest, RejectPartitionBoundsWithoutTabletId) {
+  ScatterExecutor executor;
+  for (bool start_bound : {false, true}) {
+    DistributedPlan plan;
+    TabletFragment fragment{};
+    (start_bound ? fragment.partition_start : fragment.partition_end) = "boundary";
+    plan.AddFragment(std::move(fragment));
+    std::vector<ScatterExecutor::FragmentResultSet> results;
+    const auto status = executor.Execute(plan, &results);
+    ASSERT_TRUE(status.IsNotSupported()) << status;
+    ASSERT_TRUE(results.empty());
+  }
+}
+
 TEST(DistributedJoinTest, AnalyzeJoinSingleFragment) {
   TabletRouter router;
   DistributedJoinOptimizer optimizer(&router);

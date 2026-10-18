@@ -36,6 +36,7 @@ class YBTransaction;
 namespace yb::mdb {
 
 class IdMap;
+class DocDBReadContext;
 
 class RdfYBModel {
  public:
@@ -81,6 +82,12 @@ class RdfYBModel {
   void SetUseTransactions(bool val) { use_transactions_ = val; }
   bool UseTransactions() const { return use_transactions_; }
 
+  // Opt-in until streaming correctness and supported query shapes are validated.
+  void SetUseStreamingReads(bool value) { use_streaming_reads_ = value; }
+  bool UseStreamingReads() const { return use_streaming_reads_; }
+  void SetStreamingPageRows(size_t value) { streaming_page_rows_ = value; }
+  Result<std::unique_ptr<DocDBReadContext>> NewQueryReadContext();
+
   Status BeginTransaction();
   Status CommitTransaction();
   Status AbortTransaction();
@@ -101,6 +108,8 @@ class RdfYBModel {
   bool connected_ = false;
   bool use_partition_load_ = true;
   bool use_transactions_ = true;
+  bool use_streaming_reads_ = false;
+  size_t streaming_page_rows_ = 256;
   yb::client::YBClient* client_ = nullptr;
   yb::client::TableHandle tables_[6];
   yb::client::YBSessionPtr write_session_;

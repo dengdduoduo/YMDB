@@ -25,6 +25,8 @@ DEFINE_string(mdb_masters, "127.0.0.1:7100", "Master addresses");
 DEFINE_string(mdb_keyspace, "mdb_test", "Keyspace name");
 DEFINE_bool(mdb_use_partition_load, true, "Use partition loading for queries");
 DEFINE_bool(mdb_use_transactions, true, "Use distributed transactions for import consistency and query snapshots");
+DEFINE_bool(mdb_streaming_reads, false, "Use query-owned transactional paged MDB reads (experimental)");
+DEFINE_uint32(mdb_scan_page_rows, 256, "Maximum rows per MDB streaming storage page");
 
 static int RunInit(int argc, char* argv[]) {
   if (argc < 2) {
@@ -55,6 +57,8 @@ static int RunQuery(int argc, char* argv[]) {
   }
 
   yb::mdb::RdfYBModel::Instance().SetUsePartitionLoad(FLAGS_mdb_use_partition_load);
+  yb::mdb::RdfYBModel::Instance().SetUseStreamingReads(FLAGS_mdb_streaming_reads);
+  yb::mdb::RdfYBModel::Instance().SetStreamingPageRows(FLAGS_mdb_scan_page_rows);
   yb::mdb::RdfYBModel::Instance().SetUseTransactions(FLAGS_mdb_use_transactions);
 
   int init_ret = YBCMdbInitCluster(
@@ -81,6 +85,9 @@ static int RunQuery(int argc, char* argv[]) {
   };
 
   int ret = YBCMdbExecuteSparql(query.c_str(), callback, &ctx);
+  // A later page can fail after callbacks have delivered earlier rows.
+  // Do not print that incomplete result as a successful query answer.
+  if (ret != 0) return ret;
 
   if (ctx.bindings.empty()) {
     return ret;

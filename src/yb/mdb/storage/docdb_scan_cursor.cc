@@ -1,0 +1,170 @@
+// Copyright (c) YugabyteDB, Inc.
+
+#include "yb/mdb/storage/docdb_scan_cursor.h"
+
+#include <algorithm>
+#include <utility>
+
+#include "yb/client/session.h"
+#include "yb/client/table_handle.h"
+#include "yb/client/yb_op.h"
+#include "yb/common/ql_protocol_util.h"
+#include "yb/dockv/partition.h"
+#include "yb/mdb/storage/yb_client_compat.h"
+
+namespace yb::mdb {
+namespace {
+template <class Session>
+void StartPageArena(const Session& session) {
+  // Newer clients otherwise retain every page's protobuf allocations for the
+  // entire session. All reads here flush synchronously; outstanding cursor
+  // operations retain their own arena until their continuation is consumed.
+  if constexpr (requires { session->ResetArena(nullptr); }) {
+    session->ResetArena(nullptr);
+  }
+}
+}  // namespace
+
+Status DocDBScanCursor::Open(
+    const client::TableHandle* table, client::YBSessionPtr session, DocDBScanSpec spec) {
+  Close();
+  if (!table || !session) return STATUS(InvalidArgument, "Missing MDB scan table or session");
+  if (spec.page_rows == 0 || spec.page_bytes < sizeof(DocDBScanBatch::Row)) {
+    return STATUS(InvalidArgument, "MDB scan page budget cannot hold one row");
+  }
+  for (const auto* bound : {&spec.partition_start, &spec.partition_end}) {
+    if (!bound->empty() && bound->size() != sizeof(uint16_t)) {
+      return STATUS(NotSupported, "MDB scan requires encoded YCQL hash partition bounds");
+    }
+  }
+  if (!spec.partition_end.empty() && spec.partition_start >= spec.partition_end) {
+    return STATUS(InvalidArgument, "MDB scan partition bounds are empty or reversed");
+  }
+  row_limit_ = std::min(spec.page_rows, spec.page_bytes / sizeof(DocDBScanBatch::Row));
+  table_ = table;
+  session_ = std::move(session);
+  spec_ = std::move(spec);
+  for (const auto& range : spec_.columns) {
+    if (range.min > range.max) eof_ = true;
+  }
+  return Status::OK();
+}
+
+Result<DocDBScanBatch> DocDBScanCursor::NextBatch() {
+  if (!table_) return STATUS(IllegalState, "MDB scan cursor is closed");
+  RETURN_NOT_OK(failure_);
+  auto result = ReadPage();
+  if (!result.ok()) {
+    // A failed read must never become EOF or silently restart at a new view.
+    failure_ = result.status();
+    previous_.reset();
+  }
+  return result;
+}
+
+Result<DocDBScanBatch> DocDBScanCursor::ReadPage() {
+  if (spec_.cancelled && spec_.cancelled->load(std::memory_order_relaxed)) {
+    return STATUS(Aborted, "MDB scan cancelled");
+  }
+  if (CoarseMonoClock::Now() >= spec_.deadline) {
+    return STATUS(TimedOut, "MDB scan deadline exceeded");
+  }
+  DocDBScanBatch batch;
+  if (eof_) {
+    batch.eof = true;
+    return batch;
+  }
+  if (session_->IsRestartRequired()) {
+    return STATUS(TryAgain, "MDB query read view requires restart");
+  }
+  StartPageArena(session_);
+  auto op = NewMdbReadOp(*table_, session_);
+  auto* req = op->mutable_request();
+  if (spec_.hash_key) {
+    QLAddInt64HashValue(req, static_cast<int64_t>(*spec_.hash_key));
+    std::string key;
+    RETURN_NOT_OK(op->GetPartitionKey(&key));
+    if (key < spec_.partition_start ||
+        (!spec_.partition_end.empty() && key >= spec_.partition_end)) {
+      eof_ = batch.eof = true;
+      return batch;
+    }
+  } else {
+    if (!spec_.partition_start.empty()) {
+      req->set_hash_code(dockv::PartitionSchema::DecodeMultiColumnHashValue(spec_.partition_start));
+    }
+    if (!spec_.partition_end.empty()) {
+      const auto end = dockv::PartitionSchema::DecodeMultiColumnHashValue(spec_.partition_end);
+      if (end == 0) {
+        eof_ = batch.eof = true;
+        return batch;
+      }
+      req->set_max_hash_code(end - 1);
+    }
+  }
+  table_->AddColumns({"c0", "c1", "c2"}, req);
+  req->set_limit(row_limit_);
+  req->set_return_paging_state(true);
+  if (previous_) {
+    *req->mutable_paging_state() = previous_->response().paging_state();
+  }
+  session_->SetDeadline(spec_.deadline);
+  ++rpc_calls_;
+  RETURN_NOT_OK(session_->TEST_ApplyAndFlush(op));
+  if (session_->IsRestartRequired()) {
+    return STATUS(TryAgain, "MDB query read view requires restart");
+  }
+  if (op->response().status() != QLResponsePB::YQL_STATUS_OK) {
+    return STATUS(RuntimeError, "MDB scan failed: " + std::string(op->response().error_message()));
+  }
+  auto rows = VERIFY_RESULT(op->MakeRowBlock());
+  if (rows.row_count() > row_limit_) {
+    return STATUS(Corruption, "MDB scan response exceeds requested row budget");
+  }
+  batch.rows.reserve(rows.row_count());
+  for (const auto& row : rows.rows()) {
+    DocDBScanBatch::Row values;
+    bool matches = true;
+    for (int column = 0; column < 3; ++column) {
+      if (row.column(column).IsNull()) return STATUS(Corruption, "Null MDB index key");
+      values[column] = static_cast<uint64_t>(row.column(column).int64_value());
+      const auto& range = spec_.columns[column];
+      matches = matches && values[column] >= range.min && values[column] <= range.max;
+    }
+    if (matches) batch.rows.push_back(values);
+  }
+  eof_ = !op->response().has_paging_state();
+  if (!eof_) {
+    const auto& next = op->response().paging_state();
+    const std::string next_partition(next.next_partition_key());
+    if (!spec_.partition_end.empty() && next_partition >= spec_.partition_end) {
+      eof_ = true;
+    } else if (!next_partition.empty() && next_partition < spec_.partition_start) {
+      return STATUS(Corruption, "MDB scan continuation moved before its partition boundary");
+    }
+    if (!eof_ && previous_) {
+      const auto& old = previous_->response().paging_state();
+      if (next.next_partition_key() == old.next_partition_key() &&
+          next.next_row_key() == old.next_row_key()) {
+        return STATUS(Corruption, "MDB scan continuation did not advance");
+      }
+    }
+  }
+  batch.eof = eof_;
+  previous_ = eof_ ? nullptr : std::move(op);
+  // An empty filtered page is not EOF when the server provided continuation.
+  return batch;
+}
+
+void DocDBScanCursor::Close() {
+  previous_.reset();
+  session_.reset();
+  table_ = nullptr;
+  spec_ = DocDBScanSpec();
+  failure_ = Status::OK();
+  row_limit_ = 0;
+  eof_ = false;
+  rpc_calls_ = 0;
+}
+
+}  // namespace yb::mdb

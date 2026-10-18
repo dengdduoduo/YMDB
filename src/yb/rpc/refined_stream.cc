@@ -162,6 +162,10 @@ Result<size_t> RefinedStream::ProcessReceived(ReadBufferFull read_buffer_full) {
   return STATUS_FORMAT(IllegalState, "Unexpected state: $0", std::to_underlying(state_));
 }
 
+ConnectionPtr RefinedStream::GetConnection() {
+  return context_->GetConnection();
+}
+
 Status RefinedStream::Connected() {
   if (local_side_ != LocalSide::kClient) {
     return Status::OK();

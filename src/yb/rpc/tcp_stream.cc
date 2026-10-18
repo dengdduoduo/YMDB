@@ -14,6 +14,7 @@
 #include <deque>
 
 #include "yb/rpc/tcp_stream.h"
+#include "yb/rpc/connection.h"
 
 #include "yb/rpc/outbound_data.h"
 #include "yb/rpc/rpc_introspection.pb.h"
@@ -121,6 +122,8 @@ Status TcpStream::DoStart(ev::loop_ref* loop, bool connect) {
 }
 
 void TcpStream::DelayConnectHandler(ev::timer& watcher, int revents) { // NOLINT
+  auto connection = context_->GetConnection();
+  if (connection->shutdown_completed()) return;
   if (EV_ERROR & revents) {
     LOG_WITH_PREFIX(WARNING) << "Got an error in handle delay connect";
     return;
@@ -265,6 +268,10 @@ void TcpStream::PopSending() {
 }
 
 void TcpStream::Handler(ev::io& watcher, int revents) {  // NOLINT
+  // A protocol callback can remove this connection from its reactor. Keep the
+  // entire stream chain alive until this event, including its epilogue, returns.
+  auto connection = context_->GetConnection();
+  if (connection->shutdown_completed()) return;
   DVLOG_WITH_PREFIX(4) << "Handler(revents=" << revents << ")";
   Status status = Status::OK();
   if (revents & ev::ERROR) {
@@ -279,6 +286,8 @@ void TcpStream::Handler(ev::io& watcher, int revents) {  // NOLINT
     }
   }
 
+  if (connection->shutdown_completed()) return;
+
   if (status.ok() && (revents & ev::WRITE)) {
     bool just_connected = !connected_;
     if (just_connected) {
@@ -288,6 +297,7 @@ void TcpStream::Handler(ev::io& watcher, int revents) {  // NOLINT
         VLOG_WITH_PREFIX(3) << "Connected() returned error: " << status;
       }
     }
+    if (connection->shutdown_completed()) return;
     if (status.ok()) {
       status = WriteHandler(just_connected);
       if (!status.ok()) {
@@ -295,6 +305,8 @@ void TcpStream::Handler(ev::io& watcher, int revents) {  // NOLINT
       }
     }
   }
+
+  if (connection->shutdown_completed()) return;
 
   if (status.ok()) {
     UpdateEvents();
@@ -393,7 +405,10 @@ Result<bool> TcpStream::Receive() {
 }
 
 void TcpStream::ParseReceived() {
+  auto connection = context_->GetConnection();
+  if (connection->shutdown_completed()) return;
   auto result = TryProcessReceived();
+  if (connection->shutdown_completed()) return;
   if (!result.ok()) {
     context_->Destroy(result.status());
     return;
