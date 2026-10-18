@@ -1,0 +1,76 @@
+title: YCQLAuditConfig
+description: YCQL Audit Logging Configuration. Part of AuditLogConfig.
+type: object
+required:
+  - enabled
+properties:
+  enabled:
+    description: Enabled
+    type: boolean
+  excluded_categories:
+    description: Excluded Categories
+    type: array
+    items:
+      enum:
+        - QUERY
+        - DML
+        - DDL
+        - DCL
+        - AUTH
+        - PREPARE
+        - ERROR
+        - OTHER
+      type: string
+    uniqueItems: true
+  excluded_keyspaces:
+    description: Excluded Keyspaces
+    type: array
+    items:
+      type: string
+    uniqueItems: true
+  excluded_users:
+    description: Excluded Users
+    type: array
+    items:
+      type: string
+    uniqueItems: true
+  included_categories:
+    description: Included categories
+    type: array
+    items:
+      enum:
+        - QUERY
+        - DML
+        - DDL
+        - DCL
+        - AUTH
+        - PREPARE
+        - ERROR
+        - OTHER
+      type: string
+    uniqueItems: true
+  included_keyspaces:
+    description: Included Keyspaces
+    type: array
+    items:
+      type: string
+    uniqueItems: true
+  included_users:
+    description: Included Users
+    type: array
+    items:
+      type: string
+    uniqueItems: true
+  log_level:
+    description: Log Level
+    type: string
+    enum:
+      - INFO
+      - WARNING
+      - ERROR
+  log_retention_days:
+    description: |
+      Number of days to keep gzipped YCQL audit log archives on the node. 0 or unset disables the dedicated audit-log retention pipeline and keeps the default size-based tserver log purge behavior.
+    type: integer
+    format: int32
+    minimum: 0

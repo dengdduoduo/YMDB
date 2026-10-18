@@ -1,0 +1,1194 @@
+// Copyright (c) YugabyteDB, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
+// in compliance with the License.  You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software distributed under the License
+// is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express
+// or implied.  See the License for the specific language governing permissions and limitations
+// under the License.
+
+#include "yb/client/table_info.h"
+
+#include "yb/client/client-test-util.h"
+
+#include "yb/common/ql_type.h"
+#include "yb/common/transaction.h"
+
+#include "yb/master/catalog_manager.h"
+#include "yb/master/catalog_manager_if.h"
+#include "yb/master/mini_master.h"
+#include "yb/master/sys_catalog_constants.h"
+#include "yb/tablet/tablet.h"
+#include "yb/tablet/tablet_peer.h"
+#include "yb/util/async_util.h"
+#include "yb/util/backoff_waiter.h"
+#include "yb/util/monotime.h"
+#include "yb/util/sync_point.h"
+#include "yb/util/test_thread_holder.h"
+#include "yb/yql/pgwrapper/libpq_test_base.h"
+#include "yb/yql/pgwrapper/libpq_utils.h"
+#include "yb/yql/pgwrapper/pg_mini_test_base.h"
+
+DECLARE_string(allowed_preview_flags_csv);
+DECLARE_bool(ysql_yb_enable_ddl_savepoint_support);
+DECLARE_bool(ysql_yb_ddl_transaction_block_enabled);
+DECLARE_bool(yb_enable_read_committed_isolation);
+DECLARE_bool(report_ysql_ddl_txn_status_to_master);
+DECLARE_bool(ysql_ddl_transaction_wait_for_ddl_verification);
+DECLARE_bool(TEST_ysql_ddl_fail_transaction_status_poll);
+DECLARE_int32(TEST_ysql_ddl_atomicity_alter_table_request_delay_ms);
+DECLARE_double(TEST_ysql_ddl_verification_failure_probability);
+DECLARE_int32(ysql_ddl_post_processing_failed_verification_retry_secs);
+
+namespace yb::pgwrapper {
+
+const std::string kDatabase = "yugabyte";
+const auto kTableName = "test";
+const auto kTableName2 = "test2";
+
+YB_STRONGLY_TYPED_BOOL(MarkedForDeletion);
+YB_STRONGLY_TYPED_BOOL(TestCommit);
+
+enum class DdlOp : uint8_t {
+  kNone = 0,
+  kCreate = 1 << 0,
+  kAlter = 1 << 1,
+  kDrop = 1 << 2,
+};
+
+inline DdlOp operator|(DdlOp a, DdlOp b) {
+  return static_cast<DdlOp>(static_cast<uint8_t>(a) | static_cast<uint8_t>(b));
+}
+
+inline DdlOp operator&(DdlOp a, DdlOp b) {
+  return static_cast<DdlOp>(static_cast<uint8_t>(a) & static_cast<uint8_t>(b));
+}
+
+inline void VerifyDdlOps(const yb::master::YsqlDdlTxnVerifierStatePB& state, DdlOp expected_ops) {
+  if ((expected_ops & DdlOp::kCreate) == DdlOp::kCreate) {
+    ASSERT_TRUE(state.contains_create_table_op());
+  } else {
+    ASSERT_FALSE(state.contains_create_table_op());
+  }
+
+  if ((expected_ops & DdlOp::kAlter) == DdlOp::kAlter) {
+    ASSERT_TRUE(state.contains_alter_table_op());
+  } else {
+    ASSERT_FALSE(state.contains_alter_table_op());
+  }
+
+  if ((expected_ops & DdlOp::kDrop) == DdlOp::kDrop) {
+    ASSERT_TRUE(state.contains_drop_table_op());
+  } else {
+    ASSERT_FALSE(state.contains_drop_table_op());
+  }
+}
+
+class PgDdlTransactionTest : public LibPqTestBase {
+ public:
+  void UpdateMiniClusterOptions(ExternalMiniClusterOptions* opts) override {
+    LibPqTestBase::UpdateMiniClusterOptions(opts);
+    opts->extra_master_flags.push_back("--ysql_yb_ddl_transaction_block_enabled=true");
+    opts->extra_master_flags.push_back("--yb_enable_read_committed_isolation=true");
+    opts->extra_master_flags.push_back(
+        "--allowed_preview_flags_csv=ysql_yb_ddl_transaction_block_enabled");
+    opts->extra_tserver_flags.push_back("--ysql_pg_conf_csv=log_statement=all");
+    opts->extra_tserver_flags.push_back("--ysql_yb_ddl_transaction_block_enabled=true");
+    opts->extra_tserver_flags.push_back("--yb_enable_read_committed_isolation=true");
+    opts->extra_tserver_flags.push_back(
+        "--allowed_preview_flags_csv=ysql_yb_ddl_transaction_block_enabled,"
+        "ysql_yb_enable_new_relation_fastpath_write_in_txn_blocks");
+    opts->extra_tserver_flags.push_back(
+        Format("--ysql_yb_enable_new_relation_fastpath_write_in_txn_blocks=$0",
+               (RandomUniformBool() ? "true" : "false")));
+  }
+
+  // ysql_yb_disable_ddl_transaction_block_for_read_committed is a non-runtime flag for now, so we
+  // need to restart the cluster.
+  void RestartClusterSetDisableTxnBlockForReadCommitted(bool value) {
+    LOG(INFO) << "Restart the cluster and turn " << (value ? "on" : "off")
+              << " --ysql_yb_disable_ddl_transaction_block_for_read_committed";
+    cluster_->Shutdown();
+    const std::string flag_value = Format(
+        "--ysql_yb_disable_ddl_transaction_block_for_read_committed=$0",
+        value ? "true" : "false");
+    for (size_t i = 0; i != cluster_->num_tablet_servers(); ++i) {
+      cluster_->tablet_server(i)->mutable_flags()->push_back(flag_value);
+    }
+    ASSERT_OK(cluster_->Restart());
+  }
+};
+
+TEST_F(PgDdlTransactionTest, TestTableCreateDropSameTransaction) {
+  auto conn = ASSERT_RESULT(Connect());
+  auto client = ASSERT_RESULT(cluster_->CreateClient());
+  ASSERT_OK(cluster_->SetFlagOnTServers(
+      "report_ysql_ddl_txn_status_to_master", "false"));
+
+  // Table shouldn't exist in DocDB after the transaction commmit.
+  ASSERT_OK(conn.Execute("BEGIN"));
+  ASSERT_OK(conn.Execute("CREATE TABLE txn_create_drop_commit(id int)"));
+  ASSERT_OK(conn.Execute("DROP TABLE txn_create_drop_commit"));
+  ASSERT_OK(conn.Execute("COMMIT"));
+  VerifyTableNotExists(client.get(), kDatabase, "txn_create_drop_commit", 10);
+
+  // Table shouldn't exist in DocDB after the transaction rollback.
+  ASSERT_OK(conn.Execute("BEGIN"));
+  ASSERT_OK(conn.Execute("CREATE TABLE txn_create_drop_rollback(id int)"));
+  ASSERT_OK(conn.Execute("DROP TABLE txn_create_drop_rollback"));
+  ASSERT_OK(conn.Execute("ROLLBACK"));
+  VerifyTableNotExists(client.get(), kDatabase, "txn_create_drop_rollback", 10);
+}
+
+TEST_F(PgDdlTransactionTest, TestTableCreateDropSameTransactionAnotherTableUsedForDisambiguation) {
+  auto conn = ASSERT_RESULT(Connect());
+  auto client = ASSERT_RESULT(cluster_->CreateClient());
+  ASSERT_OK(cluster_->SetFlagOnTServers(
+      "report_ysql_ddl_txn_status_to_master", "false"));
+
+  // The state of the table 'foo' should be used to determine that the transaction was a success.
+  // As a result, the table 'foo' should exist in DocDB.
+  ASSERT_OK(conn.Execute("BEGIN"));
+  ASSERT_OK(conn.Execute("CREATE TABLE txn_create_drop_commit(id int)"));
+  ASSERT_OK(conn.Execute("DROP TABLE txn_create_drop_commit"));
+  ASSERT_OK(conn.Execute("CREATE TABLE foo(id int)"));
+  ASSERT_OK(conn.Execute("COMMIT"));
+  VerifyTableNotExists(client.get(), kDatabase, "txn_create_drop_commit", 10);
+  ASSERT_RESULT(GetTableIdByTableName(client.get(), "yugabyte", "foo"));
+  VerifyTableExists(client.get(), kDatabase, "foo", 10);
+
+  // The state of the table 'bar' should be used to determine that the transaction was an abort.
+  // As a result, the table 'bar' should not exist in DocDB.
+  ASSERT_OK(conn.Execute("BEGIN"));
+  ASSERT_OK(conn.Execute("CREATE TABLE txn_create_drop_rollback(id int)"));
+  ASSERT_OK(conn.Execute("DROP TABLE txn_create_drop_rollback"));
+  ASSERT_OK(conn.Execute("CREATE TABLE bar(id int)"));
+  ASSERT_OK(conn.Execute("ROLLBACK"));
+  VerifyTableNotExists(client.get(), kDatabase, "txn_create_drop_rollback", 10);
+  VerifyTableNotExists(client.get(), kDatabase, "bar", 10);
+}
+
+TEST_F(PgDdlTransactionTest, TestTableDropCommit) {
+  auto conn = ASSERT_RESULT(Connect());
+  auto client = ASSERT_RESULT(cluster_->CreateClient());
+  ASSERT_OK(cluster_->SetFlagOnTServers(
+      "report_ysql_ddl_txn_status_to_master", "false"));
+
+  ASSERT_OK(conn.Execute("CREATE TABLE txn_drop_existing(id int)"));
+  ASSERT_RESULT(GetTableIdByTableName(client.get(), "yugabyte", "txn_drop_existing"));
+
+  ASSERT_OK(conn.Execute("BEGIN"));
+  ASSERT_OK(conn.Execute("DROP TABLE txn_drop_existing"));
+  ASSERT_OK(conn.Execute("COMMIT"));
+  VerifyTableNotExists(client.get(), kDatabase, "txn_drop_existing", 10);
+}
+
+// Test for https://github.com/yugabyte/yugabyte-db/issues/27359.
+TEST_F(PgDdlTransactionTest, TestRewriteAndDropMaterializedViewInTxn) {
+  auto conn = ASSERT_RESULT(Connect());
+  auto client = ASSERT_RESULT(cluster_->CreateClient());
+  ASSERT_OK(cluster_->SetFlagOnTServers(
+      "report_ysql_ddl_txn_status_to_master", "false"));
+
+  ASSERT_OK(conn.Execute("CREATE TABLE transactions (id SERIAL PRIMARY KEY, amount INT)"));
+  ASSERT_OK(conn.Execute("CREATE TABLE foo (id SERIAL PRIMARY KEY)"));
+  ASSERT_OK(conn.Execute("INSERT INTO transactions (amount) VALUES (10), (20), (30)"));
+  ASSERT_OK(conn.Execute(
+      "CREATE MATERIALIZED VIEW sales_summary AS "
+      "SELECT COUNT(*) AS transaction_count, SUM(amount) AS total_amount FROM transactions"));
+  auto row = ASSERT_RESULT((conn.FetchRow<int64_t, int64_t>("SELECT * FROM sales_summary")));
+  std::tuple<int64_t, int64_t> expected_row = {3, 60}; // 3 rows, total amount 10+20+30
+  ASSERT_EQ(row, expected_row);
+
+  ASSERT_OK(conn.Execute("INSERT INTO transactions (amount) VALUES (40)"));
+
+  // Rewrite and drop the materialized view in a transaction. We are using the table 'foo' to
+  // detect whether the transaction was determined to be a success or an abort.
+  ASSERT_OK(conn.Execute("BEGIN"));
+  ASSERT_OK(conn.Execute("REFRESH MATERIALIZED VIEW sales_summary"));
+  ASSERT_OK(conn.Execute("DROP MATERIALIZED VIEW sales_summary"));
+  ASSERT_OK(conn.Execute("ALTER TABLE foo ADD COLUMN new_col INT"));
+  ASSERT_OK(conn.Execute("ROLLBACK"));
+
+  // The transaction must have been deemed as an abort. This can be detected by the absence of the
+  // column 'new_col' in the table 'foo'.
+  auto foo_table_id = ASSERT_RESULT(GetTableIdByTableName(client.get(), kDatabase, "foo"));
+  std::shared_ptr<client::YBTableInfo> foo_table_info = std::make_shared<client::YBTableInfo>();
+  Synchronizer sync;
+  ASSERT_OK(client->GetTableSchemaById(foo_table_id, foo_table_info, sync.AsStatusCallback()));
+  ASSERT_OK(sync.Wait());
+  const auto& columns = foo_table_info->schema.columns();
+  ASSERT_EQ(columns.size(), 1);
+  ASSERT_EQ(columns[0].name(), "id");
+
+  // View should still exist and show the old data as the refresh was rolled back.
+  row = ASSERT_RESULT((conn.FetchRow<int64_t, int64_t>("SELECT * FROM sales_summary")));
+  expected_row = {3, 60};
+  ASSERT_EQ(row, expected_row);
+}
+
+TEST_F(PgDdlTransactionTest, TestReadCommittedTxnDdlDisabled) {
+  auto conn = ASSERT_RESULT(Connect());
+  auto client = ASSERT_RESULT(cluster_->CreateClient());
+
+  ASSERT_OK(conn.Execute("BEGIN ISOLATION LEVEL READ COMMITTED"));
+  ASSERT_OK(conn.Execute("CREATE TABLE foo (id SERIAL PRIMARY KEY)"));
+  ASSERT_OK(conn.Execute("ALTER TABLE foo ADD COLUMN new_col INT"));
+  ASSERT_OK(conn.Execute("ROLLBACK"));
+  auto res = GetTableIdByTableName(client.get(), "yugabyte", "foo");
+  ASSERT_NOK(res);
+  ASSERT_TRUE(res.status().IsNotFound());
+
+  // Disable transactional DDL for READ COMMITTED isolation level. This will make DDLs use
+  // autonomous transactions, which are not rolled back by the enclosing transaction block.
+  RestartClusterSetDisableTxnBlockForReadCommitted(true /* value */);
+  conn = ASSERT_RESULT(Connect());
+  client = ASSERT_RESULT(cluster_->CreateClient());
+
+  ASSERT_OK(conn.Execute("BEGIN ISOLATION LEVEL READ COMMITTED"));
+  ASSERT_OK(conn.Execute("CREATE TABLE foo (id SERIAL PRIMARY KEY)"));
+  ASSERT_OK(conn.Execute("ALTER TABLE foo ADD COLUMN new_col INT"));
+  ASSERT_OK(conn.Execute("ROLLBACK"));
+
+  // The table 'foo' should exist in DocDB after the transaction rollback, as the DDLs were executed
+  // in autonomous transactions.
+  // The column 'new_col' should also exist in the table 'foo'.
+  ASSERT_OK(GetTableIdByTableName(client.get(), "yugabyte", "foo"));
+  ASSERT_OK(conn.Execute("INSERT INTO foo (id, new_col) VALUES (1, 42)"));
+}
+
+class PgDdlTransactionMiniClusterTest : public PgMiniTestBase {
+ protected:
+  void SetUp() override {
+    ANNOTATE_UNPROTECTED_WRITE(FLAGS_ysql_yb_ddl_transaction_block_enabled) = true;
+    ANNOTATE_UNPROTECTED_WRITE(FLAGS_ysql_ddl_post_processing_failed_verification_retry_secs) = 5;
+    pgwrapper::PgMiniTestBase::SetUp();
+  }
+};
+
+TEST_F(PgDdlTransactionMiniClusterTest, TestWaitForSchemaVersionAfterRollback) {
+  auto conn = ASSERT_RESULT(Connect());
+  auto client = ASSERT_RESULT(cluster_->CreateClient());
+
+  ASSERT_OK(conn.Execute("CREATE TABLE foo (id SERIAL PRIMARY KEY)"));
+  auto foo_table_id = ASSERT_RESULT(GetTableIdByTableName(client.get(), "yugabyte", "foo"));
+
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_TEST_ysql_ddl_atomicity_alter_table_request_delay_ms) = 5000;
+
+  // Required ordering of operations to get SCHEMA_VERSION_MISMATCH:
+  // 1. Background verification task (ysql_ddl_verification_task) should call
+  // YsqlDdlTxnCompleteCallback and process the ALTER by clearing the verification state on foo but
+  // not yet sent the ALTER TABLE request to the tablet servers to rollback the schema.
+  // 2. ReportYsqlDdlTxnStatus should be sent and it will observe the cleared verification state on
+  // foo, incorrectly (bug) assume that the table is no longer under verification and call
+  // RemoveDdlTransactionState.
+  // 3. ROLLBACK command returns to the client (bug).
+  //
+  // Now there is a race between the SELECT query and the ALTER request to the tablet servers.
+  // With the right timing, the SELECT query can first observe the schema version 1 for table 'foo'
+  // but later observe the schema version 2 when read is happening on DocDB if the schema bump
+  // happens in between.
+  // Note that this ordering cannot be reproduced by sync points because then the test will hang
+  // forever with the bug fix. This is because with the fix, the ROLLBACK will never return unless
+  // the schema version bump happens while we need the SELECT to start execution before the schema
+  // version bump. Hence, we inject a delay to hit the race condition.
+  SyncPoint::GetInstance()->LoadDependency({
+    {
+      "CatalogManager::YsqlDdlTxnAlterTableHelper:AfterClearYsqlDdlTxnState",
+      "PgClientSession::DdlAtomicityFinishTransaction:BeforeReportYsqlDdlTxnStatus"
+    },
+    {
+      "PgClientSession::DdlAtomicityFinishTransaction:BeforeReportYsqlDdlTxnStatus",
+      "CatalogManager::YsqlDdlTxnCompleteCallback:NoTxnIdOnTable"
+    },
+    {
+      "CatalogManager::YsqlDdlTxnCompleteCallback:NoTxnIdOnTable",
+      "CatalogManager::YsqlDdlTxnAlterTableHelper:SendAlterTableRequestInternal"
+    }
+  });
+  SyncPoint::GetInstance()->ClearTrace();
+  SyncPoint::GetInstance()->EnableProcessing();
+
+  ASSERT_OK(conn.Execute("BEGIN"));
+  ASSERT_OK(conn.Execute("ALTER TABLE foo ADD COLUMN new_col INT"));
+  ASSERT_OK(conn.Execute("ROLLBACK"));
+
+  for (int i = 0; i < 1000; ++i) {
+    ASSERT_OK(conn.Fetch("SELECT * FROM foo"));
+  }
+
+  SyncPoint::GetInstance()->DisableProcessing();
+}
+
+TEST_F(PgDdlTransactionMiniClusterTest, TestPostProcessingFailedPeriodicRetrigger) {
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_ysql_ddl_post_processing_failed_verification_retry_secs) = -1;
+  auto conn = ASSERT_RESULT(Connect());
+  auto client = ASSERT_RESULT(cluster_->CreateClient());
+  auto& catalog_manager = ASSERT_RESULT(cluster_->GetLeaderMiniMaster())->catalog_manager_impl();
+
+  ASSERT_OK(conn.Execute("CREATE TABLE ddl_pp_failed_retrigger (id INT PRIMARY KEY)"));
+
+  // Fail verification task so that it ends up in kDdlPostProcessingFailed state.
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_TEST_ysql_ddl_verification_failure_probability) = 1.0;
+
+  ASSERT_OK(conn.Execute("BEGIN"));
+  ASSERT_OK(conn.Execute("ALTER TABLE ddl_pp_failed_retrigger ADD COLUMN c INT"));
+
+  const auto table_id =
+      ASSERT_RESULT(GetTableIdByTableName(client.get(), kDatabase, "ddl_pp_failed_retrigger"));
+  auto table_info = catalog_manager.GetTableInfo(table_id);
+  ASSERT_NE(table_info, nullptr);
+  const auto txn_id_pb = table_info->LockForRead()->pb_transaction_id();
+  ASSERT_FALSE(txn_id_pb.empty());
+  const auto txn_id = ASSERT_RESULT(FullyDecodeTransactionId(txn_id_pb));
+
+  // Disable YSQL reporting the status to yb-master so that we fully rely on the background task
+  // and mimic the nemesis case when tserver - master communication breaks down.
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_report_ysql_ddl_txn_status_to_master) = false;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_ysql_ddl_transaction_wait_for_ddl_verification) = false;
+  ASSERT_OK(conn.Execute("ROLLBACK"));
+
+  ASSERT_OK(WaitFor(
+      [&] {
+        const auto st = catalog_manager.TEST_GetYsqlDdlVerificationState(txn_id);
+        return Result<bool>(
+            st.has_value() &&
+            *st == master::YsqlDdlVerificationState::kDdlPostProcessingFailed);
+      },
+      MonoDelta::FromSeconds(60),
+      "DDL verification should reach kDdlPostProcessingFailed"));
+
+  LOG(INFO) << "Done waiting for kDdlPostProcessingFailed state";
+
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_ysql_ddl_post_processing_failed_verification_retry_secs) = 1;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_TEST_ysql_ddl_verification_failure_probability) = 0.0;
+
+  ASSERT_OK(WaitFor(
+    [&] {
+      const auto st = catalog_manager.TEST_GetYsqlDdlVerificationState(txn_id);
+      return Result<bool>(
+          !st.has_value() ||
+          *st != master::YsqlDdlVerificationState::kDdlPostProcessingFailed);
+    },
+    MonoDelta::FromSeconds(60),
+    "DDL verification task should have been re-triggered"));
+}
+
+TEST_F(PgDdlTransactionMiniClusterTest, TestPostProcessingFailedDueToFailedStatusPoll) {
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_ysql_ddl_post_processing_failed_verification_retry_secs) = -1;
+  auto conn = ASSERT_RESULT(Connect());
+  auto client = ASSERT_RESULT(cluster_->CreateClient());
+  auto& catalog_manager = ASSERT_RESULT(cluster_->GetLeaderMiniMaster())->catalog_manager_impl();
+
+  ASSERT_OK(conn.Execute("CREATE TABLE ddl_pp_failed_retrigger_poll (id INT PRIMARY KEY)"));
+
+  // Fail status polling so that the DDL verifier fails and ends up in the kDdlPostProcessingFailed
+  // state.
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_TEST_ysql_ddl_fail_transaction_status_poll) = true;
+
+  ASSERT_OK(conn.Execute("BEGIN"));
+  ASSERT_OK(conn.Execute("ALTER TABLE ddl_pp_failed_retrigger_poll ADD COLUMN c INT"));
+
+  const auto table_id =
+      ASSERT_RESULT(GetTableIdByTableName(client.get(), kDatabase, "ddl_pp_failed_retrigger_poll"));
+  auto table_info = catalog_manager.GetTableInfo(table_id);
+  ASSERT_NE(table_info, nullptr);
+  const auto txn_id_pb = table_info->LockForRead()->pb_transaction_id();
+  ASSERT_FALSE(txn_id_pb.empty());
+  const auto txn_id = ASSERT_RESULT(FullyDecodeTransactionId(txn_id_pb));
+
+  // Disable YSQL reporting the status to yb-master so that we fully rely on the background task
+  // and mimic the nemesis case when tserver - master communication breaks down.
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_report_ysql_ddl_txn_status_to_master) = false;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_ysql_ddl_transaction_wait_for_ddl_verification) = false;
+  ASSERT_OK(conn.Execute("ROLLBACK"));
+
+  ASSERT_OK(WaitFor(
+      [&] {
+        const auto st = catalog_manager.TEST_GetYsqlDdlVerificationState(txn_id);
+        return Result<bool>(
+            st.has_value() &&
+            *st == master::YsqlDdlVerificationState::kDdlPostProcessingFailed);
+      },
+      MonoDelta::FromSeconds(60),
+      "DDL verification should reach kDdlPostProcessingFailed"));
+
+  LOG(INFO) << "Done waiting for kDdlPostProcessingFailed state (poll-path setup)";
+
+  // Allow status polling to succeed on retrigger.
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_TEST_ysql_ddl_fail_transaction_status_poll) = false;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_ysql_ddl_post_processing_failed_verification_retry_secs) = 1;
+
+  ASSERT_OK(WaitFor(
+    [&] {
+      const auto st = catalog_manager.TEST_GetYsqlDdlVerificationState(txn_id);
+      return Result<bool>(
+          !st.has_value() ||
+          *st != master::YsqlDdlVerificationState::kDdlPostProcessingFailed);
+    },
+    MonoDelta::FromSeconds(60),
+    "DDL verification task should have been re-triggered"));
+}
+
+TEST_F(PgDdlTransactionTest, TestRenameIndexAndTruncateInTxn) {
+  auto conn = ASSERT_RESULT(Connect());
+
+  const std::string kTable = "rename_truncate_tbl";
+  const std::string kIndex = "rename_truncate_idx";
+  const std::string kRenamedIndex = "rename_truncate_idx_new";
+
+  ASSERT_OK(conn.ExecuteFormat("DROP TABLE IF EXISTS $0 CASCADE", kTable));
+  ASSERT_OK(conn.ExecuteFormat("CREATE TABLE $0 (k INT PRIMARY KEY, v INT)", kTable));
+  ASSERT_OK(conn.ExecuteFormat("CREATE INDEX $0 ON $1 (v)", kIndex, kTable));
+  ASSERT_OK(conn.ExecuteFormat("INSERT INTO $0 VALUES (1, 1)", kTable));
+
+  ASSERT_OK(cluster_->SetFlagOnTServers(
+    "report_ysql_ddl_txn_status_to_master", "false"));
+
+  ASSERT_OK(conn.Execute("BEGIN"));
+  ASSERT_OK(conn.ExecuteFormat("ALTER INDEX $0 RENAME TO $1", kIndex, kRenamedIndex));
+  ASSERT_OK(conn.ExecuteFormat("TRUNCATE TABLE $0", kTable));
+  ASSERT_OK(conn.Execute("COMMIT"));
+
+  for (size_t i = 0; i != cluster_->num_masters(); ++i) {
+    ASSERT_TRUE(cluster_->master(i)->IsProcessAlive())
+        << "Master " << i << " fatally exited";
+  }
+}
+
+TEST_F(PgDdlTransactionTest, TestNoSkipIntentsWriteOnSavepoint) {
+  auto client = ASSERT_RESULT(cluster_->CreateClient());
+  auto conn = ASSERT_RESULT(Connect());
+
+  ASSERT_OK(conn.Execute("SET yb_enable_new_relation_fastpath_write = true"));
+  ASSERT_OK(conn.Execute("SET yb_enable_new_relation_fastpath_write_in_txn_blocks = true"));
+
+  const int nrows = 100;
+  ASSERT_OK(conn.Execute("BEGIN"));
+  ASSERT_OK(conn.Execute("CREATE TABLE users (first_name TEXT, last_name TEXT)"));
+  ASSERT_OK(conn.Execute("CREATE TABLE users2 (first_name TEXT, last_name TEXT)"));
+  ASSERT_OK(conn.Execute("CREATE TABLE users3 (first_name TEXT, last_name TEXT)"));
+  ASSERT_OK(conn.ExecuteFormat(
+      "INSERT INTO users SELECT md5(random()::text), md5(random()::text) FROM "
+      "(SELECT * FROM generate_series(1,$0) AS id) AS id", nrows));
+  ASSERT_OK(conn.Execute("SAVEPOINT sp1; -- currentSubTransactionId = 2"));
+  ASSERT_OK(conn.ExecuteFormat(
+      "INSERT INTO users2 SELECT md5(random()::text), md5(random()::text) FROM "
+      "(SELECT * FROM generate_series(1,$0) AS id) AS id", nrows));
+  ASSERT_OK(conn.Execute("SAVEPOINT sp2; -- currentSubTransactionId = 3"));
+  ASSERT_OK(conn.ExecuteFormat(
+      "INSERT INTO users3 SELECT md5(random()::text), md5(random()::text) FROM "
+      "(SELECT * FROM generate_series(1,$0) AS id) AS id", nrows));
+  ASSERT_OK(conn.Execute("ROLLBACK TO SAVEPOINT sp2; -- currentSubTransactionId = 2"));
+  ASSERT_OK(conn.Execute("COMMIT"));
+
+  auto count = ASSERT_RESULT(conn.FetchRow<PGUint64>(("SELECT COUNT(*) FROM users")));
+  ASSERT_EQ(count, nrows);
+  count = ASSERT_RESULT(conn.FetchRow<PGUint64>(("SELECT COUNT(*) FROM users2")));
+  ASSERT_EQ(count, nrows);
+  count = ASSERT_RESULT(conn.FetchRow<PGUint64>(("SELECT COUNT(*) FROM users3")));
+  ASSERT_EQ(count, 0);
+}
+
+class PgDdlSavepointMiniClusterTest : public PgMiniTestBase,
+                                      public ::testing::WithParamInterface<TestCommit> {
+ protected:
+  void SetUp() override {
+    ANNOTATE_UNPROTECTED_WRITE(FLAGS_allowed_preview_flags_csv) =
+        "ysql_yb_enable_ddl_savepoint_support";
+    ANNOTATE_UNPROTECTED_WRITE(FLAGS_ysql_yb_ddl_transaction_block_enabled) = true;
+    ANNOTATE_UNPROTECTED_WRITE(FLAGS_ysql_yb_enable_ddl_savepoint_support) = true;
+
+    // Disable READ_COMMITTED isolation because it creates additional savepoints (sub_transactions)
+    // for a statement that requires special handling when asserting the size of
+    // ysql_ddl_txn_verifier_state.
+    ANNOTATE_UNPROTECTED_WRITE(FLAGS_yb_enable_read_committed_isolation) = false;
+    pgwrapper::PgMiniTestBase::SetUp();
+  }
+
+  struct PersistedColumnInformation {
+    std::string name;
+    PersistentDataType persistent_data_type;
+    MarkedForDeletion marked_for_deletion;
+  };
+
+  void ValidateSchemaColumns(
+      const SchemaPB& schema,
+      const std::vector<PersistedColumnInformation>& expected_column_informations) {
+    std::unordered_map<std::string, const ColumnSchemaPB*> schema_columns;
+    for (const auto& column : schema.columns()) {
+      schema_columns[column.name()] = &column;
+    }
+
+    EXPECT_EQ(schema_columns.size(), expected_column_informations.size());
+    for (const auto& [column_name, expected_column_type, expected_marked_for_deletion] :
+         expected_column_informations) {
+      SCOPED_TRACE(Format("column_name: $0", column_name));
+      auto column_info = *ASSERT_NOTNULL(FindOrNull(schema_columns, column_name));
+      EXPECT_EQ(column_info->type().main(), expected_column_type);
+      EXPECT_EQ(
+          MarkedForDeletion(column_info->marked_for_deletion()), expected_marked_for_deletion);
+    }
+  }
+
+  struct ColumnInformation {
+    std::string name;
+    DataType data_type;
+  };
+
+  void ValidateTabletSchema(
+      const TableId table_id, const std::vector<ColumnInformation>& expected_column_informations) {
+    auto tablet_peers = ListTableTabletPeers(cluster_.get(), table_id, ListPeersFilter::kLeaders);
+
+    for (const auto& peer : tablet_peers) {
+      auto tablet = peer->shared_tablet_maybe_null();
+      if (!tablet) {
+        continue;
+      }
+
+      auto table_schema = ASSERT_RESULT(tablet->metadata()->GetTableInfo(table_id))->schema();
+      std::unordered_map<std::string, const ColumnSchema*> schema_columns;
+      for (const auto& column : table_schema.columns()) {
+        schema_columns[column.name()] = &column;
+      }
+
+      EXPECT_EQ(schema_columns.size(), expected_column_informations.size());
+      for (const auto& [column_name, expected_column_type] : expected_column_informations) {
+        SCOPED_TRACE(Format("column_name: $0", column_name));
+        auto column_info = *ASSERT_NOTNULL(FindOrNull(schema_columns, column_name));
+        EXPECT_EQ(column_info->type()->main(), expected_column_type);
+      }
+    }
+  }
+
+  Status WaitForTableDeletionToFinish(client::YBClient* client, const std::string& table_id) {
+    return LoggedWaitFor([&]() -> Result<bool> {
+      bool table_found = false;
+      const auto tables = VERIFY_RESULT(client->ListTables());
+      for (const auto& t : tables) {
+        if (t.namespace_name() == "yugabyte" && t.table_id() == table_id) {
+          table_found = true;
+          break;
+        }
+      }
+      return !table_found;
+    }, MonoDelta::FromSeconds(60), "Wait for Table deletion to finish for table " + table_id);
+  }
+};
+
+INSTANTIATE_TEST_CASE_P(bool, PgDdlSavepointMiniClusterTest,
+    ::testing::Values(TestCommit::kFalse, TestCommit::kTrue));
+
+TEST_P(PgDdlSavepointMiniClusterTest, TestTransactionStateMultipleSubTransactions) {
+  auto client = ASSERT_RESULT(cluster_->CreateClient());
+  auto conn = ASSERT_RESULT(Connect());
+  auto& catalog_manager = ASSERT_RESULT(cluster_->GetLeaderMiniMaster())->catalog_manager();
+
+  ASSERT_OK(conn.Execute("BEGIN"));
+  ASSERT_OK(conn.ExecuteFormat("CREATE TABLE $0 (k INT PRIMARY KEY, v INT)", kTableName));
+  auto table_id = ASSERT_RESULT(GetTableIdByTableName(client.get(), "yugabyte", kTableName));
+  auto table_info = catalog_manager.GetTableInfo(table_id);
+  ASSERT_EQ(table_info->LockForRead()->ysql_ddl_txn_verifier_state().size(), 1);
+
+  ASSERT_OK(conn.Execute("SAVEPOINT a"));
+  ASSERT_OK(conn.ExecuteFormat("ALTER TABLE $0 ADD COLUMN b TEXT", kTableName));
+  ASSERT_OK(conn.ExecuteFormat("ALTER TABLE $0 ADD COLUMN c TEXT", kTableName));
+  ASSERT_EQ(table_info->LockForRead()->ysql_ddl_txn_verifier_state().size(), 2);
+
+  ASSERT_OK(conn.Execute("SAVEPOINT b"));
+  ASSERT_OK(conn.ExecuteFormat("DROP TABLE $0", kTableName));
+
+  ASSERT_OK(conn.Execute("SAVEPOINT c"));
+  ASSERT_OK(conn.ExecuteFormat("CREATE TABLE $0 (k INT PRIMARY KEY, v INT)", kTableName2));
+  auto new_table_id = ASSERT_RESULT(GetTableIdByTableName(client.get(), "yugabyte", kTableName2));
+  auto new_table_info = catalog_manager.GetTableInfo(new_table_id);
+
+  // 'table' must have 3 ddl verification states due to the 2 savepoints 'a' and 'b'. Savepoint 'c'
+  // is not relevant here since it is after the DROP TABLE. The CREATE TABLE post that creates a new
+  // DocDB table with a different table_id.
+  auto table_verifier_states = table_info->LockForRead()->ysql_ddl_txn_verifier_state();
+  ASSERT_EQ(table_verifier_states.size(), 3);
+  VerifyDdlOps(table_verifier_states[0], DdlOp::kCreate);
+  VerifyDdlOps(table_verifier_states[1], DdlOp::kAlter);
+  VerifyDdlOps(table_verifier_states[2], DdlOp::kDrop);
+  ASSERT_TRUE(table_info->LockForRead()->is_being_created_by_ysql_ddl_txn());
+  ASSERT_TRUE(table_info->LockForRead()->is_being_altered_by_ysql_ddl_txn());
+  ASSERT_TRUE(table_info->LockForRead()->is_being_deleted_by_ysql_ddl_txn());
+  ValidateSchemaColumns(
+      table_verifier_states[1].previous_schema(),
+      {{.name = "k",
+        .persistent_data_type = PersistentDataType::INT32,
+        .marked_for_deletion = MarkedForDeletion::kFalse},
+       {.name = "v",
+        .persistent_data_type = PersistentDataType::INT32,
+        .marked_for_deletion = MarkedForDeletion::kFalse}});
+
+  // 'new_table' must have only 1 ddl verification state
+  auto new_table_verifier_states = new_table_info->LockForRead()->ysql_ddl_txn_verifier_state();
+  ASSERT_EQ(new_table_verifier_states.size(), 1);
+  VerifyDdlOps(new_table_verifier_states[0], DdlOp::kCreate);
+  ASSERT_TRUE(new_table_info->LockForRead()->is_being_created_by_ysql_ddl_txn());
+  ASSERT_FALSE(new_table_info->LockForRead()->is_being_altered_by_ysql_ddl_txn());
+  ASSERT_FALSE(new_table_info->LockForRead()->is_being_deleted_by_ysql_ddl_txn());
+
+  if (GetParam()) {
+    ASSERT_OK(conn.Execute("COMMIT"));
+    ASSERT_FALSE(table_info->LockForRead()->has_ysql_ddl_txn_verifier_state());
+    ASSERT_FALSE(new_table_info->LockForRead()->has_ysql_ddl_txn_verifier_state());
+  } else {
+    ASSERT_OK(conn.Execute("ROLLBACK"));
+  }
+}
+
+// Test multiple sub-transactions with DDLs that roll forward such as Drop Column and Drop Table.
+TEST_P(PgDdlSavepointMiniClusterTest, TestTransactionStateRollForwards) {
+  auto client = ASSERT_RESULT(cluster_->CreateClient());
+  auto conn = ASSERT_RESULT(Connect());
+  auto& catalog_mgr = ASSERT_RESULT(cluster_->GetLeaderMiniMaster())->catalog_manager();
+
+  ASSERT_OK(conn.ExecuteFormat(
+      "CREATE TABLE $0 (a int primary key, b text, c text, d text, e text, f text)", kTableName));
+  ASSERT_OK(conn.ExecuteFormat("CREATE TABLE $0 (k INT PRIMARY KEY, v INT)", kTableName2));
+  ASSERT_OK(conn.Execute("BEGIN"));
+
+  ASSERT_OK(conn.ExecuteFormat("ALTER TABLE $0 DROP COLUMN b", kTableName));
+  ASSERT_OK(conn.ExecuteFormat("DROP TABLE $0", kTableName2));
+  ASSERT_OK(conn.Execute("SAVEPOINT a"));
+  ASSERT_OK(conn.ExecuteFormat("ALTER TABLE $0 DROP COLUMN c", kTableName));
+
+  auto table_id = ASSERT_RESULT(GetTableIdByTableName(client.get(), "yugabyte", kTableName));
+  auto table = catalog_mgr.GetTableInfo(table_id);
+  auto table_verifier_states = table->LockForRead()->ysql_ddl_txn_verifier_state();
+  ASSERT_EQ(table_verifier_states.size(), 2);
+  VerifyDdlOps(table_verifier_states[0], DdlOp::kAlter);
+  // All columns from 'a' to 'f' exist including 'b'.
+  ValidateSchemaColumns(
+      table_verifier_states[0].previous_schema(),
+      {{.name = "a",
+        .persistent_data_type = PersistentDataType::INT32,
+        .marked_for_deletion = MarkedForDeletion::kFalse},
+       {.name = "b",
+        .persistent_data_type = PersistentDataType::STRING,
+        .marked_for_deletion = MarkedForDeletion::kFalse},
+       {.name = "c",
+        .persistent_data_type = PersistentDataType::STRING,
+        .marked_for_deletion = MarkedForDeletion::kFalse},
+       {.name = "d",
+        .persistent_data_type = PersistentDataType::STRING,
+        .marked_for_deletion = MarkedForDeletion::kFalse},
+       {.name = "e",
+        .persistent_data_type = PersistentDataType::STRING,
+        .marked_for_deletion = MarkedForDeletion::kFalse},
+       {.name = "f",
+        .persistent_data_type = PersistentDataType::STRING,
+        .marked_for_deletion = MarkedForDeletion::kFalse}});
+  VerifyDdlOps(table_verifier_states[1], DdlOp::kAlter);
+  // 'b' must be marked for deletion due to the DROP COLUMN operation.
+  ValidateSchemaColumns(
+      table_verifier_states[1].previous_schema(),
+      {{.name = "a",
+        .persistent_data_type = PersistentDataType::INT32,
+        .marked_for_deletion = MarkedForDeletion::kFalse},
+       {.name = "b",
+        .persistent_data_type = PersistentDataType::STRING,
+        .marked_for_deletion = MarkedForDeletion::kTrue},
+       {.name = "c",
+        .persistent_data_type = PersistentDataType::STRING,
+        .marked_for_deletion = MarkedForDeletion::kFalse},
+       {.name = "d",
+        .persistent_data_type = PersistentDataType::STRING,
+        .marked_for_deletion = MarkedForDeletion::kFalse},
+       {.name = "e",
+        .persistent_data_type = PersistentDataType::STRING,
+        .marked_for_deletion = MarkedForDeletion::kFalse},
+       {.name = "f",
+        .persistent_data_type = PersistentDataType::STRING,
+        .marked_for_deletion = MarkedForDeletion::kFalse}});
+
+  auto table_id_2 = ASSERT_RESULT(GetTableIdByTableName(client.get(), "yugabyte", kTableName2));
+  auto table_2 = catalog_mgr.GetTableInfo(table_id_2);
+  auto table_2_verifier_states = table_2->LockForRead()->ysql_ddl_txn_verifier_state();
+  ASSERT_EQ(table_2_verifier_states.size(), 1);
+  VerifyDdlOps(table_2_verifier_states[0], DdlOp::kDrop);
+
+  if (GetParam()) {
+    ASSERT_OK(conn.Execute("COMMIT"));
+  } else {
+    ASSERT_OK(conn.Execute("ROLLBACK"));
+  }
+  ASSERT_FALSE(table->LockForRead()->has_ysql_ddl_txn_verifier_state());
+  ASSERT_FALSE(table_2->LockForRead()->has_ysql_ddl_txn_verifier_state());
+}
+
+TEST_P(PgDdlSavepointMiniClusterTest, TestRollbackToSavepoints) {
+  auto client = ASSERT_RESULT(cluster_->CreateClient());
+  auto conn = ASSERT_RESULT(Connect());
+  auto& catalog_mgr = ASSERT_RESULT(cluster_->GetLeaderMiniMaster())->catalog_manager();
+
+  ASSERT_OK(conn.ExecuteFormat("DROP TABLE IF EXISTS $0", kTableName));
+
+  ASSERT_OK(conn.Execute("BEGIN"));
+  ASSERT_OK(conn.ExecuteFormat(
+      "CREATE TABLE $0 (a int primary key, b text, c text, d text, e text, f text)", kTableName));
+  ASSERT_OK(conn.Execute("SAVEPOINT a"));
+  ASSERT_OK(conn.ExecuteFormat("ALTER TABLE $0 ADD COLUMN g TEXT", kTableName));
+  ASSERT_OK(conn.Execute("SAVEPOINT b"));
+  ASSERT_OK(conn.ExecuteFormat("ALTER TABLE $0 DROP COLUMN b", kTableName));
+  ASSERT_OK(conn.Execute("SAVEPOINT c"));
+  ASSERT_OK(conn.ExecuteFormat("DROP TABLE $0", kTableName));
+
+  ASSERT_OK(conn.Execute("ROLLBACK TO SAVEPOINT c"));
+  auto table_id = ASSERT_RESULT(GetTableIdByTableName(client.get(), "yugabyte", kTableName));
+  // Column 'b' won't exist as it has been dropped before the savepoint 'c'.
+  ValidateTabletSchema(
+      table_id, {{.name = "a", .data_type = DataType::INT32},
+                 {.name = "c", .data_type = DataType::STRING},
+                 {.name = "d", .data_type = DataType::STRING},
+                 {.name = "e", .data_type = DataType::STRING},
+                 {.name = "f", .data_type = DataType::STRING},
+                 {.name = "g", .data_type = DataType::STRING}});
+
+  auto table = catalog_mgr.GetTableInfo(table_id);
+  auto table_verifier_states = table->LockForRead()->ysql_ddl_txn_verifier_state();
+  ASSERT_EQ(table_verifier_states.size(), 3);
+  VerifyDdlOps(table_verifier_states[0], DdlOp::kCreate);
+  VerifyDdlOps(table_verifier_states[1], DdlOp::kAlter);
+  // Column 'g' won't exist in the previous_schema since it was created as part of savepoint 'b'.
+  ValidateSchemaColumns(
+      table_verifier_states[1].previous_schema(),
+      {{.name = "a",
+        .persistent_data_type = PersistentDataType::INT32,
+        .marked_for_deletion = MarkedForDeletion::kFalse},
+       {.name = "b",
+        .persistent_data_type = PersistentDataType::STRING,
+        .marked_for_deletion = MarkedForDeletion::kFalse},
+       {.name = "c",
+        .persistent_data_type = PersistentDataType::STRING,
+        .marked_for_deletion = MarkedForDeletion::kFalse},
+       {.name = "d",
+        .persistent_data_type = PersistentDataType::STRING,
+        .marked_for_deletion = MarkedForDeletion::kFalse},
+       {.name = "e",
+        .persistent_data_type = PersistentDataType::STRING,
+        .marked_for_deletion = MarkedForDeletion::kFalse},
+       {.name = "f",
+        .persistent_data_type = PersistentDataType::STRING,
+        .marked_for_deletion = MarkedForDeletion::kFalse}});
+  VerifyDdlOps(table_verifier_states[2], DdlOp::kAlter);
+  // Column 'g' exists now in previous_schema.
+  ValidateSchemaColumns(
+      table_verifier_states[2].previous_schema(),
+      {{.name = "a",
+        .persistent_data_type = PersistentDataType::INT32,
+        .marked_for_deletion = MarkedForDeletion::kFalse},
+       {.name = "b",
+        .persistent_data_type = PersistentDataType::STRING,
+        .marked_for_deletion = MarkedForDeletion::kFalse},
+       {.name = "c",
+        .persistent_data_type = PersistentDataType::STRING,
+        .marked_for_deletion = MarkedForDeletion::kFalse},
+       {.name = "d",
+        .persistent_data_type = PersistentDataType::STRING,
+        .marked_for_deletion = MarkedForDeletion::kFalse},
+       {.name = "e",
+        .persistent_data_type = PersistentDataType::STRING,
+        .marked_for_deletion = MarkedForDeletion::kFalse},
+       {.name = "f",
+        .persistent_data_type = PersistentDataType::STRING,
+        .marked_for_deletion = MarkedForDeletion::kFalse},
+       {.name = "g",
+        .persistent_data_type = PersistentDataType::STRING,
+        .marked_for_deletion = MarkedForDeletion::kFalse}});
+
+  ASSERT_OK(conn.Execute("ROLLBACK TO SAVEPOINT b"));
+  // Drop of column 'b' must be rolled back now.
+  ValidateTabletSchema(
+      table_id, {{.name = "a", .data_type = DataType::INT32},
+                 {.name = "b", .data_type = DataType::STRING},
+                 {.name = "c", .data_type = DataType::STRING},
+                 {.name = "d", .data_type = DataType::STRING},
+                 {.name = "e", .data_type = DataType::STRING},
+                 {.name = "f", .data_type = DataType::STRING},
+                 {.name = "g", .data_type = DataType::STRING}});
+  table_verifier_states = table->LockForRead()->ysql_ddl_txn_verifier_state();
+  ASSERT_EQ(table_verifier_states.size(), 2);
+  VerifyDdlOps(table_verifier_states[0], DdlOp::kCreate);
+  VerifyDdlOps(table_verifier_states[1], DdlOp::kAlter);
+
+  ASSERT_OK(conn.Execute("ROLLBACK TO SAVEPOINT a"));
+  // Column 'g' doesn't exist anymore.
+  ValidateTabletSchema(
+      table_id, {{.name = "a", .data_type = DataType::INT32},
+                 {.name = "b", .data_type = DataType::STRING},
+                 {.name = "c", .data_type = DataType::STRING},
+                 {.name = "d", .data_type = DataType::STRING},
+                 {.name = "e", .data_type = DataType::STRING},
+                 {.name = "f", .data_type = DataType::STRING}});
+  table_verifier_states = table->LockForRead()->ysql_ddl_txn_verifier_state();
+  ASSERT_EQ(table_verifier_states.size(), 1);
+  VerifyDdlOps(table_verifier_states[0], DdlOp::kCreate);
+
+  if (GetParam()) {
+    ASSERT_OK(conn.Execute("COMMIT"));
+  } else {
+    ASSERT_OK(conn.Execute("ROLLBACK"));
+  }
+  ASSERT_FALSE(table->LockForRead()->has_ysql_ddl_txn_verifier_state());
+}
+
+// Tests that rollback to savepoint which involves DROP and CREATE TABLE with same name works.
+TEST_P(PgDdlSavepointMiniClusterTest, TestRollbackToSavepointWithDropCreateTableSameName) {
+  auto client = ASSERT_RESULT(cluster_->CreateClient());
+  auto conn = ASSERT_RESULT(Connect());
+  auto& catalog_mgr = ASSERT_RESULT(cluster_->GetLeaderMiniMaster())->catalog_manager();
+
+  ASSERT_OK(conn.ExecuteFormat("DROP TABLE IF EXISTS $0", kTableName));
+
+  ASSERT_OK(conn.ExecuteFormat(
+    "CREATE TABLE $0 (a int primary key, b text, c text, d text, e text, f text)", kTableName));
+  auto table_id = ASSERT_RESULT(GetTableIdByTableName(client.get(), "yugabyte", kTableName));
+  auto table = catalog_mgr.GetTableInfo(table_id);
+
+  ASSERT_OK(conn.Execute("BEGIN"));
+  ASSERT_OK(conn.Execute("SAVEPOINT a"));
+  ASSERT_OK(conn.ExecuteFormat("DROP TABLE $0", kTableName));
+  ASSERT_OK(conn.ExecuteFormat("CREATE TABLE $0 (a int, b text, c text, d text)", kTableName));
+
+  auto table_verifier_states = table->LockForRead()->ysql_ddl_txn_verifier_state();
+  ASSERT_EQ(table_verifier_states.size(), 1);
+  VerifyDdlOps(table_verifier_states[0], DdlOp::kDrop);
+
+  // Get the id of the table created with the same name but after the drop statement.
+  // The GetTableIdByTableName function cannot be used here because it returns the id of the first
+  // table with the given name. In this case, there are two. So we need to choose the one different
+  // from the first table.
+  std::string table_id_after_drop;
+  {
+    const auto tables = ASSERT_RESULT(client->ListTables());
+    for (const auto& t : tables) {
+      if (t.namespace_name() == "yugabyte" && t.table_name() == kTableName &&
+          t.table_id() != table_id) {
+        table_id_after_drop = t.table_id();
+      }
+    }
+  }
+  ASSERT_FALSE(table_id_after_drop.empty());
+  auto table_after_drop = catalog_mgr.GetTableInfo(table_id_after_drop);
+  ASSERT_EQ(table_after_drop->LockForRead()->ysql_ddl_txn_verifier_state().size(), 1);
+  VerifyDdlOps(table_after_drop->LockForRead()->ysql_ddl_txn_verifier_state()[0], DdlOp::kCreate);
+
+  ASSERT_OK(conn.Execute("ROLLBACK TO SAVEPOINT a"));
+  ValidateTabletSchema(
+      table_id, {{.name = "a", .data_type = DataType::INT32},
+                 {.name = "b", .data_type = DataType::STRING},
+                 {.name = "c", .data_type = DataType::STRING},
+                 {.name = "d", .data_type = DataType::STRING},
+                 {.name = "e", .data_type = DataType::STRING},
+                 {.name = "f", .data_type = DataType::STRING}});
+  ASSERT_FALSE(table->LockForRead()->has_ysql_ddl_txn_verifier_state());
+  ASSERT_OK(WaitForTableDeletionToFinish(client.get(), table_id_after_drop));
+  ASSERT_FALSE(table_after_drop->LockForRead()->has_ysql_ddl_txn_verifier_state());
+
+  if (GetParam()) {
+    ASSERT_OK(conn.Execute("COMMIT"));
+  } else {
+    ASSERT_OK(conn.Execute("ROLLBACK"));
+  }
+  ASSERT_FALSE(table->LockForRead()->has_ysql_ddl_txn_verifier_state());
+  ASSERT_FALSE(table_after_drop->LockForRead()->has_ysql_ddl_txn_verifier_state());
+}
+
+TEST_P(PgDdlSavepointMiniClusterTest, TestRollbackToSavepointWithNestedSavepoint) {
+  auto client = ASSERT_RESULT(cluster_->CreateClient());
+  auto conn = ASSERT_RESULT(Connect());
+  auto& catalog_mgr = ASSERT_RESULT(cluster_->GetLeaderMiniMaster())->catalog_manager();
+
+  ASSERT_OK(conn.ExecuteFormat("DROP TABLE IF EXISTS $0", kTableName));
+
+  ASSERT_OK(conn.Execute("BEGIN"));
+  ASSERT_OK(conn.ExecuteFormat("CREATE TABLE $0 (a INT, b INT)", kTableName));
+  ASSERT_OK(conn.Execute("SAVEPOINT a"));
+  ASSERT_OK(conn.ExecuteFormat("ALTER TABLE $0 ADD COLUMN c TEXT", kTableName));
+  ASSERT_OK(conn.Execute("SAVEPOINT b"));
+  ASSERT_OK(conn.ExecuteFormat("ALTER TABLE $0 ADD COLUMN d TEXT", kTableName));
+  ASSERT_OK(conn.ExecuteFormat("ALTER TABLE $0 DROP COLUMN b", kTableName));
+
+  // Rollback to savepoint a -> should remove column 'c', 'd', and bring back column 'b'.
+  ASSERT_OK(conn.Execute("ROLLBACK TO SAVEPOINT a"));
+  auto table_id = ASSERT_RESULT(GetTableIdByTableName(client.get(), "yugabyte", kTableName));
+  ValidateTabletSchema(
+      table_id, {{"ybrowid", DataType::BINARY},
+                 {"a", DataType::INT32},
+                 {"b", DataType::INT32}});
+  auto table = catalog_mgr.GetTableInfo(table_id);
+  auto table_verifier_states = table->LockForRead()->ysql_ddl_txn_verifier_state();
+  ASSERT_EQ(table_verifier_states.size(), 1);
+  VerifyDdlOps(table_verifier_states[0], DdlOp::kCreate);
+  auto table_schema = ASSERT_RESULT(table->GetSchema());
+  ASSERT_EQ(table_schema.num_columns(), 3); // Only column 'ybrowid', 'a' and 'b'.
+  ASSERT_EQ(table_schema.columns()[0].name(), "ybrowid");
+  ASSERT_EQ(table_schema.columns()[1].name(), "a");
+  ASSERT_EQ(table_schema.columns()[2].name(), "b");
+
+  ASSERT_OK(conn.ExecuteFormat("ALTER TABLE $0 ADD COLUMN e TEXT", kTableName));
+  table_verifier_states = table->LockForRead()->ysql_ddl_txn_verifier_state();
+  ASSERT_EQ(table_verifier_states.size(), 2);
+  VerifyDdlOps(table_verifier_states[0], DdlOp::kCreate);
+  VerifyDdlOps(table_verifier_states[1], DdlOp::kAlter);
+
+  if (GetParam()) {
+    ASSERT_OK(conn.Execute("COMMIT"));
+  } else {
+    ASSERT_OK(conn.Execute("ROLLBACK"));
+  }
+  ASSERT_FALSE(table->LockForRead()->has_ysql_ddl_txn_verifier_state());
+}
+
+TEST_P(PgDdlSavepointMiniClusterTest, TestRollbackToSavepointWithReleaseSavepoint) {
+  auto client = ASSERT_RESULT(cluster_->CreateClient());
+  auto conn = ASSERT_RESULT(Connect());
+  auto& catalog_mgr = ASSERT_RESULT(cluster_->GetLeaderMiniMaster())->catalog_manager();
+
+  ASSERT_OK(conn.ExecuteFormat("DROP TABLE IF EXISTS $0", kTableName));
+
+  ASSERT_OK(conn.Execute("BEGIN"));
+  ASSERT_OK(conn.ExecuteFormat("CREATE TABLE $0 (a INT, b INT)", kTableName));
+  auto table_id = ASSERT_RESULT(GetTableIdByTableName(client.get(), "yugabyte", kTableName));
+  ASSERT_OK(conn.Execute("SAVEPOINT a"));
+  ASSERT_OK(conn.ExecuteFormat("DROP TABLE $0", kTableName));
+  ASSERT_OK(conn.Execute("SAVEPOINT b"));
+  ASSERT_OK(conn.ExecuteFormat("CREATE TABLE $0 (a INT, b INT)", kTableName));
+  std::string table_id_after_drop;
+  {
+    const auto tables = ASSERT_RESULT(client->ListTables());
+    for (const auto& t : tables) {
+      if (t.namespace_name() == "yugabyte" && t.table_name() == kTableName &&
+          t.table_id() != table_id) {
+        table_id_after_drop = t.table_id();
+      }
+    }
+  }
+  ASSERT_OK(conn.ExecuteFormat("ALTER TABLE $0 DROP COLUMN b", kTableName));
+  ASSERT_OK(conn.Execute("RELEASE SAVEPOINT b"));
+  ASSERT_OK(conn.Execute("SAVEPOINT c"));
+  ASSERT_OK(conn.ExecuteFormat("ALTER TABLE $0 ADD COLUMN c INT", kTableName));
+
+  // Rollback to savepoint a -> should bring bring the earlier table with column 'a' and 'b'.
+  ASSERT_OK(conn.Execute("ROLLBACK TO SAVEPOINT a"));
+  ValidateTabletSchema(
+      table_id, {{"ybrowid", DataType::BINARY},
+                 {"a", DataType::INT32},
+                 {"b", DataType::INT32}});
+  auto table = catalog_mgr.GetTableInfo(table_id);
+  auto table_verifier_states = table->LockForRead()->ysql_ddl_txn_verifier_state();
+  ASSERT_EQ(table_verifier_states.size(), 1);
+  VerifyDdlOps(table_verifier_states[0], DdlOp::kCreate);
+  auto table_schema = ASSERT_RESULT(table->GetSchema());
+  ASSERT_EQ(table_schema.num_columns(), 3); // Only column 'ybrowid', 'a' and 'b'.
+  ASSERT_EQ(table_schema.columns()[0].name(), "ybrowid");
+  ASSERT_EQ(table_schema.columns()[1].name(), "a");
+  ASSERT_EQ(table_schema.columns()[2].name(), "b");
+
+  ASSERT_FALSE(table_id_after_drop.empty());
+  ASSERT_OK(WaitForTableDeletionToFinish(client.get(), table_id_after_drop));
+  auto table_after_drop = catalog_mgr.GetTableInfo(table_id_after_drop);
+  ASSERT_FALSE(table_after_drop->LockForRead()->has_ysql_ddl_txn_verifier_state());
+
+  ASSERT_OK(conn.ExecuteFormat("ALTER TABLE $0 ADD COLUMN e TEXT", kTableName));
+  table_verifier_states = table->LockForRead()->ysql_ddl_txn_verifier_state();
+  ASSERT_EQ(table_verifier_states.size(), 2);
+  VerifyDdlOps(table_verifier_states[0], DdlOp::kCreate);
+  VerifyDdlOps(table_verifier_states[1], DdlOp::kAlter);
+
+  if (GetParam()) {
+    ASSERT_OK(conn.Execute("COMMIT"));
+  } else {
+    ASSERT_OK(conn.Execute("ROLLBACK"));
+  }
+  ASSERT_FALSE(table->LockForRead()->has_ysql_ddl_txn_verifier_state());
+}
+
+// Test case for https://github.com/yugabyte/yugabyte-db/issues/30721.
+TEST_P(PgDdlSavepointMiniClusterTest, TestRollbackToSavepointWithSlowIndexDeletion) {
+  if (GetParam()) {
+    return;
+  }
+
+  auto conn = ASSERT_RESULT(Connect());
+
+  ASSERT_OK(conn.Execute("DROP TABLE IF EXISTS existing_table"));
+  ASSERT_OK(conn.ExecuteFormat("DROP TABLE IF EXISTS $0", kTableName));
+  ASSERT_OK(conn.Execute("CREATE TABLE existing_table (k INT PRIMARY KEY)"));
+  ASSERT_OK(conn.Execute("INSERT INTO existing_table VALUES (1)"));
+
+  // Ensure that the deletion of the base table is completed before we call
+  // IsTableDeletionDueToRollbackToSubTxn for the index table.
+  // With the fix to call IsTableDeletionDueToRollbackToSubTxn before initiating any tablet
+  // deletion, this ordering is a no-op but this leads to test failures in the old buggy code where
+  // we were calling it from within SendDeleteTabletRequest.
+  SyncPoint::GetInstance()->LoadDependency({
+      {
+          "CatalogManager::CheckTableDeleted:AfterRemoveDdlTransactionState",
+          "CatalogManager::SendDeleteTabletRequest:IndexTable",
+      },
+  });
+  SyncPoint::GetInstance()->ClearTrace();
+  SyncPoint::GetInstance()->EnableProcessing();
+
+  ASSERT_OK(conn.Execute("BEGIN"));
+  ASSERT_OK(conn.Execute("SAVEPOINT sp"));
+  ASSERT_OK(conn.ExecuteFormat("CREATE TABLE $0 (a INT PRIMARY KEY, b INT)", kTableName));
+  ASSERT_OK(conn.ExecuteFormat("CREATE INDEX idx_$0 ON $0 (b)", kTableName));
+  // The below insert is important to ensure that we have at least one operation on the index
+  // tablets from this transaction. Otherwise, we will not see the transaction abort while deletion
+  // of the tablet in the old buggy code.
+  ASSERT_OK(conn.ExecuteFormat("INSERT INTO $0 VALUES (1, 1)", kTableName));
+  ASSERT_OK(conn.Execute("ROLLBACK TO SAVEPOINT sp"));
+  ASSERT_OK(conn.Execute("ALTER TABLE existing_table ADD COLUMN b INT"));
+  ASSERT_OK(conn.Execute("INSERT INTO existing_table VALUES (2, 2)"));
+  ASSERT_OK(conn.Execute("COMMIT"));
+
+  SyncPoint::GetInstance()->DisableProcessing();
+
+  ASSERT_OK(conn.Execute("DROP TABLE existing_table"));
+}
+
+// Probe for #29139 / D51840: when sys.catalog raft replication on yb-master is delayed,
+// the master's safe time lags current hybrid time and this can cause a read restart error
+// even without concurrent sessions. This can happen in a single connection in auto-commit mode
+// running sequential commands that modify the PG catalog (say stmt1 and stmt2), and stmt2 picks
+// safe_time as its read time which can predate stmt1's catalog write time -- causing a read restart
+// error. Also, note that the read restart error is faced by any rpc other than the 1st one in stmt2
+// because the error is retried internally on yb-master if faced by the 1st rpc.
+//
+// D51840 fixes this issue for autonomous DDLs by picking the current time as read time on the
+// tserver proxy instead of picking the safe time on master. The transactional DDL path
+// (ysql_yb_ddl_transaction_block_enabled=true) still faces the issue because it still picks safe
+// time as the read time.
+class PgMasterDDLReadRestartProbeTest : public LibPqTestBase {
+ public:
+  int GetNumMasters() const override { return 3; }
+
+ protected:
+  void UpdateMiniClusterOptions(ExternalMiniClusterOptions* options) override {
+    options->extra_master_flags.push_back(
+        "--ysql_yb_ddl_transaction_block_enabled=false");
+    options->extra_tserver_flags.push_back(
+        "--ysql_yb_ddl_transaction_block_enabled=false");
+    options->extra_tserver_flags.push_back(
+        Format("--enable_object_locking_for_table_locks=false"));
+    options->extra_master_flags.push_back(
+        Format("--enable_object_locking_for_table_locks=false"));
+    options->extra_tserver_flags.push_back(
+        Format("--ysql_enable_concurrent_ddl=false"));
+    AppendFlagToAllowedPreviewFlagsCsv(
+        options->extra_tserver_flags, "ysql_enable_concurrent_ddl");
+    LibPqTestBase::UpdateMiniClusterOptions(options);
+  }
+
+  Status RunRepro(bool expect_error);
+
+  void RestartClusterSetDdlTransactionBlockEnabled(bool value) {
+    LOG(INFO) << "Restart the cluster and turn " << (value ? "on" : "off")
+              << " --ysql_yb_ddl_transaction_block_enabled";
+    cluster_->Shutdown();
+    for (const auto& daemon : cluster_->daemons()) {
+      daemon->AddExtraFlag("ysql_yb_ddl_transaction_block_enabled", value ? "true" : "false");
+    }
+    ASSERT_OK(cluster_->Restart());
+  }
+};
+
+Status PgMasterDDLReadRestartProbeTest::RunRepro(bool expect_error) {
+  const auto iterations = 10;
+  auto setup_conn = VERIFY_RESULT(Connect());
+  RETURN_NOT_OK(setup_conn.Execute("DROP DATABASE IF EXISTS db_a"));
+  RETURN_NOT_OK(setup_conn.Execute("DROP DATABASE IF EXISTS db_b"));
+  RETURN_NOT_OK(setup_conn.Execute("CREATE DATABASE db_a"));
+  RETURN_NOT_OK(setup_conn.Execute("CREATE DATABASE db_b"));
+
+  // Lag master sys.catalog raft replication so safe_time trails current_ht. Targeted at
+  // the sys.catalog tablet only -- leader heartbeats and background master tasks stay
+  // fast, avoiding the cluster collapse seen with a global UpdateConsensus delay.
+  RETURN_NOT_OK(cluster_->SetFlagOnMasters(
+      "TEST_delay_update_consensus_before_mark_committed_tablet_id",
+      master::kSysCatalogTabletId));
+  RETURN_NOT_OK(cluster_->SetFlagOnMasters(
+      "TEST_delay_update_consensus_before_mark_committed_ms", "10"));
+
+  TestThreadHolder thread_holder;
+
+  // Background: continuous lightweight DDLs on db_b to keep ops in flight on master
+  // sys.catalog, holding majority_replicated (and hence safe_time) behind current_ht.
+  thread_holder.AddThreadFunctor(
+      [this, &stop = thread_holder.stop_flag()] {
+    auto conn = ASSERT_RESULT(ConnectToDB("db_b"));
+    int i = 0;
+    while (!stop.load(std::memory_order_acquire)) {
+      auto s = conn.ExecuteFormat("CREATE SCHEMA bg_r_$0", i);
+      if (!s.ok()) {
+        LOG(WARNING) << "bg CREATE SCHEMA iter=" << i << " failed: " << s;
+      }
+      s = conn.ExecuteFormat("DROP SCHEMA bg_r_$0", i);
+      if (!s.ok()) {
+        LOG(WARNING) << "bg DROP SCHEMA iter=" << i << " failed: " << s;
+      }
+      ++i;
+    }
+  });
+
+  auto conn = VERIFY_RESULT(ConnectToDB("db_a"));
+  RETURN_NOT_OK(conn.Execute("SET yb_non_ddl_txn_for_sys_tables_allowed=true"));
+
+  auto is_read_restart = [](const Status& s) {
+    return !s.ok() &&
+        s.message().ToBuffer().find("Restart read required") != std::string::npos;
+  };
+
+  const char* const kStmts[] = {
+      "CREATE TABLE public.test(k int primary key, "
+      "\"........pg.dropped.62........\" integer)",
+      "UPDATE pg_catalog.pg_attribute SET attlen = -1, attalign = 'i', "
+      "attbyval = false WHERE attname = '........pg.dropped.62........' "
+      "AND attrelid = 'public.test'::pg_catalog.regclass",
+      "ALTER TABLE ONLY public.test DROP COLUMN \"........pg.dropped.62........\";",
+      "DROP TABLE public.test",
+  };
+
+  const auto deadline = MonoTime::Now() + MonoDelta::FromSeconds(60);
+  for (int i = 0; i < iterations || (expect_error && MonoTime::Now() < deadline); ++i) {
+    for (const auto* stmt : kStmts) {
+      auto s = conn.Execute(stmt);
+      if (is_read_restart(s)) {
+        LOG(INFO) << "Read restart observed at iter=" << i << ": " << s;
+        if (expect_error) {
+          return Status::OK();
+        }
+        return STATUS(IllegalState, "Faced a read restart error when none were expected");
+      } else if (!s.ok()) {
+        LOG(WARNING) << "Non-read-restart failure iter=" << i << ": " << s;
+      }
+    }
+  }
+
+  thread_holder.Stop();
+  if (expect_error) {
+    return STATUS(TimedOut, "Timed out waiting for the expected read restart error");
+  }
+  return Status::OK();
+}
+
+TEST_F(PgMasterDDLReadRestartProbeTest,
+       YB_DISABLE_TEST_IN_SANITIZERS(DDLStaleSafeTimeReadRestart)) {
+  ASSERT_OK(RunRepro(false /* expect_error */));
+
+  // Restart with transactional DDL enabled but object locking disabled.
+  ASSERT_NO_FATALS(RestartClusterSetDdlTransactionBlockEnabled(true));
+
+  ASSERT_OK(RunRepro(true /* expect_error */));
+}
+
+} // namespace yb::pgwrapper

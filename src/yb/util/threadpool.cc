@@ -1,0 +1,217 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+//
+// The following only applies to changes made to this file as part of YugabyteDB development.
+//
+// Portions Copyright (c) YugabyteDB, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
+// in compliance with the License.  You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software distributed under the License
+// is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express
+// or implied.  See the License for the specific language governing permissions and limitations
+// under the License.
+//
+
+#include <algorithm>
+#include <functional>
+#include <limits>
+#include <memory>
+
+#include "yb/util/flags.h"
+
+#include "yb/gutil/callback.h"
+#include "yb/gutil/macros.h"
+#include "yb/gutil/map-util.h"
+#include "yb/gutil/stl_util.h"
+#include "yb/gutil/strings/substitute.h"
+
+#include "yb/util/callsite_profiling.h"
+#include "yb/util/cgroups.h"
+#include "yb/util/errno.h"
+#include "yb/util/logging.h"
+#include "yb/util/metrics.h"
+#include "yb/util/status_log.h"
+#include "yb/util/strand.h"
+#include "yb/util/thread.h"
+#include "yb/util/threadpool.h"
+#include "yb/util/trace.h"
+
+DEFINE_RUNTIME_bool(threadpool_use_current_trace_for_tasks, false,
+    "If true, the thread pool will use the current trace for tasks submitted to it.");
+
+namespace yb {
+
+using strings::Substitute;
+using std::unique_ptr;
+using std::deque;
+
+
+////////////////////////////////////////////////////////
+// ThreadPoolBuilder
+///////////////////////////////////////////////////////
+
+ThreadPoolBuilder::ThreadPoolBuilder(std::string name)
+    : options_(ThreadPoolOptions {
+        .name = std::move(name),
+        .max_workers = make_unsigned(NumEffectiveCPUs()),
+        .idle_timeout = MonoDelta::FromMilliseconds(500),
+      }) {}
+
+Status ThreadPool::SubmitClosure(const Closure& task) {
+  return DoSubmit([task] { task.Run(); });
+}
+
+Status ThreadPool::Submit(const std::shared_ptr<Runnable>& r) {
+  return DoSubmit([r]() { r->Run(); });
+}
+
+Status ThreadPool::SubmitFunc(const std::function<void()>& func) {
+  return DoSubmit(func);
+}
+
+template <class F>
+Status ThreadPool::DoSubmit(const F& f) {
+  bool enqueued;
+  if (FLAGS_threadpool_use_current_trace_for_tasks) {
+    TracePtr trace(Trace::CurrentTrace());
+    enqueued = underlying_->EnqueueFunctor([f, trace]() {
+      ADOPT_TRACE(trace.get());
+      f();
+    });
+  } else {
+    enqueued = underlying_->EnqueueFunctor(f);
+  }
+
+  if (PREDICT_TRUE(enqueued)) {
+    return Status::OK();
+  }
+  if (underlying_->IsClosing()) {
+    return STATUS(ShutdownInProgress, "The pool has been shut down.");
+  }
+  // The only non-closing reason YBThreadPool::Enqueue returns false is a worker-thread
+  // creation failure under max_workers == kUnlimitedWorkersWithoutQueue, which
+  // ThreadPoolBuilder never selects today. Surface a distinct status here so callers can
+  // tell the two cases apart if that ever changes.
+  return STATUS(ServiceUnavailable, "Failed to enqueue task to the thread pool.");
+}
+
+template <class Impl>
+class ThreadPoolTokenImpl : public ThreadPoolToken {
+ public:
+  explicit ThreadPoolTokenImpl(YBThreadPool* thread_pool) : impl_(thread_pool) {}
+
+  ~ThreadPoolTokenImpl() {
+    impl_.Shutdown();
+  }
+
+  Status SubmitFunc(std::function<void()> f) override {
+#ifdef __linux__
+    if (task_cgroup_) {
+      Cgroup* cg = task_cgroup_;
+      f = [orig = std::move(f), cg]() {
+        WARN_NOT_OK(cg->MoveCurrentThreadToGroup(),
+                    "Failed to move thread to per-db cgroup");
+        orig();
+      };
+    }
+#endif
+    if (impl_.EnqueueFunctor(std::move(f))) {
+      return Status::OK();
+    }
+    if (impl_.IsClosing()) {
+      return STATUS(ShutdownInProgress, "Thread pool token was shut down.", "", Errno(ESHUTDOWN));
+    }
+    // Mirrors DoSubmit: the only non-closing reason the underlying pool can reject this
+    // enqueue is a worker-thread creation failure under kUnlimitedWorkersWithoutQueue,
+    // unreachable today via ThreadPoolBuilder.
+    return STATUS(ServiceUnavailable, "Failed to enqueue task to the thread pool token.");
+  }
+
+  void SetTaskCgroup([[maybe_unused]] Cgroup* cgroup) override {
+#ifdef __linux__
+    task_cgroup_ = cgroup;
+#endif
+  }
+
+  void Shutdown() override {
+    impl_.Shutdown();
+  }
+
+ private:
+  Impl impl_;
+#ifdef __linux__
+  Cgroup* task_cgroup_ = nullptr;
+#endif
+};
+
+std::unique_ptr<ThreadPoolToken> ThreadPool::NewToken(ExecutionMode mode) {
+  switch (mode) {
+    case ExecutionMode::SERIAL:
+      return std::make_unique<ThreadPoolTokenImpl<Strand>>(underlying_.get());
+    case ExecutionMode::CONCURRENT:
+      return std::make_unique<ThreadPoolTokenImpl<ThreadSubPool>>(underlying_.get());
+  }
+  FATAL_INVALID_ENUM_VALUE(ExecutionMode, mode);
+}
+
+Status ThreadPoolToken::SubmitClosure(const Closure& task) {
+  return SubmitFunc(std::bind(&Closure::Run, task));
+}
+
+Status ThreadPoolToken::Submit(const std::shared_ptr<Runnable>& runnable) {
+  return SubmitFunc([runnable] { runnable->Run(); });
+}
+
+Status TaskRunner::Init(int concurrency) {
+  ThreadPoolBuilder builder("Task Runner");
+  if (concurrency > 0) {
+    builder.set_max_threads(concurrency);
+  }
+  return builder.Build(&thread_pool_);
+}
+
+Status TaskRunner::Wait(StopWaitIfFailed stop_wait_if_failed) {
+  UniqueLock lock(mutex_);
+  WaitOnConditionVariable(&cond_, &lock, [this, &stop_wait_if_failed] {
+    return (running_tasks_ == 0 || (stop_wait_if_failed && failed_.load()));
+  });
+  return first_failure_;
+}
+
+void TaskRunner::CompleteTask(const Status& status) {
+  bool is_first_failure = false;
+  if (!status.ok()) {
+    bool expected = false;
+    if (failed_.compare_exchange_strong(expected, true)) {
+      is_first_failure = true;
+      std::lock_guard lock(mutex_);
+      first_failure_ = status;
+    } else {
+      LOG(WARNING) << status.message() << std::endl;
+    }
+  }
+  if (--running_tasks_ == 0 || is_first_failure) {
+    std::lock_guard lock(mutex_);
+    YB_PROFILE(cond_.notify_one());
+  }
+}
+
+} // namespace yb

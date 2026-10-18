@@ -1,0 +1,9 @@
+title: YbaComponent
+description: |
+  Individual YBA components to be backed up
+type: string
+enum:
+  - YBA
+  - PROMETHEUS
+  - RELEASES
+  - PA_COLLECTOR

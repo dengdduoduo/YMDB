@@ -1,0 +1,8 @@
+title: ClusterStorageSpec
+description: Complete storage volume specification used at the cluster (non-override) node level. Requires volume_size and num_volumes. Part of ClusterNodeSpec.
+allOf:
+  - $ref: "./ClusterStorageBase.yaml"
+  - type: object
+    required:
+      - volume_size
+      - num_volumes

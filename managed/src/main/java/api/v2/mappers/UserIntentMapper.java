@@ -1,0 +1,1398 @@
+// Copyright (c) YugabyteDB, Inc.
+package api.v2.mappers;
+
+import api.v2.models.AvailabilityZoneGFlags;
+import api.v2.models.AvailabilityZoneNetworking;
+import api.v2.models.AvailabilityZoneNodeSpec;
+import api.v2.models.CloudVolumeEncryption;
+import api.v2.models.ClusterAddSpec;
+import api.v2.models.ClusterEditSpec;
+import api.v2.models.ClusterGFlags;
+import api.v2.models.ClusterNetworkingEditSpec;
+import api.v2.models.ClusterNetworkingSpec;
+import api.v2.models.ClusterNodeSpec;
+import api.v2.models.ClusterPerProcessNodeSpec;
+import api.v2.models.ClusterPerProviderSpec;
+import api.v2.models.ClusterProviderEditSpec;
+import api.v2.models.ClusterProviderSpec;
+import api.v2.models.ClusterResizeNodeSpec;
+import api.v2.models.ClusterResizeStorageSpec;
+import api.v2.models.ClusterSpec;
+import api.v2.models.ClusterSpec.ClusterTypeEnum;
+import api.v2.models.ClusterStorageBase;
+import api.v2.models.ClusterStorageSpec;
+import api.v2.models.ClusterStorageType;
+import api.v2.models.ExposingServiceState;
+import api.v2.models.NodeProxyConfig;
+import api.v2.models.PerProcessNodeSpec;
+import api.v2.models.PerProviderResizeNodesSpec;
+import api.v2.models.PerProviderUpdateProxyConfigSpec;
+import api.v2.models.ProviderAzNodesSpec;
+import api.v2.models.ProviderNodeSpec;
+import api.v2.models.ProviderRegionNodesSpec;
+import api.v2.models.ProviderRootNodesSpec;
+import api.v2.models.ResizeProviderAzNodesSpec;
+import api.v2.models.ResizeProviderNodeSpec;
+import api.v2.models.ResizeProviderRegionNodesSpec;
+import api.v2.models.ResizeProviderRootNodesSpec;
+import api.v2.models.UniverseResizeNodesCluster;
+import api.v2.models.UniverseUpdateProxyConfigClustersInner;
+import api.v2.models.UpdateProxyConfigSpec;
+import com.yugabyte.yw.cloud.PublicCloudConstants.StorageType;
+import com.yugabyte.yw.commissioner.tasks.UniverseTaskBase.ServerType;
+import com.yugabyte.yw.common.PlatformServiceException;
+import com.yugabyte.yw.common.gflags.SpecificGFlags;
+import com.yugabyte.yw.common.gflags.SpecificGFlags.PerProcessFlags;
+import com.yugabyte.yw.forms.HierarchicalNodesSpec;
+import com.yugabyte.yw.forms.UniverseDefinitionTaskParams;
+import com.yugabyte.yw.forms.UniverseDefinitionTaskParams.AZOverrides;
+import com.yugabyte.yw.forms.UniverseDefinitionTaskParams.PerProcessDetails;
+import com.yugabyte.yw.forms.UniverseDefinitionTaskParams.UserIntent;
+import com.yugabyte.yw.forms.UniverseDefinitionTaskParams.UserIntent.K8SNodeResourceSpec;
+import com.yugabyte.yw.forms.UniverseDefinitionTaskParams.UserIntentOverrides;
+import com.yugabyte.yw.models.AvailabilityZone;
+import com.yugabyte.yw.models.Provider;
+import com.yugabyte.yw.models.Region;
+import com.yugabyte.yw.models.helpers.DeviceInfo;
+import com.yugabyte.yw.models.helpers.ProxyConfig;
+import com.yugabyte.yw.models.helpers.exporters.audit.AuditLogConfig;
+import com.yugabyte.yw.models.helpers.exporters.metrics.MetricsExportConfig;
+import com.yugabyte.yw.models.helpers.exporters.query.QueryLogConfig;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Map.Entry;
+import java.util.UUID;
+import java.util.stream.Collectors;
+import org.mapstruct.InheritInverseConfiguration;
+import org.mapstruct.Mapper;
+import org.mapstruct.Mapping;
+import org.mapstruct.MappingTarget;
+import org.mapstruct.ValueMapping;
+import org.mapstruct.ValueMappings;
+import org.mapstruct.factory.Mappers;
+import play.mvc.Http;
+
+@Mapper(config = CentralConfig.class)
+public interface UserIntentMapper {
+  public static UserIntentMapper INSTANCE = Mappers.getMapper(UserIntentMapper.class);
+
+  default ClusterNodeSpec userIntentToClusterNodeSpec(
+      UniverseDefinitionTaskParams.UserIntent userIntent) {
+    if (userIntent == null) {
+      return null;
+    }
+    ClusterNodeSpec clusterNodeSpec = new ClusterNodeSpec();
+
+    // top-level node spec from UserIntent
+    clusterNodeSpec.setInstanceType(userIntent.instanceType);
+    clusterNodeSpec.setStorageSpec(deviceInfoToStorageSpec(userIntent.deviceInfo));
+    clusterNodeSpec.setCgroupSize(userIntent.getCgroupSize());
+    clusterNodeSpec.setDedicatedNodes(userIntent.dedicatedNodes);
+    clusterNodeSpec.setK8sMasterResourceSpec(
+        toV2K8SNodeResourceSpec(userIntent.masterK8SNodeResourceSpec));
+    clusterNodeSpec.setK8sTserverResourceSpec(
+        toV2K8SNodeResourceSpec(userIntent.tserverK8SNodeResourceSpec));
+
+    // tserver/master node spec from UserIntentOverrides
+    UserIntentOverrides overrides = userIntent.getUserIntentOverrides();
+    if (overrides != null && overrides.getPerProcess() != null) {
+      if (overrides.getPerProcess().get(ServerType.TSERVER) != null) {
+        PerProcessDetails perProcessDetails = overrides.getPerProcess().get(ServerType.TSERVER);
+        ClusterPerProcessNodeSpec tserverNodeSpec = new ClusterPerProcessNodeSpec();
+        tserverNodeSpec.setInstanceType(perProcessDetails.getInstanceType());
+        tserverNodeSpec.setStorageSpec(deviceInfoToStorageSpec(perProcessDetails.getDeviceInfo()));
+        clusterNodeSpec.setTserver(tserverNodeSpec);
+      }
+      if (overrides.getPerProcess().get(ServerType.MASTER) != null) {
+        PerProcessDetails perProcessDetails = overrides.getPerProcess().get(ServerType.MASTER);
+        ClusterPerProcessNodeSpec masterNodeSpec = new ClusterPerProcessNodeSpec();
+        masterNodeSpec.setInstanceType(perProcessDetails.getInstanceType());
+        masterNodeSpec.setStorageSpec(deviceInfoToStorageSpec(perProcessDetails.getDeviceInfo()));
+        clusterNodeSpec.setMaster(masterNodeSpec);
+      }
+    }
+    if (userIntent.masterDeviceInfo != null || userIntent.masterInstanceType != null) {
+      ClusterPerProcessNodeSpec masterNodeSpec = clusterNodeSpec.getMaster();
+      if (masterNodeSpec == null) {
+        masterNodeSpec = new ClusterPerProcessNodeSpec();
+      }
+      if (userIntent.masterInstanceType != null) {
+        masterNodeSpec.setInstanceType(userIntent.masterInstanceType);
+      }
+      if (userIntent.masterDeviceInfo != null) {
+        masterNodeSpec.setStorageSpec(deviceInfoToStorageSpec(userIntent.masterDeviceInfo));
+      }
+      clusterNodeSpec.setMaster(masterNodeSpec);
+    }
+    // az node spec from UserIntent
+    if (overrides != null && overrides.getAzOverrides() != null) {
+      Map<String, AvailabilityZoneNodeSpec> azNodeSpec = new HashMap<>();
+      overrides
+          .getAzOverrides()
+          .forEach(
+              (azUuid, azOverrides) -> {
+                AvailabilityZoneNodeSpec azNode = new AvailabilityZoneNodeSpec();
+                azNode.setInstanceType(azOverrides.getInstanceType());
+                azNode.setStorageSpec(deviceInfoToStorageBase(azOverrides.getDeviceInfo()));
+                azNode.setCgroupSize(azOverrides.getCgroupSize());
+                if (azOverrides.getPerProcess() != null) {
+                  PerProcessDetails tserverOverrides =
+                      azOverrides.getPerProcess().get(ServerType.TSERVER);
+                  if (tserverOverrides != null) {
+                    PerProcessNodeSpec azTserver = new PerProcessNodeSpec();
+                    azTserver.setInstanceType(tserverOverrides.getInstanceType());
+                    azTserver.setStorageSpec(
+                        deviceInfoToStorageBase(tserverOverrides.getDeviceInfo()));
+                    azNode.setTserver(azTserver);
+                  }
+                  PerProcessDetails masterOverrides =
+                      azOverrides.getPerProcess().get(ServerType.MASTER);
+                  if (masterOverrides != null) {
+                    PerProcessNodeSpec azMaster = new PerProcessNodeSpec();
+                    azMaster.setInstanceType(masterOverrides.getInstanceType());
+                    azMaster.setStorageSpec(
+                        deviceInfoToStorageBase(masterOverrides.getDeviceInfo()));
+                    azNode.setMaster(azMaster);
+                  }
+                }
+                azNodeSpec.put(azUuid.toString(), azNode);
+              });
+      clusterNodeSpec.setAzNodeSpec(azNodeSpec);
+    }
+    return clusterNodeSpec;
+  }
+
+  ClusterStorageSpec deviceInfoToStorageSpec(DeviceInfo deviceInfo);
+
+  ClusterStorageBase deviceInfoToStorageBase(DeviceInfo deviceInfo);
+
+  @ValueMappings({
+    @ValueMapping(target = "SCRATCH", source = "Scratch"),
+    @ValueMapping(target = "PERSISTENT", source = "Persistent"),
+    @ValueMapping(target = "HYPERDISK_BALANCED", source = "Hyperdisk_Balanced"),
+    @ValueMapping(target = "HYPERDISK_EXTREME", source = "Hyperdisk_Extreme"),
+    @ValueMapping(target = "STANDARDSSD_LRS", source = "StandardSSD_LRS"),
+    @ValueMapping(target = "PREMIUM_LRS", source = "Premium_LRS"),
+    @ValueMapping(target = "PREMIUMV2_LRS", source = "PremiumV2_LRS"),
+    @ValueMapping(target = "ULTRASSD_LRS", source = "UltraSSD_LRS"),
+    @ValueMapping(target = "OCI_BALANCED", source = "OCI_Balanced"),
+    @ValueMapping(target = "OCI_HIGHERPERFORMANCE", source = "OCI_HigherPerformance"),
+    @ValueMapping(target = "OCI_LOWERCOST", source = "OCI_LowerCost"),
+    @ValueMapping(target = "LOCAL", source = "Local"),
+    @ValueMapping(target = "IO2", source = "IO2"),
+  })
+  ClusterStorageType mapStorageType(StorageType storageType);
+
+  api.v2.models.K8SNodeResourceSpec toV2K8SNodeResourceSpec(
+      K8SNodeResourceSpec v1K8SNodeResourceSpec);
+
+  // @Mapping(target = "enableLb", source = "enableLB")
+  default ClusterNetworkingSpec userIntentToClusterNetworkingSpec(
+      UniverseDefinitionTaskParams.UserIntent userIntent) {
+    if (userIntent == null) {
+      return null;
+    }
+    ClusterNetworkingSpec clusterNetworkingSpec = new ClusterNetworkingSpec();
+    clusterNetworkingSpec.setEnableLb(userIntent.enableLB);
+    clusterNetworkingSpec.setEnableExposingService(
+        toV2ExposingServiceState(userIntent.enableExposingService));
+    clusterNetworkingSpec.setProxyConfig(toV2ProxyConfig(userIntent.getProxyConfig()));
+    // per az
+    if (userIntent.getAZProxyConfigMap() != null) {
+      Map<String, AvailabilityZoneNetworking> azNetworking = new HashMap<>();
+      userIntent
+          .getAZProxyConfigMap()
+          .forEach(
+              (azUuid, azProxyConfig) -> {
+                AvailabilityZoneNetworking azNetworkingItem = new AvailabilityZoneNetworking();
+                azNetworkingItem.setProxyConfig(toV2ProxyConfig(azProxyConfig));
+                azNetworking.put(azUuid.toString(), azNetworkingItem);
+              });
+      clusterNetworkingSpec.setAzNetworking(azNetworking);
+    }
+    return clusterNetworkingSpec;
+  }
+
+  NodeProxyConfig toV2ProxyConfig(ProxyConfig v1ProxyConfig);
+
+  ExposingServiceState toV2ExposingServiceState(
+      UniverseDefinitionTaskParams.ExposingServiceState v1ExposingServiceState);
+
+  @Mapping(target = "kmsConfigUuid", source = "kmsConfigUUID")
+  CloudVolumeEncryption toV2CloudVolumeEncryption(
+      com.yugabyte.yw.models.helpers.CloudVolumeEncryption v1CloudVolumeEncryption);
+
+  // v1 to v2 mappings for log configs (used by ClusterMapper.toV2ClusterSpec for GET universe API)
+  api.v2.models.AuditLogConfig toV2AuditLogConfig(AuditLogConfig v1AuditLogConfig);
+
+  api.v2.models.QueryLogConfig toV2QueryLogConfig(QueryLogConfig v1QueryLogConfig);
+
+  api.v2.models.MetricsExportConfig toV2MetricsExportConfig(
+      MetricsExportConfig v1MetricsExportConfig);
+
+  default ClusterGFlags specificGFlagsToClusterGFlags(
+      UniverseDefinitionTaskParams.UserIntent userIntent) {
+    if (userIntent == null) {
+      return null;
+    }
+    SpecificGFlags specificGFlags = userIntent.specificGFlags;
+    if (specificGFlags == null) {
+      return null;
+    }
+    ClusterGFlags clusterGFlags = new ClusterGFlags();
+    if (specificGFlags.getPerProcessFlags() != null) {
+      clusterGFlags.master(specificGFlags.getPerProcessFlags().value.get(ServerType.MASTER));
+      clusterGFlags.tserver(specificGFlags.getPerProcessFlags().value.get(ServerType.TSERVER));
+    }
+    if (specificGFlags.getPerAZ() != null) {
+      for (Entry<UUID, PerProcessFlags> entry : specificGFlags.getPerAZ().entrySet()) {
+        AvailabilityZoneGFlags azGFlags = new AvailabilityZoneGFlags();
+        azGFlags.setMaster(entry.getValue().value.get(ServerType.MASTER));
+        azGFlags.setTserver(entry.getValue().value.get(ServerType.TSERVER));
+        clusterGFlags.putAzGflagsItem(entry.getKey().toString(), azGFlags);
+      }
+    }
+    if (specificGFlags.getGflagGroups() != null) {
+      clusterGFlags.setGflagGroups(
+          UniverseDefinitionTaskParamsMapper.INSTANCE.mapGflagGroupsList(
+              specificGFlags.getGflagGroups()));
+    }
+    return clusterGFlags;
+  }
+
+  @Mapping(target = "awsInstanceProfile", source = "awsArnString")
+  @Mapping(target = "imageBundleUuid", source = "imageBundleUUID")
+  @Mapping(target = "helmOverrides", source = "universeOverrides")
+  @Mapping(target = "azHelmOverrides", source = "azOverrides")
+  @Mapping(target = "provider", expression = "java(UUID.fromString(userIntent.provider))")
+  ClusterProviderSpec userIntentToClusterProviderSpec(UserIntent userIntent);
+
+  // v2 to v1 mappings begin here
+
+  default UserIntent toV1UserIntent(ClusterSpec clusterSpec) {
+    if (clusterSpec == null) {
+      return null;
+    }
+
+    UniverseDefinitionTaskParams.UserIntent userIntent =
+        new UniverseDefinitionTaskParams.UserIntent();
+    if (clusterSpec.getNumNodes() != null) {
+      userIntent.numNodes = clusterSpec.getNumNodes();
+    }
+    if (clusterSpec.getReplicationFactor() != null) {
+      userIntent.replicationFactor = clusterSpec.getReplicationFactor();
+    }
+    fillUserIntentFromClusterNodeSpec(clusterSpec.getNodeSpec(), userIntent);
+    applyDedicatedNodes(clusterSpec.getDedicatedNodes(), clusterSpec.getNodeSpec(), userIntent);
+    fillUserIntentFromClusterNetworkingSpec(clusterSpec.getNetworkingSpec(), userIntent);
+    fillUserIntentFromClusterProviderSpec(clusterSpec.getProviderSpec(), userIntent);
+
+    if (clusterSpec.getUseSpotInstance() != null) {
+      userIntent.useSpotInstance = clusterSpec.getUseSpotInstance();
+    }
+    Map<String, String> instanceTags = clusterSpec.getInstanceTags();
+    if (instanceTags != null) {
+      userIntent.instanceTags = new LinkedHashMap<String, String>(instanceTags);
+    }
+    userIntent.auditLogConfig = toV1AuditLogConfig(clusterSpec.getAuditLogConfig());
+    userIntent.queryLogConfig = toV1QueryLogConfig(clusterSpec.getQueryLogConfig());
+    // Keep the stored exportActive flag consistent with the exporter list (it defaults to true), so
+    // an edit-universe spec with logging on but no exporters is not persisted or shown as "export
+    // active" with no exporters. Metrics computes its isExportActive() from the list, so it is
+    // exempt. Mirrors the normalization in UpdateAndPersistExportTelemetryConfig.
+    if (userIntent.auditLogConfig != null) {
+      userIntent.auditLogConfig.normalizeExportActive();
+    }
+    if (userIntent.queryLogConfig != null) {
+      userIntent.queryLogConfig.normalizeExportActive();
+    }
+    userIntent.metricsExportConfig = toV1MetricsExportConfig(clusterSpec.getMetricsExportConfig());
+    userIntent.specificGFlags = clusterSpecToSpecificGFlags(clusterSpec);
+    if (clusterSpec.getProviderSpecs() != null && !clusterSpec.getProviderSpecs().isEmpty()) {
+      userIntent.providerSpecifications = new ArrayList<>();
+      for (ClusterPerProviderSpec providerSpec : clusterSpec.getProviderSpecs()) {
+        if (providerSpec == null) {
+          throw new PlatformServiceException(Http.Status.BAD_REQUEST, "Null provider spec");
+        }
+        UniverseDefinitionTaskParams.ProviderSpecification providerSpecification =
+            clusterPerProviderSpecToProviderSpecification(providerSpec);
+        Provider provider = Provider.getOrBadRequest(providerSpec.getProvider());
+        providerSpecification.setProviderType(provider.getCloudCode());
+        fillProviderSpecificationFromSpecs(
+            providerSpec.getNodesSpecs(), providerSpec.getNetworkingSpec(), providerSpecification);
+        userIntent.providerSpecifications.add(providerSpecification);
+      }
+    }
+
+    return userIntent;
+  }
+
+  default UserIntent toV1UserIntentFromClusterEditSpec(
+      ClusterEditSpec clusterEditSpec, @MappingTarget UserIntent userIntent) {
+    if (clusterEditSpec == null) {
+      return userIntent;
+    }
+    if (userIntent == null) {
+      userIntent = new UniverseDefinitionTaskParams.UserIntent();
+    }
+    if (clusterEditSpec.getNumNodes() != null) {
+      userIntent.numNodes = clusterEditSpec.getNumNodes();
+    }
+    fillUserIntentFromClusterNodeSpec(clusterEditSpec.getNodeSpec(), userIntent);
+    applyDedicatedNodes(
+        clusterEditSpec.getDedicatedNodes(), clusterEditSpec.getNodeSpec(), userIntent);
+    fillUserIntentFromClusterNetworkingEditSpec(clusterEditSpec.getNetworkingSpec(), userIntent);
+    fillUserIntentFromClusterProviderEditSpec(clusterEditSpec.getProviderSpec(), userIntent);
+    Map<String, String> instanceTags = clusterEditSpec.getInstanceTags();
+    if (instanceTags != null) {
+      userIntent.instanceTags = new LinkedHashMap<String, String>(instanceTags);
+    }
+    if (clusterEditSpec.getProviderSpecs() != null
+        && !clusterEditSpec.getProviderSpecs().isEmpty()) {
+      for (ClusterPerProviderSpec providerSpec : clusterEditSpec.getProviderSpecs()) {
+        if (providerSpec == null) {
+          throw new PlatformServiceException(Http.Status.BAD_REQUEST, "Null provider spec");
+        }
+        if (providerSpec.getProvider() == null) {
+          throw new PlatformServiceException(Http.Status.BAD_REQUEST, "Provider must be set");
+        }
+        UniverseDefinitionTaskParams.ProviderSpecification providerSpecification =
+            userIntent.getProviderSpecification(providerSpec.getProvider());
+        if (providerSpecification == null) {
+          providerSpecification = clusterPerProviderSpecToProviderSpecification(providerSpec);
+          Provider provider = Provider.getOrBadRequest(providerSpec.getProvider());
+          providerSpecification.setProviderType(provider.getCloudCode());
+          fillProviderSpecificationFromSpecs(
+              providerSpec.getNodesSpecs(),
+              providerSpec.getNetworkingSpec(),
+              providerSpecification);
+          userIntent.providerSpecifications.add(providerSpecification);
+        } else {
+          applyClusterPerProviderSpecToProviderSpecification(providerSpec, providerSpecification);
+        }
+      }
+    }
+    return userIntent;
+  }
+
+  default UserIntent toV1UserIntentFromUniverseResizeNodesCluster(
+      UniverseResizeNodesCluster source, @MappingTarget UserIntent userIntent) {
+    if (source == null) {
+      return userIntent;
+    }
+    if (userIntent == null) {
+      userIntent = new UniverseDefinitionTaskParams.UserIntent();
+    }
+    if (source.getProviderNodesSpecs() != null && !source.getProviderNodesSpecs().isEmpty()) {
+      if (!userIntent.isMulticloudSupport()) {
+        throw new PlatformServiceException(
+            Http.Status.UNPROCESSABLE_ENTITY,
+            "ProviderNodesSpecs are only applicable to multicloud universes");
+      }
+      applyPerProviderResizeNodesSpecsToUserIntent(source.getProviderNodesSpecs(), userIntent);
+    } else if (source.getNodeSpec() != null) {
+      fillUserIntentFromClusterResizeNodeSpec(source.getNodeSpec(), userIntent);
+    }
+    // node_spec / provider_nodes_specs may be omitted for gflags-only resize requests
+    userIntent.specificGFlags = v1SpecificGFlagsFromClusterGFlags(source.getGflags());
+    return userIntent;
+  }
+
+  default UserIntent applyPerProviderResizeNodesSpecsToUserIntent(
+      List<PerProviderResizeNodesSpec> providerNodesSpecs, UserIntent userIntent) {
+    if (providerNodesSpecs == null || providerNodesSpecs.isEmpty() || userIntent == null) {
+      return userIntent;
+    }
+    if (!userIntent.isMulticloudSupport()) {
+      throw new PlatformServiceException(
+          Http.Status.BAD_REQUEST,
+          "provider_nodes_specs is only supported for multicloud clusters");
+    }
+    for (PerProviderResizeNodesSpec providerSpec : providerNodesSpecs) {
+      if (providerSpec == null) {
+        throw new PlatformServiceException(Http.Status.BAD_REQUEST, "Null provider node spec");
+      }
+      if (providerSpec.getProvider() == null) {
+        throw new PlatformServiceException(Http.Status.BAD_REQUEST, "Provider must be set");
+      }
+      UniverseDefinitionTaskParams.ProviderSpecification providerSpecification =
+          userIntent.getProviderSpecification(providerSpec.getProvider());
+      if (providerSpecification == null) {
+        throw new PlatformServiceException(
+            Http.Status.BAD_REQUEST, "Provider " + providerSpec.getProvider() + " is not found");
+      }
+      applyResizeProviderRootNodesSpecToProviderSpecification(
+          providerSpec.getNodesSpec(), providerSpecification);
+    }
+    return userIntent;
+  }
+
+  default UserIntent toV1UserIntentFromUniverseUpdateProxyConfigClustersInner(
+      UniverseUpdateProxyConfigClustersInner source, @MappingTarget UserIntent userIntent) {
+    if (source == null) {
+      return userIntent;
+    }
+    if (userIntent == null) {
+      userIntent = new UniverseDefinitionTaskParams.UserIntent();
+    }
+    if (source.getProviderProxySpecs() != null && !source.getProviderProxySpecs().isEmpty()) {
+      if (!userIntent.isMulticloudSupport()) {
+        throw new PlatformServiceException(
+            Http.Status.BAD_REQUEST,
+            "provider_proxy_specs is only supported for multicloud clusters");
+      }
+      applyPerProviderUpdateProxyConfigSpecsToUserIntent(
+          source.getProviderProxySpecs(), userIntent);
+    } else if (source.getNetworkingSpec() != null) {
+      fillUserIntentFromUpdateProxyConfigSpec(source.getNetworkingSpec(), userIntent);
+    }
+    // networking_spec / provider_proxy_specs may be omitted; treat as no-op
+    return userIntent;
+  }
+
+  default UserIntent applyPerProviderUpdateProxyConfigSpecsToUserIntent(
+      List<PerProviderUpdateProxyConfigSpec> providerProxySpecs, UserIntent userIntent) {
+    if (providerProxySpecs == null || providerProxySpecs.isEmpty() || userIntent == null) {
+      return userIntent;
+    }
+    if (!userIntent.isMulticloudSupport()) {
+      throw new PlatformServiceException(
+          Http.Status.BAD_REQUEST,
+          "provider_proxy_specs is only supported for multicloud clusters");
+    }
+    for (PerProviderUpdateProxyConfigSpec providerProxySpec : providerProxySpecs) {
+      if (providerProxySpec == null) {
+        throw new PlatformServiceException(Http.Status.BAD_REQUEST, "Null provider proxy spec");
+      }
+      if (providerProxySpec.getProvider() == null) {
+        throw new PlatformServiceException(Http.Status.BAD_REQUEST, "Provider must be set");
+      }
+      UniverseDefinitionTaskParams.ProviderSpecification providerSpecification =
+          userIntent.getProviderSpecification(providerProxySpec.getProvider());
+      if (providerSpecification == null) {
+        throw new PlatformServiceException(
+            Http.Status.BAD_REQUEST,
+            "Provider " + providerProxySpec.getProvider() + " is not found");
+      }
+      applyUpdateProxyConfigSpecToProviderSpecification(
+          providerProxySpec.getProxyConfig(),
+          providerProxySpec.getRegionNetworking(),
+          providerProxySpec.getAzNetworking(),
+          providerSpecification);
+    }
+    return userIntent;
+  }
+
+  default void applyUpdateProxyConfigSpecToProviderSpecification(
+      NodeProxyConfig proxyConfig,
+      Map<String, NodeProxyConfig> regionNetworking,
+      Map<String, NodeProxyConfig> azNetworking,
+      UniverseDefinitionTaskParams.ProviderSpecification providerSpecification) {
+    if (providerSpecification == null) {
+      return;
+    }
+    HierarchicalNodesSpec.RootNodesSpec nodesSpecs = providerSpecification.getNodesSpecs();
+    if (nodesSpecs == null) {
+      throw new PlatformServiceException(Http.Status.BAD_REQUEST, "Missing root nodes spec");
+    }
+    Provider provider = Provider.getOrBadRequest(providerSpecification.getProviderUUID());
+    if (proxyConfig != null) {
+      nodesSpecs.getOrCreateTserverSpec().setBackupProxyConfig(toV1ProxyConfig(proxyConfig));
+    }
+    if (regionNetworking != null) {
+      regionNetworking.forEach(
+          (regionCode, regionProxyConfig) -> {
+            if (regionProxyConfig == null) {
+              return;
+            }
+            if (Region.getByCode(provider, regionCode) == null) {
+              throw new PlatformServiceException(
+                  Http.Status.BAD_REQUEST,
+                  "Region " + regionCode + " not found for provider " + provider.getUuid());
+            }
+            HierarchicalNodesSpec.RegionNodesSpec regionNodesSpec =
+                nodesSpecs.getOrCreateDescendant(regionCode);
+            regionNodesSpec
+                .getOrCreateTserverSpec()
+                .setBackupProxyConfig(toV1ProxyConfig(regionProxyConfig));
+          });
+    }
+    if (azNetworking != null) {
+      azNetworking.forEach(
+          (azCode, azProxyConfig) -> {
+            if (azProxyConfig == null) {
+              return;
+            }
+            AvailabilityZone az =
+                AvailabilityZone.maybeGetByCode(provider, azCode)
+                    .orElseThrow(
+                        () ->
+                            new PlatformServiceException(
+                                Http.Status.BAD_REQUEST,
+                                "Availability zone "
+                                    + azCode
+                                    + " not found for provider "
+                                    + provider.getUuid()));
+            HierarchicalNodesSpec.RegionNodesSpec regionNodesSpec =
+                nodesSpecs.getOrCreateDescendant(az.getRegion().getCode());
+            HierarchicalNodesSpec.AzNodesSpec azNodesSpec =
+                regionNodesSpec.getOrCreateDescendant(az.getCode());
+            azNodesSpec
+                .getOrCreateTserverSpec()
+                .setBackupProxyConfig(toV1ProxyConfig(azProxyConfig));
+          });
+    }
+  }
+
+  default UserIntent overwriteUserIntentFromClusterAddSpec(
+      ClusterAddSpec clusterAddSpec, @MappingTarget UserIntent userIntent) {
+    if (clusterAddSpec == null) {
+      return userIntent;
+    }
+    if (clusterAddSpec.getNumNodes() != null) {
+      userIntent.numNodes = clusterAddSpec.getNumNodes();
+    }
+    fillUserIntentFromClusterNodeSpec(clusterAddSpec.getNodeSpec(), userIntent);
+    applyDedicatedNodes(
+        clusterAddSpec.getDedicatedNodes(), clusterAddSpec.getNodeSpec(), userIntent);
+    fillUserIntentFromClusterProviderEditSpec(clusterAddSpec.getProviderSpec(), userIntent);
+
+    Map<String, String> instanceTags = clusterAddSpec.getInstanceTags();
+    if (instanceTags != null) {
+      if (userIntent.instanceTags == null) {
+        userIntent.instanceTags = new LinkedHashMap<String, String>(instanceTags);
+      } else {
+        userIntent.instanceTags.clear();
+        userIntent.instanceTags.putAll(instanceTags);
+      }
+    }
+    if (clusterAddSpec != null) {
+      userIntent.specificGFlags = clusterAddSpecToSpecificGFlags(clusterAddSpec);
+    }
+    return userIntent;
+  }
+
+  @InheritInverseConfiguration
+  StorageType mapStorageTypeEnum(ClusterStorageType storageType);
+
+  /**
+   * Apply dedicated_nodes when explicitly present. Cluster-level value is preferred over the
+   * deprecated node_spec.dedicated_nodes. Null means omit (preserve existing on edit / fall back to
+   * node_spec / default false on create via UserIntent field default).
+   */
+  default void applyDedicatedNodes(
+      Boolean clusterDedicatedNodes, ClusterNodeSpec nodeSpec, UserIntent userIntent) {
+    if (userIntent == null) {
+      return;
+    }
+    if (clusterDedicatedNodes != null) {
+      userIntent.dedicatedNodes = clusterDedicatedNodes;
+    } else if (nodeSpec != null && nodeSpec.getDedicatedNodes() != null) {
+      userIntent.dedicatedNodes = nodeSpec.getDedicatedNodes();
+    }
+  }
+
+  default UserIntent fillUserIntentFromClusterNodeSpec(
+      ClusterNodeSpec clusterNodeSpec, UserIntent userIntent) {
+    if (clusterNodeSpec == null) {
+      return userIntent;
+    }
+    userIntent.instanceType = clusterNodeSpec.getInstanceType();
+    userIntent.deviceInfo = storageSpecToDeviceInfo(clusterNodeSpec.getStorageSpec());
+    userIntent.setCgroupSize(clusterNodeSpec.getCgroupSize());
+    userIntent.masterK8SNodeResourceSpec =
+        toV1K8SNodeResourceSpec(clusterNodeSpec.getK8sMasterResourceSpec());
+    userIntent.tserverK8SNodeResourceSpec =
+        toV1K8SNodeResourceSpec(clusterNodeSpec.getK8sTserverResourceSpec());
+
+    // fill user intent overrides
+    if (clusterNodeSpec.getMaster() != null
+        && (clusterNodeSpec.getMaster().getInstanceType() != null
+            || clusterNodeSpec.getMaster().getStorageSpec() != null)) {
+      UserIntentOverrides overrides = userIntent.getUserIntentOverrides();
+      if (overrides == null) {
+        overrides = new UserIntentOverrides();
+        userIntent.setUserIntentOverrides(overrides);
+      }
+      PerProcessDetails masterOverrides = new PerProcessDetails();
+      masterOverrides.setInstanceType(clusterNodeSpec.getMaster().getInstanceType());
+      masterOverrides.setDeviceInfo(
+          storageSpecToDeviceInfo(clusterNodeSpec.getMaster().getStorageSpec()));
+      Map<ServerType, PerProcessDetails> perProcess = overrides.getPerProcess();
+      if (perProcess == null) {
+        perProcess = new HashMap<>();
+        overrides.setPerProcess(perProcess);
+      }
+      perProcess.put(ServerType.MASTER, masterOverrides);
+      // Our code is using masterInstanceType and masterDeviceInfo now instead of overrides.
+      userIntent.masterInstanceType = masterOverrides.getInstanceType();
+      userIntent.masterDeviceInfo = masterOverrides.getDeviceInfo();
+    }
+    if (clusterNodeSpec.getTserver() != null) {
+      UserIntentOverrides overrides = userIntent.getUserIntentOverrides();
+      if (overrides == null) {
+        overrides = new UserIntentOverrides();
+        userIntent.setUserIntentOverrides(overrides);
+      }
+      PerProcessDetails tserverOverrides = new PerProcessDetails();
+      tserverOverrides.setInstanceType(clusterNodeSpec.getTserver().getInstanceType());
+      tserverOverrides.setDeviceInfo(
+          storageSpecToDeviceInfo(clusterNodeSpec.getTserver().getStorageSpec()));
+      Map<ServerType, PerProcessDetails> perProcess = overrides.getPerProcess();
+      if (perProcess == null) {
+        perProcess = new HashMap<>();
+        overrides.setPerProcess(perProcess);
+      }
+      perProcess.put(ServerType.TSERVER, tserverOverrides);
+    }
+    // When az_node_spec is present, fully replace existing AZ overrides (same semantics as
+    // az_gflags). Omitting the field leaves existing overrides unchanged; an empty map clears them.
+    if (clusterNodeSpec.getAzNodeSpec() != null) {
+      UserIntentOverrides overrides = getOrCreateUserIntentOverrides(userIntent);
+      Map<UUID, AZOverrides> azOverridesMap = new HashMap<>();
+      clusterNodeSpec
+          .getAzNodeSpec()
+          .forEach(
+              (azUuid, azNode) -> {
+                AZOverrides azOverrides = new AZOverrides();
+                azOverrides.setInstanceType(azNode.getInstanceType());
+                azOverrides.setDeviceInfo(storageSpecToDeviceInfo(azNode.getStorageSpec()));
+                azOverrides.setCgroupSize(azNode.getCgroupSize());
+                if (azNode.getMaster() != null) {
+                  PerProcessDetails masterOverrides = new PerProcessDetails();
+                  masterOverrides.setInstanceType(azNode.getMaster().getInstanceType());
+                  masterOverrides.setDeviceInfo(
+                      storageSpecToDeviceInfo(azNode.getMaster().getStorageSpec()));
+                  getOrCreateAzPerProcess(azOverrides).put(ServerType.MASTER, masterOverrides);
+                }
+                if (azNode.getTserver() != null) {
+                  PerProcessDetails tserverOverrides = new PerProcessDetails();
+                  tserverOverrides.setInstanceType(azNode.getTserver().getInstanceType());
+                  tserverOverrides.setDeviceInfo(
+                      storageSpecToDeviceInfo(azNode.getTserver().getStorageSpec()));
+                  getOrCreateAzPerProcess(azOverrides).put(ServerType.TSERVER, tserverOverrides);
+                }
+                azOverridesMap.put(UUID.fromString(azUuid), azOverrides);
+              });
+      overrides.setAzOverrides(azOverridesMap);
+    }
+    return userIntent;
+  }
+
+  default UserIntent fillUserIntentFromClusterResizeNodeSpec(
+      ClusterResizeNodeSpec clusterResizeNodeSpec, UserIntent userIntent) {
+    if (clusterResizeNodeSpec == null) {
+      return userIntent;
+    }
+    if (clusterResizeNodeSpec.getInstanceType() != null) {
+      userIntent.instanceType = clusterResizeNodeSpec.getInstanceType();
+    }
+    if (clusterResizeNodeSpec.getStorageSpec() != null) {
+      DeviceInfo incoming = resizeStorageSpecToDeviceInfo(clusterResizeNodeSpec.getStorageSpec());
+      if (userIntent.deviceInfo == null) {
+        userIntent.deviceInfo = incoming;
+      } else {
+        userIntent.deviceInfo.mergeDeviceInfo(incoming);
+      }
+    }
+    if (clusterResizeNodeSpec.getCgroupSize() != null) {
+      userIntent.setCgroupSize(clusterResizeNodeSpec.getCgroupSize());
+    }
+    if (clusterResizeNodeSpec.getK8sMasterResourceSpec() != null) {
+      userIntent.masterK8SNodeResourceSpec =
+          toV1K8SNodeResourceSpec(clusterResizeNodeSpec.getK8sMasterResourceSpec());
+    }
+    if (clusterResizeNodeSpec.getK8sTserverResourceSpec() != null) {
+      userIntent.tserverK8SNodeResourceSpec =
+          toV1K8SNodeResourceSpec(clusterResizeNodeSpec.getK8sTserverResourceSpec());
+    }
+
+    // fill user intent overrides
+    if (clusterResizeNodeSpec.getMaster() != null) {
+      UserIntentOverrides overrides = userIntent.getUserIntentOverrides();
+      if (overrides == null) {
+        overrides = new UserIntentOverrides();
+        userIntent.setUserIntentOverrides(overrides);
+      }
+      boolean hasChanges = false;
+      PerProcessDetails masterOverrides = new PerProcessDetails();
+      String masterInstanceType = clusterResizeNodeSpec.getMaster().getInstanceType();
+      DeviceInfo incomingDeviceInfo = null;
+      if (masterInstanceType != null) {
+        userIntent.masterInstanceType = masterInstanceType;
+        masterOverrides.setInstanceType(masterInstanceType);
+        hasChanges = true;
+      }
+      if (clusterResizeNodeSpec.getMaster().getStorageSpec() != null) {
+        // Our code is using masterInstanceType and masterDeviceInfo now instead of overrides.
+        DeviceInfo currentDeviceInfo = userIntent.masterDeviceInfo;
+        incomingDeviceInfo =
+            resizeStorageSpecToDeviceInfo(clusterResizeNodeSpec.getMaster().getStorageSpec());
+        if (currentDeviceInfo == null) {
+          currentDeviceInfo = incomingDeviceInfo;
+        } else {
+          currentDeviceInfo.mergeDeviceInfo(incomingDeviceInfo);
+        }
+        masterOverrides.setDeviceInfo(currentDeviceInfo);
+        hasChanges = true;
+      }
+      if (hasChanges) {
+        Map<ServerType, PerProcessDetails> perProcess = overrides.getPerProcess();
+        if (perProcess == null) {
+          perProcess = new HashMap<>();
+          overrides.setPerProcess(perProcess);
+        }
+        PerProcessDetails existingMasterOverrides =
+            perProcess.getOrDefault(ServerType.MASTER, new PerProcessDetails());
+        existingMasterOverrides.mergeWith(masterOverrides);
+        perProcess.put(ServerType.MASTER, existingMasterOverrides);
+      }
+
+      if (incomingDeviceInfo != null) {
+        if (userIntent.masterDeviceInfo == null) {
+          userIntent.masterDeviceInfo = incomingDeviceInfo;
+        } else {
+          userIntent.masterDeviceInfo.mergeDeviceInfo(incomingDeviceInfo);
+        }
+      }
+    }
+    if (clusterResizeNodeSpec.getTserver() != null) {
+      UserIntentOverrides overrides = userIntent.getUserIntentOverrides();
+      if (overrides == null) {
+        overrides = new UserIntentOverrides();
+        userIntent.setUserIntentOverrides(overrides);
+      }
+      PerProcessDetails tserverOverrides = new PerProcessDetails();
+      boolean hasChanges = false;
+      if (clusterResizeNodeSpec.getTserver().getInstanceType() != null) {
+        tserverOverrides.setInstanceType(clusterResizeNodeSpec.getTserver().getInstanceType());
+        hasChanges = true;
+      }
+      if (clusterResizeNodeSpec.getTserver().getStorageSpec() != null) {
+        DeviceInfo incoming =
+            resizeStorageSpecToDeviceInfo(clusterResizeNodeSpec.getTserver().getStorageSpec());
+        if (tserverOverrides.getDeviceInfo() == null) {
+          tserverOverrides.setDeviceInfo(incoming);
+        } else {
+          tserverOverrides.getDeviceInfo().mergeDeviceInfo(incoming);
+        }
+        hasChanges = true;
+      }
+      if (hasChanges) {
+        Map<ServerType, PerProcessDetails> perProcess = overrides.getPerProcess();
+        if (perProcess == null) {
+          perProcess = new HashMap<>();
+          overrides.setPerProcess(perProcess);
+        }
+        PerProcessDetails existingTserverOverrides =
+            perProcess.getOrDefault(ServerType.TSERVER, new PerProcessDetails());
+        existingTserverOverrides.mergeWith(tserverOverrides);
+        perProcess.put(ServerType.TSERVER, existingTserverOverrides);
+      }
+    }
+    if (clusterResizeNodeSpec.getAzNodeSpec() != null) {
+      clusterResizeNodeSpec
+          .getAzNodeSpec()
+          .forEach(
+              (azUuid, azNode) -> {
+                UserIntentOverrides overrides = getOrCreateUserIntentOverrides(userIntent);
+                Map<UUID, AZOverrides> azOverridesMap = getOrCreateAzOverrides(overrides);
+                boolean hasAzOverride = false;
+                AZOverrides azOverrides =
+                    azOverridesMap.getOrDefault(UUID.fromString(azUuid), new AZOverrides());
+                if (azNode.getInstanceType() != null) {
+                  azOverrides.setInstanceType(azNode.getInstanceType());
+                  hasAzOverride = true;
+                }
+                if (azNode.getStorageSpec() != null) {
+                  DeviceInfo incoming = resizeStorageSpecToDeviceInfo(azNode.getStorageSpec());
+                  if (azOverrides.getDeviceInfo() == null) {
+                    azOverrides.setDeviceInfo(incoming);
+                  } else {
+                    azOverrides.getDeviceInfo().mergeDeviceInfo(incoming);
+                  }
+                  hasAzOverride = true;
+                }
+                if (azNode.getCgroupSize() != null) {
+                  azOverrides.setCgroupSize(azNode.getCgroupSize());
+                  hasAzOverride = true;
+                }
+                if (azNode.getMaster() != null) {
+                  Map<ServerType, PerProcessDetails> azPerProcess =
+                      getOrCreateAzPerProcess(azOverrides);
+                  PerProcessDetails masterOverrides =
+                      azPerProcess.getOrDefault(ServerType.MASTER, new PerProcessDetails());
+                  boolean hasChanges = false;
+                  if (azNode.getMaster().getInstanceType() != null) {
+                    masterOverrides.setInstanceType(azNode.getMaster().getInstanceType());
+                    hasChanges = true;
+                  }
+                  if (azNode.getMaster().getStorageSpec() != null) {
+                    DeviceInfo incoming =
+                        resizeStorageSpecToDeviceInfo(azNode.getMaster().getStorageSpec());
+                    if (masterOverrides.getDeviceInfo() == null) {
+                      masterOverrides.setDeviceInfo(incoming);
+                    } else {
+                      masterOverrides.getDeviceInfo().mergeDeviceInfo(incoming);
+                    }
+                    hasChanges = true;
+                  }
+                  if (hasChanges) {
+                    azPerProcess.put(ServerType.MASTER, masterOverrides);
+                    hasAzOverride = true;
+                  }
+                }
+                if (azNode.getTserver() != null) {
+                  Map<ServerType, PerProcessDetails> azPerProcess =
+                      getOrCreateAzPerProcess(azOverrides);
+                  PerProcessDetails tserverOverrides =
+                      azPerProcess.getOrDefault(ServerType.TSERVER, new PerProcessDetails());
+                  boolean hasChanges = false;
+                  if (azNode.getTserver().getInstanceType() != null) {
+                    tserverOverrides.setInstanceType(azNode.getTserver().getInstanceType());
+                    hasChanges = true;
+                  }
+                  if (azNode.getTserver().getStorageSpec() != null) {
+                    DeviceInfo incoming =
+                        resizeStorageSpecToDeviceInfo(azNode.getTserver().getStorageSpec());
+                    if (tserverOverrides.getDeviceInfo() == null) {
+                      tserverOverrides.setDeviceInfo(incoming);
+                    } else {
+                      tserverOverrides.getDeviceInfo().mergeDeviceInfo(incoming);
+                    }
+                    hasChanges = true;
+                  }
+                  if (hasChanges) {
+                    azPerProcess.put(ServerType.TSERVER, tserverOverrides);
+                    hasAzOverride = true;
+                  }
+                }
+                if (hasAzOverride) {
+                  azOverridesMap.put(UUID.fromString(azUuid), azOverrides);
+                }
+              });
+    }
+    return userIntent;
+  }
+
+  DeviceInfo storageSpecToDeviceInfo(ClusterStorageSpec storageSpec);
+
+  DeviceInfo storageSpecToDeviceInfo(ClusterStorageBase storageSpec);
+
+  DeviceInfo resizeStorageSpecToDeviceInfo(ClusterResizeStorageSpec storageSpec);
+
+  @Mapping(target = "kmsConfigUUID", source = "kmsConfigUuid")
+  com.yugabyte.yw.models.helpers.CloudVolumeEncryption toV1CloudVolumeEncryption(
+      CloudVolumeEncryption v2CloudVolumeEncryption);
+
+  K8SNodeResourceSpec toV1K8SNodeResourceSpec(
+      api.v2.models.K8SNodeResourceSpec v2K8SNodeResourceSpec);
+
+  ProxyConfig toV1ProxyConfig(NodeProxyConfig nodeProxyConfig);
+
+  UniverseDefinitionTaskParams.ExposingServiceState toV1ExposingServiceState(
+      ExposingServiceState v2ExposingServiceState);
+
+  AuditLogConfig toV1AuditLogConfig(api.v2.models.AuditLogConfig v2AuditLogConfig);
+
+  QueryLogConfig toV1QueryLogConfig(api.v2.models.QueryLogConfig v2QueryLogConfig);
+
+  MetricsExportConfig toV1MetricsExportConfig(
+      api.v2.models.MetricsExportConfig v2MetricsExportConfig);
+
+  default UserIntent fillUserIntentFromClusterNetworkingSpec(
+      ClusterNetworkingSpec clusterNetworkingSpec, UserIntent userIntent) {
+    if (clusterNetworkingSpec == null) {
+      return userIntent;
+    }
+    userIntent.enableLB = clusterNetworkingSpec.getEnableLb();
+    userIntent.setProxyConfig(toV1ProxyConfig(clusterNetworkingSpec.getProxyConfig()));
+    userIntent.enableExposingService =
+        toV1ExposingServiceState(clusterNetworkingSpec.getEnableExposingService());
+    return userIntent;
+  }
+
+  default UserIntent fillUserIntentFromClusterNetworkingEditSpec(
+      ClusterNetworkingEditSpec clusterNetworkingEditSpec, UserIntent userIntent) {
+    if (clusterNetworkingEditSpec == null) {
+      return userIntent;
+    }
+    if (clusterNetworkingEditSpec.getEnableExposingService() != null) {
+      userIntent.enableExposingService =
+          toV1ExposingServiceState(clusterNetworkingEditSpec.getEnableExposingService());
+    }
+    return userIntent;
+  }
+
+  // Used by ClusterMapper.deepCopyClusterEditSpecWithoutPlacementSpec when inheriting
+  // primary ClusterSpec networking into ClusterEditSpec.
+  default ClusterNetworkingEditSpec toClusterNetworkingEditSpec(ClusterNetworkingSpec source) {
+    if (source == null) {
+      return null;
+    }
+    ClusterNetworkingEditSpec editSpec = new ClusterNetworkingEditSpec();
+    editSpec.setEnableExposingService(source.getEnableExposingService());
+    return editSpec;
+  }
+
+  default UserIntent fillUserIntentFromUpdateProxyConfigSpec(
+      UpdateProxyConfigSpec updateProxyConfigSpec, UserIntent userIntent) {
+    if (updateProxyConfigSpec == null) {
+      return userIntent;
+    }
+    if (updateProxyConfigSpec.getProxyConfig() != null) {
+      userIntent.setProxyConfig(toV1ProxyConfig(updateProxyConfigSpec.getProxyConfig()));
+    }
+    if (updateProxyConfigSpec.getAzNetworking() != null) {
+      if (userIntent.getUserIntentOverrides() == null) {
+        userIntent.setUserIntentOverrides(new UserIntentOverrides());
+      }
+      updateProxyConfigSpec
+          .getAzNetworking()
+          .forEach(
+              (azUuid, azProxyConfig) -> {
+                if (azProxyConfig != null) {
+                  userIntent
+                      .getUserIntentOverrides()
+                      .updateAZOverride(
+                          UUID.fromString(azUuid),
+                          azo -> azo.setProxyConfig(toV1ProxyConfig(azProxyConfig)));
+                }
+              });
+    }
+    return userIntent;
+  }
+
+  default UserIntent fillUserIntentFromClusterProviderSpec(
+      ClusterProviderSpec clusterProviderSpec, UserIntent userIntent) {
+    if (clusterProviderSpec == null) {
+      return userIntent;
+    }
+
+    userIntent.universeOverrides = clusterProviderSpec.getHelmOverrides();
+    Map<String, String> azHelmOverrides = clusterProviderSpec.getAzHelmOverrides();
+    if (azHelmOverrides != null) {
+      userIntent.azOverrides = new LinkedHashMap<String, String>(azHelmOverrides);
+    }
+    userIntent.imageBundleUUID = clusterProviderSpec.getImageBundleUuid();
+    userIntent.awsArnString = clusterProviderSpec.getAwsInstanceProfile();
+
+    UUID provider = clusterProviderSpec.getProvider();
+    if (provider != null) {
+      userIntent.provider = provider.toString();
+    }
+    List<UUID> regionList = clusterProviderSpec.getRegionList();
+    if (regionList != null) {
+      userIntent.regionList = new ArrayList<UUID>(regionList);
+    }
+    userIntent.preferredRegion = clusterProviderSpec.getPreferredRegion();
+    userIntent.accessKeyCode = clusterProviderSpec.getAccessKeyCode();
+    return userIntent;
+  }
+
+  default UserIntent fillUserIntentFromClusterProviderEditSpec(
+      ClusterProviderEditSpec clusterProviderEditSpec, UserIntent userIntent) {
+    if (clusterProviderEditSpec == null) {
+      return userIntent;
+    }
+    List<UUID> regionList = clusterProviderEditSpec.getRegionList();
+    if (regionList != null) {
+      userIntent.regionList = new ArrayList<UUID>(regionList);
+    }
+    if (clusterProviderEditSpec.getImageBundleUuid() != null) {
+      userIntent.imageBundleUUID = clusterProviderEditSpec.getImageBundleUuid();
+    }
+    if (clusterProviderEditSpec.getAwsInstanceProfile() != null) {
+      userIntent.awsArnString = clusterProviderEditSpec.getAwsInstanceProfile();
+    }
+    return userIntent;
+  }
+
+  default SpecificGFlags v1SpecificGFlagsFromClusterGFlags(ClusterGFlags v2ClusterGFlags) {
+    if (v2ClusterGFlags == null) {
+      return new SpecificGFlags();
+    }
+    SpecificGFlags specificGFlags =
+        SpecificGFlags.construct(v2ClusterGFlags.getMaster(), v2ClusterGFlags.getTserver());
+    if (v2ClusterGFlags.getAzGflags() != null) {
+      Map<UUID, PerProcessFlags> perAz = new HashMap<>();
+      for (Entry<String, AvailabilityZoneGFlags> entry : v2ClusterGFlags.getAzGflags().entrySet()) {
+        PerProcessFlags perProc = new PerProcessFlags();
+        perProc.value.put(ServerType.MASTER, entry.getValue().getMaster());
+        perProc.value.put(ServerType.TSERVER, entry.getValue().getTserver());
+        perAz.put(UUID.fromString(entry.getKey()), perProc);
+      }
+      specificGFlags.setPerAZ(perAz);
+    }
+    if (v2ClusterGFlags.getGflagGroups() != null) {
+      specificGFlags.setGflagGroups(
+          UniverseDefinitionTaskParamsMapper.INSTANCE.mapGroupNameList(
+              v2ClusterGFlags.getGflagGroups()));
+    }
+    return specificGFlags;
+  }
+
+  default SpecificGFlags clusterSpecToSpecificGFlags(ClusterSpec clusterSpec) {
+    SpecificGFlags specificGFlags = v1SpecificGFlagsFromClusterGFlags(clusterSpec.getGflags());
+    if (clusterSpec.getClusterType() != null
+        && !clusterSpec.getClusterType().equals(ClusterTypeEnum.PRIMARY)) {
+      // do not set inherit from primary as v2 manually defaults to true behaviour
+      specificGFlags.setInheritFromPrimary(false);
+    }
+    return specificGFlags;
+  }
+
+  default SpecificGFlags clusterAddSpecToSpecificGFlags(ClusterAddSpec clusterAddSpec) {
+    SpecificGFlags specificGFlags = v1SpecificGFlagsFromClusterGFlags(clusterAddSpec.getGflags());
+    // do not set inherit from primary as v2 manually defaults to true behaviour
+    specificGFlags.setInheritFromPrimary(false);
+    return specificGFlags;
+  }
+
+  default UserIntentOverrides getOrCreateUserIntentOverrides(UserIntent userIntent) {
+    UserIntentOverrides overrides = userIntent.getUserIntentOverrides();
+    if (overrides == null) {
+      overrides = new UserIntentOverrides();
+      userIntent.setUserIntentOverrides(overrides);
+    }
+    return overrides;
+  }
+
+  default Map<UUID, AZOverrides> getOrCreateAzOverrides(UserIntentOverrides overrides) {
+    if (overrides.getAzOverrides() == null) {
+      overrides.setAzOverrides(new HashMap<>());
+    }
+    return overrides.getAzOverrides();
+  }
+
+  default Map<ServerType, PerProcessDetails> getOrCreateAzPerProcess(AZOverrides azOverrides) {
+    Map<ServerType, PerProcessDetails> perProcess = azOverrides.getPerProcess();
+    if (perProcess == null) {
+      perProcess = new HashMap<>();
+      azOverrides.setPerProcess(perProcess);
+    }
+    return perProcess;
+  }
+
+  // Provider specifications
+
+  @Mapping(target = "providerUUID", source = "provider")
+  @Mapping(target = "imageBundleUUID", source = "imageBundleUuid")
+  @Mapping(target = "nodesSpecs", ignore = true)
+  @Mapping(target = "providerType", ignore = true)
+  @Mapping(target = "enableLoadBalancer", ignore = true)
+  @Mapping(target = "exposingServiceState", ignore = true)
+  UniverseDefinitionTaskParams.ProviderSpecification clusterPerProviderSpecToProviderSpecification(
+      ClusterPerProviderSpec clusterPerProviderSpec);
+
+  @InheritInverseConfiguration(name = "clusterPerProviderSpecToProviderSpecification")
+  @Mapping(target = "nodesSpecs", source = "nodesSpecs")
+  @Mapping(target = "networkingSpec", source = ".")
+  ClusterPerProviderSpec providerSpecificationToClusterPerProviderSpec(
+      UniverseDefinitionTaskParams.ProviderSpecification providerSpec);
+
+  default void fillProviderSpecificationFromSpecs(
+      ProviderRootNodesSpec nodesSpecs,
+      ClusterNetworkingSpec clusterNetworkingSpec,
+      UniverseDefinitionTaskParams.ProviderSpecification providerSpecification) {
+    if (nodesSpecs != null) {
+      providerSpecification.setNodesSpecs(providerRootNodesSpecToRootNodesSpec(nodesSpecs));
+    }
+    if (clusterNetworkingSpec != null) {
+      if (clusterNetworkingSpec.getEnableLb() != null) {
+        providerSpecification.setEnableLoadBalancer(clusterNetworkingSpec.getEnableLb());
+      }
+      if (clusterNetworkingSpec.getEnableExposingService() != null) {
+        providerSpecification.setExposingServiceState(
+            UniverseDefinitionTaskParams.ExposingServiceState.valueOf(
+                clusterNetworkingSpec.getEnableExposingService().name()));
+      }
+    }
+  }
+
+  default void applyClusterPerProviderSpecToProviderSpecification(
+      ClusterPerProviderSpec providerSpec,
+      UniverseDefinitionTaskParams.ProviderSpecification providerSpecification) {
+    if (providerSpec == null || providerSpecification == null) {
+      return;
+    }
+    if (providerSpec.getAccessKeyCode() != null) {
+      providerSpecification.setAccessKeyCode(providerSpec.getAccessKeyCode());
+    }
+    if (providerSpec.getImageBundleUuid() != null) {
+      providerSpecification.setImageBundleUUID(providerSpec.getImageBundleUuid());
+    }
+    if (providerSpec.getAwsInstanceProfile() != null) {
+      providerSpecification.setAwsInstanceProfile(providerSpec.getAwsInstanceProfile());
+    }
+    if (providerSpec.getInstanceTags() != null) {
+      providerSpecification.setInstanceTags(new LinkedHashMap<>(providerSpec.getInstanceTags()));
+    }
+    applyProviderRootNodesSpecToProviderSpecification(
+        providerSpec.getNodesSpecs(), providerSpecification);
+    fillProviderSpecificationFromSpecs(
+        null, providerSpec.getNetworkingSpec(), providerSpecification);
+  }
+
+  default void applyProviderRootNodesSpecToProviderSpecification(
+      ProviderRootNodesSpec nodesSpec,
+      UniverseDefinitionTaskParams.ProviderSpecification providerSpecification) {
+    if (nodesSpec == null || providerSpecification == null) {
+      return;
+    }
+    HierarchicalNodesSpec.RootNodesSpec incoming = providerRootNodesSpecToRootNodesSpec(nodesSpec);
+    if (incoming == null) {
+      return;
+    }
+    HierarchicalNodesSpec.RootNodesSpec existing = providerSpecification.getNodesSpecs();
+    if (existing == null) {
+      throw new PlatformServiceException(Http.Status.BAD_REQUEST, "Missing root nodes spec");
+    }
+    HierarchicalNodesSpec.merge(
+        existing, incoming, item -> item.getSource().mergeInto(item.getCurrent()));
+  }
+
+  default HierarchicalNodesSpec.RootNodesSpec providerRootNodesSpecToRootNodesSpec(
+      ProviderRootNodesSpec nodesSpecs) {
+    if (nodesSpecs == null) {
+      return null;
+    }
+    HierarchicalNodesSpec.RootNodesSpec result =
+        HierarchicalNodesSpec.RootNodesSpec.builder()
+            .tserverSpecification(providerNodeSpecToNodeSpec(nodesSpecs.getTserverSpecification()))
+            .masterSpecification(providerNodeSpecToNodeSpec(nodesSpecs.getMasterSpecification()))
+            .build();
+    if (nodesSpecs.getRegionNodesSpecs() != null) {
+      result.setRegionNodesSpecs(
+          nodesSpecs.getRegionNodesSpecs().stream()
+              .map(this::providerRegionNodesSpecToRegionNodesSpec)
+              .collect(Collectors.toList()));
+    }
+    return result;
+  }
+
+  default HierarchicalNodesSpec.RegionNodesSpec providerRegionNodesSpecToRegionNodesSpec(
+      ProviderRegionNodesSpec regionNodesSpec) {
+    if (regionNodesSpec == null) {
+      return null;
+    }
+    HierarchicalNodesSpec.RegionNodesSpec result =
+        HierarchicalNodesSpec.RegionNodesSpec.builder()
+            .regionCode(regionNodesSpec.getRegionCode())
+            .tserverSpecification(
+                providerNodeSpecToNodeSpec(regionNodesSpec.getTserverSpecification()))
+            .masterSpecification(
+                providerNodeSpecToNodeSpec(regionNodesSpec.getMasterSpecification()))
+            .build();
+    if (regionNodesSpec.getAzNodesSpecs() != null) {
+      result.setAzNodesSpecs(
+          regionNodesSpec.getAzNodesSpecs().stream()
+              .map(this::providerAzNodesSpecToAzNodesSpec)
+              .collect(Collectors.toList()));
+    }
+    return result;
+  }
+
+  default HierarchicalNodesSpec.AzNodesSpec providerAzNodesSpecToAzNodesSpec(
+      ProviderAzNodesSpec azNodesSpec) {
+    if (azNodesSpec == null) {
+      return null;
+    }
+    return HierarchicalNodesSpec.AzNodesSpec.builder()
+        .azCode(azNodesSpec.getAzCode())
+        .tserverSpecification(providerNodeSpecToNodeSpec(azNodesSpec.getTserverSpecification()))
+        .masterSpecification(providerNodeSpecToNodeSpec(azNodesSpec.getMasterSpecification()))
+        .build();
+  }
+
+  @Mapping(target = "storageSpec", source = "deviceInfo")
+  @Mapping(target = "k8sNodeResourceSpec", source = "k8SNodeResourceSpec")
+  ProviderNodeSpec nodeSpecToProviderNodeSpec(HierarchicalNodesSpec.NodeSpec nodeSpec);
+
+  @InheritInverseConfiguration(name = "nodeSpecToProviderNodeSpec")
+  @Mapping(target = "k8SNodeResourceSpec", source = "k8sNodeResourceSpec")
+  HierarchicalNodesSpec.NodeSpec providerNodeSpecToNodeSpec(ProviderNodeSpec nodeSpec);
+
+  default ProviderRootNodesSpec rootNodesSpecToProviderRootNodesSpec(
+      HierarchicalNodesSpec.RootNodesSpec nodesSpecs) {
+    if (nodesSpecs == null) {
+      return null;
+    }
+    ProviderRootNodesSpec result = new ProviderRootNodesSpec();
+    result.setTserverSpecification(
+        nodeSpecToProviderNodeSpec(nodesSpecs.getTserverSpecification()));
+    result.setMasterSpecification(nodeSpecToProviderNodeSpec(nodesSpecs.getMasterSpecification()));
+    if (nodesSpecs.getRegionNodesSpecs() != null) {
+      result.setRegionNodesSpecs(
+          nodesSpecs.getRegionNodesSpecs().stream()
+              .map(this::regionNodesSpecToProviderRegionNodesSpec)
+              .collect(Collectors.toList()));
+    }
+    return result;
+  }
+
+  default ProviderRegionNodesSpec regionNodesSpecToProviderRegionNodesSpec(
+      HierarchicalNodesSpec.RegionNodesSpec regionNodesSpec) {
+    if (regionNodesSpec == null) {
+      return null;
+    }
+    ProviderRegionNodesSpec result = new ProviderRegionNodesSpec();
+    result.setRegionCode(regionNodesSpec.getRegionCode());
+    result.setTserverSpecification(
+        nodeSpecToProviderNodeSpec(regionNodesSpec.getTserverSpecification()));
+    result.setMasterSpecification(
+        nodeSpecToProviderNodeSpec(regionNodesSpec.getMasterSpecification()));
+    if (regionNodesSpec.getAzNodesSpecs() != null) {
+      result.setAzNodesSpecs(
+          regionNodesSpec.getAzNodesSpecs().stream()
+              .map(this::azNodesSpecToProviderAzNodesSpec)
+              .collect(Collectors.toList()));
+    }
+    return result;
+  }
+
+  default ProviderAzNodesSpec azNodesSpecToProviderAzNodesSpec(
+      HierarchicalNodesSpec.AzNodesSpec azNodesSpec) {
+    if (azNodesSpec == null) {
+      return null;
+    }
+    ProviderAzNodesSpec result = new ProviderAzNodesSpec();
+    result.setAzCode(azNodesSpec.getAzCode());
+    result.setTserverSpecification(
+        nodeSpecToProviderNodeSpec(azNodesSpec.getTserverSpecification()));
+    result.setMasterSpecification(nodeSpecToProviderNodeSpec(azNodesSpec.getMasterSpecification()));
+    return result;
+  }
+
+  default List<ClusterPerProviderSpec> providerSpecificationsToClusterPerProviderSpecs(
+      List<UniverseDefinitionTaskParams.ProviderSpecification> providerSpecifications) {
+    if (providerSpecifications == null || providerSpecifications.isEmpty()) {
+      return null;
+    }
+    return providerSpecifications.stream()
+        .map(this::providerSpecificationToClusterPerProviderSpec)
+        .collect(Collectors.toList());
+  }
+
+  @Mapping(target = "enableLb", source = "enableLoadBalancer")
+  @Mapping(target = "enableExposingService", source = "exposingServiceState")
+  ClusterNetworkingSpec providerSpecificationToClusterNetworkingSpec(
+      UniverseDefinitionTaskParams.ProviderSpecification providerSpec);
+
+  default void applyResizeProviderRootNodesSpecToProviderSpecification(
+      ResizeProviderRootNodesSpec nodesSpec,
+      UniverseDefinitionTaskParams.ProviderSpecification providerSpecification) {
+    if (nodesSpec == null || providerSpecification == null) {
+      return;
+    }
+    HierarchicalNodesSpec.RootNodesSpec incoming =
+        resizeProviderRootNodesSpecToRootNodesSpec(nodesSpec);
+    if (incoming == null) {
+      return;
+    }
+    HierarchicalNodesSpec.RootNodesSpec existing = providerSpecification.getNodesSpecs();
+    if (existing == null) {
+      throw new PlatformServiceException(Http.Status.BAD_REQUEST, "Missing root nodes spec");
+    }
+    HierarchicalNodesSpec.merge(
+        existing, incoming, item -> item.getSource().mergeInto(item.getCurrent()));
+  }
+
+  default HierarchicalNodesSpec.RootNodesSpec resizeProviderRootNodesSpecToRootNodesSpec(
+      ResizeProviderRootNodesSpec nodesSpecs) {
+    if (nodesSpecs == null) {
+      return null;
+    }
+    HierarchicalNodesSpec.RootNodesSpec result =
+        HierarchicalNodesSpec.RootNodesSpec.builder().build();
+    mergeResizeProviderNodeSpecsIntoNodesSpec(
+        nodesSpecs.getTserverSpecification(), nodesSpecs.getMasterSpecification(), result);
+    if (nodesSpecs.getRegionNodesSpecs() != null) {
+      result.setRegionNodesSpecs(
+          nodesSpecs.getRegionNodesSpecs().stream()
+              .map(this::resizeProviderRegionNodesSpecToRegionNodesSpec)
+              .collect(Collectors.toList()));
+    }
+    return result;
+  }
+
+  default HierarchicalNodesSpec.RegionNodesSpec resizeProviderRegionNodesSpecToRegionNodesSpec(
+      ResizeProviderRegionNodesSpec regionNodesSpec) {
+    if (regionNodesSpec == null) {
+      return null;
+    }
+    HierarchicalNodesSpec.RegionNodesSpec result =
+        HierarchicalNodesSpec.RegionNodesSpec.builder()
+            .regionCode(regionNodesSpec.getRegionCode())
+            .build();
+    mergeResizeProviderNodeSpecsIntoNodesSpec(
+        regionNodesSpec.getTserverSpecification(),
+        regionNodesSpec.getMasterSpecification(),
+        result);
+    if (regionNodesSpec.getAzNodesSpecs() != null) {
+      result.setAzNodesSpecs(
+          regionNodesSpec.getAzNodesSpecs().stream()
+              .map(this::resizeProviderAzNodesSpecToAzNodesSpec)
+              .collect(Collectors.toList()));
+    }
+    return result;
+  }
+
+  default HierarchicalNodesSpec.AzNodesSpec resizeProviderAzNodesSpecToAzNodesSpec(
+      ResizeProviderAzNodesSpec azNodesSpec) {
+    if (azNodesSpec == null) {
+      return null;
+    }
+    HierarchicalNodesSpec.AzNodesSpec result =
+        HierarchicalNodesSpec.AzNodesSpec.builder().azCode(azNodesSpec.getAzCode()).build();
+    mergeResizeProviderNodeSpecsIntoNodesSpec(
+        azNodesSpec.getTserverSpecification(), azNodesSpec.getMasterSpecification(), result);
+    return result;
+  }
+
+  default void mergeResizeProviderNodeSpecsIntoNodesSpec(
+      ResizeProviderNodeSpec tserverSpec,
+      ResizeProviderNodeSpec masterSpec,
+      HierarchicalNodesSpec.NodesSpec target) {
+    if (target == null) {
+      return;
+    }
+    if (tserverSpec != null) {
+      HierarchicalNodesSpec.NodeSpec tserver = resizeProviderNodeSpecToNodeSpec(tserverSpec);
+      if (tserver != null) {
+        tserver.mergeInto(target.getOrCreateTserverSpec());
+      }
+    }
+    if (masterSpec != null) {
+      HierarchicalNodesSpec.NodeSpec master = resizeProviderNodeSpecToNodeSpec(masterSpec);
+      if (master != null) {
+        master.mergeInto(target.getOrCreateMasterSpec());
+      }
+    }
+  }
+
+  default HierarchicalNodesSpec.NodeSpec resizeProviderNodeSpecToNodeSpec(
+      ResizeProviderNodeSpec resizeNodeSpec) {
+    if (resizeNodeSpec == null) {
+      return null;
+    }
+    HierarchicalNodesSpec.NodeSpec result = HierarchicalNodesSpec.NodeSpec.builder().build();
+    if (resizeNodeSpec.getInstanceType() != null) {
+      result.setInstanceType(resizeNodeSpec.getInstanceType());
+    }
+    if (resizeNodeSpec.getStorageSpec() != null) {
+      result.setDeviceInfo(resizeStorageSpecToDeviceInfo(resizeNodeSpec.getStorageSpec()));
+    }
+    if (resizeNodeSpec.getCgroupSize() != null) {
+      result.setCgroupSize(resizeNodeSpec.getCgroupSize());
+    }
+    if (resizeNodeSpec.getK8sNodeResourceSpec() != null) {
+      result.setK8SNodeResourceSpec(
+          toV1K8SNodeResourceSpec(resizeNodeSpec.getK8sNodeResourceSpec()));
+    }
+    return result.isEmpty() ? null : result;
+  }
+}

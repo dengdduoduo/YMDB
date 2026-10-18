@@ -1,0 +1,33 @@
+#ifndef ODYSSEY_BACKEND_H
+#define ODYSSEY_BACKEND_H
+
+/*
+ * Odyssey.
+ *
+ * Scalable PostgreSQL connection pooler.
+ */
+
+int od_backend_connect(od_server_t *, char *, kiwi_params_t *, od_client_t *);
+int od_backend_connect_cancel(od_server_t *, od_rule_storage_t *, kiwi_key_t *);
+
+void od_backend_close_connection(od_server_t *);
+void od_backend_close(od_server_t *);
+void yb_evict_prep_stmt_by_keyhash(od_server_t *, char *, yb_od_hash_64_t);
+void od_backend_evict_server_hashmap(od_server_t *, char *, char *, uint32_t);
+void yb_backend_register_close_prep_stmt(od_server_t *, char *, char *, uint32_t);
+void yb_backend_unregister_close_prep_stmt(od_server_t *, char *, char *);
+int yb_backend_update_prep_stmt(od_server_t *, char *, char *, uint32_t,
+				YbParseType *);
+void yb_backend_drain_close_prep_stmts(od_server_t *, char *);
+void od_backend_error(od_server_t *, char *, char *, uint32_t);
+
+int od_backend_update_parameter(od_server_t *, char *, char *, uint32_t, int);
+int od_backend_ready(od_server_t *, char *, uint32_t);
+int od_backend_ready_wait(od_server_t *, char *, int, uint32_t);
+
+od_retcode_t od_backend_query_send(od_server_t *server, char *context,
+				   char *query, char *param, int len);
+od_retcode_t od_backend_query(od_server_t *, char *, char *, char *, int,
+			      uint32_t, uint32_t);
+
+#endif /* ODYSSEY_BACKEND_H */

@@ -1,0 +1,15 @@
+.support-bundle-custom-date-range {
+  color: grey;
+  padding-right: 5px;
+  margin-right: 12px;
+
+  .rw-widget-picker {
+    min-width: 225px !important;
+    max-width: 225px !important;
+  }
+
+  .rw-select {
+    width: max-content !important;
+    text-align: center;
+  }
+}

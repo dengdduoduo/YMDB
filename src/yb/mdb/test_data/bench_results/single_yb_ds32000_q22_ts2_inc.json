@@ -1,0 +1,194 @@
+{
+  "db": "yb",
+  "dataset": "ds32000",
+  "num_queries": 22,
+  "tservers": 2,
+  "import_time_s": 111.80639100074768,
+  "import_type": "incremental",
+  "base_dataset": "ds16000",
+  "times_ms": [
+    8304.187059402466,
+    8165.545701980591,
+    8183.284759521484,
+    7981.085538864136,
+    8261.559247970581,
+    9764.263153076172,
+    11282.090425491333,
+    10209.787130355835,
+    8996.327877044678,
+    9326.353311538696,
+    9138.136386871338,
+    9267.42696762085,
+    9366.095304489136,
+    9466.887950897217,
+    9318.450450897217,
+    9270.328283309937,
+    9545.26686668396,
+    9290.230512619019
+  ],
+  "errors": [
+    {
+      "id": 5,
+      "template": "RND_FILTER_REGEX",
+      "error": "WARNING: Logging before InitGoogleLogging() is written to STDERR\nI0511 23:35:44.499320 1539763 mdb_adapter.cc:484] Connecting to masters at 127.0.0.1:7100\nI0511 23:35:44.500437 1539763 mem_tracker.cc:200] Creating root MemTracker with garbage collection threshold 106186954 bytes\nI0511 23:35:44.500475 1539763 mem_tracker.cc:205] Root memory limit is 10618695475\nI0511 23:35:44.503743 1539763 thread_pool.cc:393] Starting thread pool { name: ybclient max_workers: 1024 min_workers: 0 idle_timeout: 15"
+    },
+    {
+      "id": 6,
+      "template": "RND_FILTER_STRSTARTS",
+      "error": "WARNING: Logging before InitGoogleLogging() is written to STDERR\nI0511 23:35:46.546340 1539864 mdb_adapter.cc:484] Connecting to masters at 127.0.0.1:7100\nI0511 23:35:46.547093 1539864 mem_tracker.cc:200] Creating root MemTracker with garbage collection threshold 106186954 bytes\nI0511 23:35:46.547120 1539864 mem_tracker.cc:205] Root memory limit is 10618695475\nI0511 23:35:46.551188 1539864 thread_pool.cc:393] Starting thread pool { name: ybclient max_workers: 1024 min_workers: 0 idle_timeout: 15"
+    },
+    {
+      "id": 7,
+      "template": "RND_FILTER_CONTAINS",
+      "error": "WARNING: Logging before InitGoogleLogging() is written to STDERR\nI0511 23:35:48.686247 1539924 mdb_adapter.cc:484] Connecting to masters at 127.0.0.1:7100\nI0511 23:35:48.686889 1539924 mem_tracker.cc:200] Creating root MemTracker with garbage collection threshold 106186954 bytes\nI0511 23:35:48.686916 1539924 mem_tracker.cc:205] Root memory limit is 10618695475\nI0511 23:35:48.690019 1539924 thread_pool.cc:393] Starting thread pool { name: ybclient max_workers: 1024 min_workers: 0 idle_timeout: 15"
+    },
+    {
+      "id": 20,
+      "template": "RND_RDF_TYPE",
+      "error": "WARNING: Logging before InitGoogleLogging() is written to STDERR\nI0511 23:37:44.406090 1542446 mdb_adapter.cc:484] Connecting to masters at 127.0.0.1:7100\nI0511 23:37:44.407059 1542446 mem_tracker.cc:200] Creating root MemTracker with garbage collection threshold 106186954 bytes\nI0511 23:37:44.407092 1542446 mem_tracker.cc:205] Root memory limit is 10618695475\nI0511 23:37:44.410399 1542446 thread_pool.cc:393] Starting thread pool { name: ybclient max_workers: 1024 min_workers: 0 idle_timeout: 15"
+    }
+  ],
+  "stats": {
+    "p50": 9280.279397964478,
+    "p90": 9897.92034626007,
+    "p95": 10370.632624626158,
+    "p99": 11099.798865318297,
+    "min": 7981.085538864136,
+    "max": 11282.090425491333,
+    "mean": 9174.294829368591
+  },
+  "details": [
+    {
+      "id": 1,
+      "template": "RND_BGP",
+      "elapsed_ms": 8304.187059402466,
+      "error": null
+    },
+    {
+      "id": 2,
+      "template": "RND_JOIN",
+      "elapsed_ms": 8165.545701980591,
+      "error": null
+    },
+    {
+      "id": 3,
+      "template": "RND_FILTER_isIRI",
+      "elapsed_ms": 8183.284759521484,
+      "error": null
+    },
+    {
+      "id": 4,
+      "template": "RND_FILTER_BOUND",
+      "elapsed_ms": 7981.085538864136,
+      "error": null
+    },
+    {
+      "id": 5,
+      "template": "RND_FILTER_REGEX",
+      "elapsed_ms": 2056.427240371704,
+      "error": "WARNING: Logging before InitGoogleLogging() is written to STDERR\nI0511 23:35:44.499320 1539763 mdb_adapter.cc:484] Connecting to masters at 127.0.0.1:7100\nI0511 23:35:44.500437 1539763 mem_tracker.cc:200] Creating root MemTracker with garbage collection threshold 106186954 bytes\nI0511 23:35:44.500475 1539763 mem_tracker.cc:205] Root memory limit is 10618695475\nI0511 23:35:44.503743 1539763 thread_pool.cc:393] Starting thread pool { name: ybclient max_workers: 1024 min_workers: 0 idle_timeout: 15"
+    },
+    {
+      "id": 6,
+      "template": "RND_FILTER_STRSTARTS",
+      "elapsed_ms": 2132.483720779419,
+      "error": "WARNING: Logging before InitGoogleLogging() is written to STDERR\nI0511 23:35:46.546340 1539864 mdb_adapter.cc:484] Connecting to masters at 127.0.0.1:7100\nI0511 23:35:46.547093 1539864 mem_tracker.cc:200] Creating root MemTracker with garbage collection threshold 106186954 bytes\nI0511 23:35:46.547120 1539864 mem_tracker.cc:205] Root memory limit is 10618695475\nI0511 23:35:46.551188 1539864 thread_pool.cc:393] Starting thread pool { name: ybclient max_workers: 1024 min_workers: 0 idle_timeout: 15"
+    },
+    {
+      "id": 7,
+      "template": "RND_FILTER_CONTAINS",
+      "elapsed_ms": 2043.3216094970703,
+      "error": "WARNING: Logging before InitGoogleLogging() is written to STDERR\nI0511 23:35:48.686247 1539924 mdb_adapter.cc:484] Connecting to masters at 127.0.0.1:7100\nI0511 23:35:48.686889 1539924 mem_tracker.cc:200] Creating root MemTracker with garbage collection threshold 106186954 bytes\nI0511 23:35:48.686916 1539924 mem_tracker.cc:205] Root memory limit is 10618695475\nI0511 23:35:48.690019 1539924 thread_pool.cc:393] Starting thread pool { name: ybclient max_workers: 1024 min_workers: 0 idle_timeout: 15"
+    },
+    {
+      "id": 8,
+      "template": "RND_FILTER_eq",
+      "elapsed_ms": 8261.559247970581,
+      "error": null
+    },
+    {
+      "id": 9,
+      "template": "RND_FILTER_sameTerm",
+      "elapsed_ms": 9764.263153076172,
+      "error": null
+    },
+    {
+      "id": 10,
+      "template": "RND_OPTIONAL",
+      "elapsed_ms": 11282.090425491333,
+      "error": null
+    },
+    {
+      "id": 11,
+      "template": "RND_UNION",
+      "elapsed_ms": 10209.787130355835,
+      "error": null
+    },
+    {
+      "id": 12,
+      "template": "RND_PATH_star",
+      "elapsed_ms": 8996.327877044678,
+      "error": null
+    },
+    {
+      "id": 13,
+      "template": "RND_PATH_plus",
+      "elapsed_ms": 9326.353311538696,
+      "error": null
+    },
+    {
+      "id": 14,
+      "template": "RND_PATH_inverse",
+      "elapsed_ms": 9138.136386871338,
+      "error": null
+    },
+    {
+      "id": 15,
+      "template": "RND_ORDER_ASC",
+      "elapsed_ms": 9267.42696762085,
+      "error": null
+    },
+    {
+      "id": 16,
+      "template": "RND_ORDER_DESC",
+      "elapsed_ms": 9366.095304489136,
+      "error": null
+    },
+    {
+      "id": 17,
+      "template": "RND_DISTINCT",
+      "elapsed_ms": 9466.887950897217,
+      "error": null
+    },
+    {
+      "id": 18,
+      "template": "RND_LIMIT",
+      "elapsed_ms": 9318.450450897217,
+      "error": null
+    },
+    {
+      "id": 19,
+      "template": "RND_LIMIT_OFFSET",
+      "elapsed_ms": 9270.328283309937,
+      "error": null
+    },
+    {
+      "id": 20,
+      "template": "RND_RDF_TYPE",
+      "elapsed_ms": 2200.0670433044434,
+      "error": "WARNING: Logging before InitGoogleLogging() is written to STDERR\nI0511 23:37:44.406090 1542446 mdb_adapter.cc:484] Connecting to masters at 127.0.0.1:7100\nI0511 23:37:44.407059 1542446 mem_tracker.cc:200] Creating root MemTracker with garbage collection threshold 106186954 bytes\nI0511 23:37:44.407092 1542446 mem_tracker.cc:205] Root memory limit is 10618695475\nI0511 23:37:44.410399 1542446 thread_pool.cc:393] Starting thread pool { name: ybclient max_workers: 1024 min_workers: 0 idle_timeout: 15"
+    },
+    {
+      "id": 21,
+      "template": "RND_ASK",
+      "elapsed_ms": 9545.26686668396,
+      "error": null
+    },
+    {
+      "id": 22,
+      "template": "RND_SELECT_ALL",
+      "elapsed_ms": 9290.230512619019,
+      "error": null
+    }
+  ]
+}

@@ -1,0 +1,10 @@
+title: PerProcessNodeSpec
+description: 'Instance settings for nodes, including partial overrides. Storage fields are all optional. Part of AvailabilityZoneNodeSpec.'
+type: object
+properties:
+  instance_type:
+    description: Instance type for tserver/master nodes of cluster that determines the cpu and memory resources.
+    type: string
+    example: c5.xlarge
+  storage_spec:
+    $ref: "./ClusterStorageBase.yaml"

@@ -1,0 +1,167 @@
+// Copyright (c) YugabyteDB, Inc.
+
+package com.yugabyte.yw.forms;
+
+import com.fasterxml.jackson.annotation.JsonIgnore;
+import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
+import com.fasterxml.jackson.annotation.JsonProperty;
+import com.fasterxml.jackson.databind.annotation.JsonDeserialize;
+import com.yugabyte.yw.common.PlatformServiceException;
+import com.yugabyte.yw.common.Util;
+import com.yugabyte.yw.common.config.RuntimeConfGetter;
+import com.yugabyte.yw.common.config.UniverseConfKeys;
+import com.yugabyte.yw.common.inject.StaticInjectorHolder;
+import com.yugabyte.yw.models.Universe;
+import com.yugabyte.yw.models.common.YbaApi;
+import com.yugabyte.yw.models.helpers.NodeDetails;
+import io.swagger.annotations.ApiModelProperty;
+import java.util.Map;
+import play.mvc.Http.Status;
+
+@JsonIgnoreProperties(ignoreUnknown = true)
+@JsonDeserialize(converter = UpgradeTaskParams.Converter.class)
+public class UpgradeTaskParams extends UniverseDefinitionTaskParams {
+
+  public UpgradeOption upgradeOption = UpgradeOption.ROLLING_UPGRADE;
+
+  @JsonIgnore protected RuntimeConfGetter runtimeConfGetter;
+
+  @ApiModelProperty(
+      value =
+          "YbaApi Internal. Whether to skip node prechecks while " + "performing rolling upgrade")
+  @YbaApi(visibility = YbaApi.YbaApiVisibility.INTERNAL, sinceYBAVersion = "2.23.0.0")
+  public Boolean skipNodeChecks = false;
+
+  @ApiModelProperty(value = "YbaApi Internal. Requested batch size values for rolling upgrade")
+  @YbaApi(visibility = YbaApi.YbaApiVisibility.INTERNAL, sinceYBAVersion = "2024.2.0.0")
+  public RollMaxBatchSize rollMaxBatchSize = null;
+
+  public enum UpgradeTaskType {
+    Everything,
+    Software,
+    Systemd,
+    VMImage,
+    GFlags,
+    Restart,
+    Certs,
+    ToggleTls,
+    ResizeNode,
+    Reboot,
+    ThirdPartyPackages,
+    YbcGFlags,
+  }
+
+  public enum UpgradeTaskSubType {
+    None,
+    Download,
+    Install,
+    CopyCerts,
+    ValidateGFlags,
+    Round1GFlagsUpdate,
+    Round2GFlagsUpdate,
+    PackageReInstall,
+    YbcInstall,
+    YbcGflagsUpdate,
+    InstallThirdPartyPackages,
+  }
+
+  public enum UpgradeOption {
+    @JsonProperty("Rolling")
+    ROLLING_UPGRADE,
+    @JsonProperty("Non-Rolling")
+    NON_ROLLING_UPGRADE,
+    @JsonProperty("Non-Restart")
+    NON_RESTART_UPGRADE
+  }
+
+  public boolean isKubernetesUpgradeSupported() {
+    return false;
+  }
+
+  @JsonIgnore
+  public SoftwareUpgradeState getUniverseSoftwareUpgradeStateOnFailure() {
+    return null;
+  }
+
+  public void verifyParams(Universe universe, boolean isFirstTry) {
+    verifyParams(universe, null, isFirstTry);
+  }
+
+  public void verifyParams(Universe universe, NodeDetails.NodeState nodeState, boolean isFirstTry) {
+    if (clusters != null) {
+      for (Cluster cluster : clusters) {
+        Cluster originalCluster = universe.getCluster(cluster.uuid);
+        if (originalCluster != null
+            && originalCluster.userIntent != null
+            && cluster.userIntent != null) {
+          if (originalCluster.userIntent.isMulticloudSupport()
+              != cluster.userIntent.isMulticloudSupport()) {
+            throw new PlatformServiceException(
+                Status.BAD_REQUEST,
+                cluster.clusterType
+                    + ": original cluster has multicloud support "
+                    + originalCluster.userIntent.isMulticloudSupport()
+                    + " but current cluster has "
+                    + cluster.userIntent.isMulticloudSupport()
+                    + " (should be the same)");
+          }
+        }
+      }
+    }
+    Map<String, String> universeConfig = universe.getConfig();
+
+    if (upgradeOption == UpgradeOption.ROLLING_UPGRADE && universe.nodesInTransit(nodeState)) {
+      throw new PlatformServiceException(
+          Status.BAD_REQUEST,
+          "Cannot perform a rolling upgrade on universe "
+              + universe.getUniverseUUID()
+              + " as it has nodes in one of "
+              + NodeDetails.IN_TRANSIT_STATES
+              + " states.");
+    }
+
+    if (upgradeOption == UpgradeOption.NON_RESTART_UPGRADE && universe.nodesInTransit(nodeState)) {
+      throw new PlatformServiceException(
+          Status.BAD_REQUEST,
+          "Cannot perform a non-restart upgrade on universe "
+              + universe.getUniverseUUID()
+              + " as it has nodes in one of "
+              + NodeDetails.IN_TRANSIT_STATES
+              + " states.");
+    }
+
+    runtimeConfGetter = StaticInjectorHolder.injector().instanceOf(RuntimeConfGetter.class);
+
+    if (upgradeOption == UpgradeOption.NON_ROLLING_UPGRADE
+        && universe.nodesInTransit(nodeState)
+        && !runtimeConfGetter.getConfForScope(
+            universe, UniverseConfKeys.allowUpgradeOnTransitUniverse)) {
+      throw new PlatformServiceException(
+          Status.BAD_REQUEST,
+          "Cannot perform a non-rolling upgrade on universe "
+              + universe.getUniverseUUID()
+              + " as it has nodes in one of "
+              + NodeDetails.IN_TRANSIT_STATES
+              + " states.");
+    }
+
+    if (isKubernetesUpgradeSupported() && Util.isKubernetesBasedUniverse(universe)) {
+      if (!universeConfig.containsKey(Universe.HELM2_LEGACY)) {
+        throw new PlatformServiceException(
+            Status.BAD_REQUEST,
+            "Cannot perform upgrade on universe. "
+                + universe.getUniverseUUID()
+                + " as it is not helm 3 compatible. "
+                + "Manually migrate the deployment to helm3 "
+                + "and then mark the universe as helm 3 compatible.");
+      }
+    }
+
+    if (!isKubernetesUpgradeSupported() && Util.isKubernetesBasedUniverse(universe)) {
+      throw new PlatformServiceException(
+          Status.BAD_REQUEST, "Kubernetes Upgrade is not supported.");
+    }
+  }
+
+  public static class Converter extends BaseConverter<UpgradeTaskParams> {}
+}

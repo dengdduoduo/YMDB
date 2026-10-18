@@ -1,0 +1,16 @@
+title: UniverseMetricsExporterConfig
+type: object
+description: |
+  UniverseMetricsExporterConfig
+  Individual Metrics Exporter Configuration Specification.
+allOf:
+  - $ref: "./UniverseExporterConfig.yaml"
+  - $ref: "./BatchedExporterConfig.yaml"
+  - $ref: "./MemoryLimitedExporterConfig.yaml"
+  - type: object
+    properties:
+      metrics_prefix:
+        description: Custom prefix to be added to all the metrics. Can be customised to each exporter differently.
+        type: string
+        example: ybdb.
+        default: ''

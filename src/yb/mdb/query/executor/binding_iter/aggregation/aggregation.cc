@@ -1,0 +1,126 @@
+#include "aggregation.h"
+
+void Aggregation::_begin(Binding& _parent_binding) {
+    groups = 0;
+    parent_binding = &_parent_binding;
+
+    group_vars_binding = Binding(parent_binding->size);
+    child_binding = Binding(parent_binding->size);
+
+    child->begin(child_binding);
+    set_status_from(*child);
+    if (!status().ok()) return;
+    new_group = child->next();
+    set_status_from(*child);
+
+    for (auto&& [var_id, agg] : aggregations) {
+        agg->set_binding(child_binding);
+        agg->begin();
+    }
+}
+
+
+void Aggregation::_reset() {
+    groups = 0;
+    child->reset();
+    set_status_from(*child);
+    if (!status().ok()) return;
+    new_group = child->next();
+    set_status_from(*child);
+
+    for (auto&& [var_id, agg] : aggregations) {
+        agg->begin();
+    }
+}
+
+
+bool Aggregation::_next() {
+    if (!status().ok()) return false;
+    if (new_group) {
+        for (auto& var_id : group_vars) {
+            group_vars_binding.add(var_id, child_binding[var_id]);
+        }
+        for (auto&& [var_id, agg] : aggregations) {
+            agg->begin();
+            agg->process();
+        }
+    } else {
+        if (groups == 0 && group_vars.size() == 0) {
+            for (auto&& [var_id, agg] : aggregations) {
+                parent_binding->add(var_id, agg->get());
+            }
+            groups++;
+            return true;
+        } else {
+            return false;
+        }
+    }
+
+    new_group = false;
+    while (child->next()) {
+        bool same_group = true;
+        for (auto& var_id : group_vars) {
+            if ( child_binding[var_id] != group_vars_binding[var_id] ) {
+                same_group = false;
+            }
+        }
+        if (same_group) {
+            for (auto&& [var_id, agg] : aggregations) {
+                agg->process();
+            }
+        } else {
+            new_group = true;
+            break;
+        }
+    }
+    set_status_from(*child);
+    if (!status().ok()) return false;
+    for (auto&& [var_id, agg] : aggregations) {
+        parent_binding->add(var_id, agg->get());
+    }
+    for (auto& var_id: group_vars) {
+        parent_binding->add(var_id, group_vars_binding[var_id]);
+    }
+    groups++;
+    return true;
+}
+
+
+void Aggregation::assign_nulls() {
+    for (const auto var : group_vars) {
+        parent_binding->add(var, ObjectId::get_null());
+    }
+    for (auto&& [var_id, agg] : aggregations) {
+        parent_binding->add(var_id, ObjectId::get_null());
+    }
+    child->assign_nulls();
+}
+
+void Aggregation::print(std::ostream& os, int indent, bool stats) const
+{
+    if (stats) {
+        print_generic_stats(os, indent);
+    }
+    os << std::string(indent, ' ') << "Aggregation(";
+
+    if (group_vars.size() > 0) {
+        os << "group vars:";
+
+        for (auto var : group_vars) {
+            os << " " << var;
+        }
+        if (aggregations.size() > 0) {
+            os << " ";
+        }
+    }
+
+    if (aggregations.size() > 0) {
+        os << "aggregations:";
+
+        for (auto& [var, agg] : aggregations) {
+            os << " " << var << '=' << *agg;
+        }
+    }
+    os << ")\n";
+    child->print(os, indent + 2, stats);
+}

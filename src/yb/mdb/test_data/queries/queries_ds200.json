@@ -1,0 +1,226 @@
+[
+  {
+    "id": 1,
+    "template": "BGP_1",
+    "category": "Basic Graph Pattern",
+    "description": "Single triple pattern",
+    "query": "SELECT ?x ?y\nWHERE {\n  ?x <http://example.org/locatedIn> ?y .\n}"
+  },
+  {
+    "id": 2,
+    "template": "BGP_2",
+    "category": "Basic Graph Pattern",
+    "description": "Two triple patterns (join)",
+    "query": "SELECT ?x ?y ?z\nWHERE {\n  ?x <http://example.org/worksFor> ?y .\n  ?y <http://example.org/developedBy> ?z .\n}"
+  },
+  {
+    "id": 3,
+    "template": "BGP_3",
+    "category": "Basic Graph Pattern",
+    "description": "Three triple patterns (complex join)",
+    "query": "SELECT ?x ?y ?z ?w\nWHERE {\n  ?x <http://example.org/knows> ?y .\n  ?y <http://example.org/knows> ?z .\n  ?z <http://example.org/manages> ?w .\n}"
+  },
+  {
+    "id": 4,
+    "template": "FILTER_isIRI",
+    "category": "FILTER",
+    "description": "FILTER with isIRI",
+    "query": "SELECT ?x ?y\nWHERE {\n  ?x <http://example.org/locatedIn> ?y .\n  FILTER(isIRI(?x))\n}"
+  },
+  {
+    "id": 5,
+    "template": "FILTER_BOUND",
+    "category": "FILTER",
+    "description": "FILTER with BOUND",
+    "query": "SELECT ?x ?y\nWHERE {\n  ?x <http://example.org/fundedBy> ?y .\n  FILTER(BOUND(?y))\n}"
+  },
+  {
+    "id": 6,
+    "template": "FILTER_REGEX",
+    "category": "FILTER",
+    "description": "FILTER with REGEX on label",
+    "query": "SELECT ?x ?l\nWHERE {\n  ?x <http://www.w3.org/2000/01/rdf-schema#label> ?l .\n  FILTER(REGEX(?l, \"Person|Company\"))\n}"
+  },
+  {
+    "id": 7,
+    "template": "FILTER_eq",
+    "category": "FILTER",
+    "description": "FILTER with variable equality",
+    "query": "SELECT ?x ?y\nWHERE {\n  ?x <http://example.org/locatedIn> ?y .\n  ?x <http://example.org/collaboratesWith> ?z .\n  FILTER(?y = ?z)\n}"
+  },
+  {
+    "id": 8,
+    "template": "FILTER_neq",
+    "category": "FILTER",
+    "description": "FILTER with variable inequality",
+    "query": "SELECT ?x ?y ?z\nWHERE {\n  ?x <http://example.org/reportsTo> ?y .\n  ?x <http://example.org/worksFor> ?z .\n  FILTER(?y != ?z)\n}"
+  },
+  {
+    "id": 9,
+    "template": "FILTER_STRSTARTS",
+    "category": "FILTER",
+    "description": "FILTER with STRSTARTS",
+    "query": "SELECT ?x ?l\nWHERE {\n  ?x <http://www.w3.org/2000/01/rdf-schema#label> ?l .\n  FILTER(STRSTARTS(?l, \"Person\"))\n}"
+  },
+  {
+    "id": 10,
+    "template": "FILTER_CONTAINS",
+    "category": "FILTER",
+    "description": "FILTER with CONTAINS",
+    "query": "SELECT ?x ?l\nWHERE {\n  ?x <http://www.w3.org/2000/01/rdf-schema#label> ?l .\n  FILTER(CONTAINS(?l, \"#\"))\n}"
+  },
+  {
+    "id": 11,
+    "template": "FILTER_sameTerm",
+    "category": "FILTER",
+    "description": "FILTER with sameTerm",
+    "query": "SELECT ?x ?y\nWHERE {\n  ?x <http://example.org/worksFor> ?y .\n  ?x <http://example.org/locatedIn> ?z .\n  FILTER(sameTerm(?y, ?z))\n}"
+  },
+  {
+    "id": 12,
+    "template": "OPTIONAL",
+    "category": "OPTIONAL",
+    "description": "OPTIONAL pattern",
+    "query": "SELECT ?x ?y ?l\nWHERE {\n  ?x <http://example.org/knows> ?y .\nOPTIONAL {\n    ?y <http://www.w3.org/2000/01/rdf-schema#label> ?l .\n}\n}"
+  },
+  {
+    "id": 13,
+    "template": "UNION",
+    "category": "UNION",
+    "description": "UNION of two patterns",
+    "query": "SELECT ?x ?y\nWHERE {\n{\n  ?x <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://example.org/Organization> .\n} UNION {\n  ?y <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://example.org/Person> .\n}\n}"
+  },
+  {
+    "id": 14,
+    "template": "PATH_inverse",
+    "category": "Property Path",
+    "description": "Inverse property path (^)",
+    "query": "SELECT ?x ?y\nWHERE {\n  ?x ^<http://example.org/fundedBy> ?y .\n}"
+  },
+  {
+    "id": 15,
+    "template": "PATH_star",
+    "category": "Property Path",
+    "description": "Zero-or-more path (*)",
+    "query": "SELECT ?x ?y\nWHERE {\n  ?x <http://example.org/knows>* ?y .\n}"
+  },
+  {
+    "id": 16,
+    "template": "PATH_plus",
+    "category": "Property Path",
+    "description": "One-or-more path (+)",
+    "query": "SELECT ?x ?y\nWHERE {\n  ?x <http://example.org/fundedBy>+ ?y .\n}"
+  },
+  {
+    "id": 17,
+    "template": "ORDER_ASC",
+    "category": "ORDER BY",
+    "description": "ORDER BY ASC",
+    "query": "SELECT ?x ?y\nWHERE {\n  ?x <http://example.org/reportsTo> ?y .\n}\nORDER BY ASC(?x)\nLIMIT 20"
+  },
+  {
+    "id": 18,
+    "template": "ORDER_DESC",
+    "category": "ORDER BY",
+    "description": "ORDER BY DESC",
+    "query": "SELECT ?x ?y\nWHERE {\n  ?x <http://example.org/knows> ?y .\n}\nORDER BY DESC(?x)\nLIMIT 20"
+  },
+  {
+    "id": 19,
+    "template": "DISTINCT",
+    "category": "DISTINCT",
+    "description": "SELECT DISTINCT",
+    "query": "SELECT DISTINCT ?x\nWHERE {\n  ?x <http://example.org/memberOf> <http://example.org/Person151> .\n}"
+  },
+  {
+    "id": 20,
+    "template": "LIMIT",
+    "category": "LIMIT/OFFSET",
+    "description": "LIMIT clause",
+    "query": "SELECT ?x ?y\nWHERE {\n  ?x <http://example.org/developedBy> ?y .\n}\nLIMIT 10"
+  },
+  {
+    "id": 21,
+    "template": "LIMIT_OFFSET",
+    "category": "LIMIT/OFFSET",
+    "description": "LIMIT with OFFSET",
+    "query": "SELECT ?x ?y\nWHERE {\n  ?x <http://example.org/worksFor> ?y .\n}\nLIMIT 10\nOFFSET 5"
+  },
+  {
+    "id": 22,
+    "template": "COMPLEX_mixed",
+    "category": "Complex",
+    "description": "FILTER + OPTIONAL + ORDER BY",
+    "query": "SELECT ?x ?y ?l\nWHERE {\n  ?x <http://example.org/manages> ?y .\nOPTIONAL {\n    ?y <http://www.w3.org/2000/01/rdf-schema#label> ?l .\n}\n  FILTER(BOUND(?l) && REGEX(?l, \"Person\"))\n}\nORDER BY ASC(?x)\nLIMIT 15"
+  },
+  {
+    "id": 23,
+    "template": "COMPLEX_union_filter",
+    "category": "Complex",
+    "description": "UNION with FILTER",
+    "query": "SELECT ?x ?y\nWHERE {\n{\n  ?x <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://example.org/Person> .\n  FILTER(isIRI(?x))\n} UNION {\n  ?y <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://example.org/Company> .\n  FILTER(isIRI(?y))\n}\n}"
+  },
+  {
+    "id": 24,
+    "template": "COMPLEX_path_filter",
+    "category": "Complex",
+    "description": "Property path with FILTER",
+    "query": "SELECT ?x ?y\nWHERE {\n  ?x <http://example.org/contains>* ?y .\n  FILTER(isIRI(?x) && isIRI(?y))\n}\nLIMIT 20"
+  },
+  {
+    "id": 25,
+    "template": "COMPLEX_opt_distinct",
+    "category": "Complex",
+    "description": "OPTIONAL + DISTINCT + ORDER BY",
+    "query": "SELECT DISTINCT ?x\nWHERE {\n  ?x <http://example.org/developedBy> ?y .\nOPTIONAL {\n    ?x <http://www.w3.org/2000/01/rdf-schema#label> ?l .\n}\n}\nORDER BY ASC(?x)\nLIMIT 20"
+  },
+  {
+    "id": 26,
+    "template": "BGP_2",
+    "category": "Basic Graph Pattern",
+    "description": "Two triple patterns (join)",
+    "query": "SELECT ?x ?y ?z\nWHERE {\n  ?x <http://example.org/contains> ?y .\n  ?y <http://example.org/locatedIn> ?z .\n}"
+  },
+  {
+    "id": 27,
+    "template": "FILTER_BOUND",
+    "category": "FILTER",
+    "description": "FILTER with BOUND",
+    "query": "SELECT ?x ?y\nWHERE {\n  ?x <http://example.org/developedBy> ?y .\n  FILTER(BOUND(?y))\n}"
+  },
+  {
+    "id": 28,
+    "template": "ORDER_DESC",
+    "category": "ORDER BY",
+    "description": "ORDER BY DESC",
+    "query": "SELECT ?x ?y\nWHERE {\n  ?x <http://example.org/memberOf> ?y .\n}\nORDER BY DESC(?x)\nLIMIT 20"
+  },
+  {
+    "id": 29,
+    "template": "FILTER_sameTerm",
+    "category": "FILTER",
+    "description": "FILTER with sameTerm",
+    "query": "SELECT ?x ?y\nWHERE {\n  ?x <http://example.org/reportsTo> ?y .\n  ?x <http://example.org/locatedIn> ?z .\n  FILTER(sameTerm(?y, ?z))\n}"
+  },
+  {
+    "id": 30,
+    "template": "FILTER_sameTerm",
+    "category": "FILTER",
+    "description": "FILTER with sameTerm",
+    "query": "SELECT ?x ?y\nWHERE {\n  ?x <http://example.org/collaboratesWith> ?y .\n  ?x <http://example.org/contains> ?z .\n  FILTER(sameTerm(?y, ?z))\n}"
+  },
+  {
+    "id": 31,
+    "template": "OPTIONAL",
+    "category": "OPTIONAL",
+    "description": "OPTIONAL pattern",
+    "query": "SELECT ?x ?y ?l\nWHERE {\n  ?x <http://example.org/locatedIn> ?y .\nOPTIONAL {\n    ?y <http://www.w3.org/2000/01/rdf-schema#label> ?l .\n}\n}"
+  },
+  {
+    "id": 32,
+    "template": "UNION",
+    "category": "UNION",
+    "description": "UNION of two patterns",
+    "query": "SELECT ?x ?y\nWHERE {\n{\n  ?x <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://example.org/Department> .\n} UNION {\n  ?y <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://example.org/Company> .\n}\n}"
+  }
+]

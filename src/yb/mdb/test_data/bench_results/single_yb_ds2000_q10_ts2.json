@@ -1,0 +1,104 @@
+{
+  "db": "yb",
+  "dataset": "ds2000",
+  "num_queries": 10,
+  "tservers": 2,
+  "import_time_s": 12.688912630081177,
+  "times_ms": [
+    552.3495674133301,
+    641.6146755218506,
+    540.4257774353027,
+    539.4635200500488,
+    540.0087833404541,
+    546.0798740386963,
+    511.07192039489746,
+    541.7115688323975,
+    515.4953002929688,
+    546.8270778656006
+  ],
+  "errors": [],
+  "row_counts": [
+    9,
+    25,
+    9,
+    0,
+    12,
+    11,
+    10,
+    15,
+    10,
+    4
+  ],
+  "details": [
+    {
+      "id": 1310,
+      "template": "RND_OPTIONAL",
+      "category": "Random OPTIONAL",
+      "time_ms": 552.3495674133301
+    },
+    {
+      "id": 229,
+      "template": "RND_UNION",
+      "category": "Random UNION",
+      "time_ms": 641.6146755218506
+    },
+    {
+      "id": 52,
+      "template": "RND_FILTER_isIRI",
+      "category": "Random FILTER",
+      "time_ms": 540.4257774353027
+    },
+    {
+      "id": 1519,
+      "template": "RND_LIMIT_OFFSET",
+      "category": "Random LIMIT",
+      "time_ms": 539.4635200500488
+    },
+    {
+      "id": 564,
+      "template": "RND_PATH_star",
+      "category": "Random Path",
+      "time_ms": 540.0087833404541
+    },
+    {
+      "id": 502,
+      "template": "RND_PATH_inverse",
+      "category": "Random Path",
+      "time_ms": 546.0798740386963
+    },
+    {
+      "id": 458,
+      "template": "RND_FILTER_BOUND",
+      "category": "Random FILTER",
+      "time_ms": 511.07192039489746
+    },
+    {
+      "id": 286,
+      "template": "RND_UNION",
+      "category": "Random UNION",
+      "time_ms": 541.7115688323975
+    },
+    {
+      "id": 1509,
+      "template": "RND_LIMIT",
+      "category": "Random LIMIT",
+      "time_ms": 515.4953002929688
+    },
+    {
+      "id": 210,
+      "template": "RND_FILTER_isIRI",
+      "category": "Random FILTER",
+      "time_ms": 546.8270778656006
+    }
+  ],
+  "stats": {
+    "count": 10,
+    "min": 511.07192039489746,
+    "max": 641.6146755218506,
+    "mean": 547.5048065185547,
+    "p50": 541.0686731338501,
+    "p90": 561.2760782241821,
+    "p95": 601.4453768730162,
+    "p99": 633.5808157920837
+  }
+}

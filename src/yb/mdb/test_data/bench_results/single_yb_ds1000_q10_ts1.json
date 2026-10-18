@@ -1,0 +1,104 @@
+{
+  "db": "yb",
+  "dataset": "ds1000",
+  "num_queries": 10,
+  "tservers": 1,
+  "import_time_s": 8.414212942123413,
+  "times_ms": [
+    627.1562576293945,
+    407.4420928955078,
+    700.4613876342773,
+    535.2764129638672,
+    617.1324253082275,
+    710.6356620788574,
+    591.6123390197754,
+    428.7075996398926,
+    389.5866870880127,
+    779.1047096252441
+  ],
+  "errors": [],
+  "row_counts": [
+    0,
+    5,
+    10,
+    10,
+    0,
+    11,
+    13,
+    0,
+    20,
+    11
+  ],
+  "details": [
+    {
+      "id": 1310,
+      "template": "RND_JOIN",
+      "category": "Random Join",
+      "time_ms": 627.1562576293945
+    },
+    {
+      "id": 229,
+      "template": "RND_PATH_plus",
+      "category": "Random Path",
+      "time_ms": 407.4420928955078
+    },
+    {
+      "id": 52,
+      "template": "RND_FILTER_isIRI",
+      "category": "Random FILTER",
+      "time_ms": 700.4613876342773
+    },
+    {
+      "id": 1519,
+      "template": "RND_LIMIT",
+      "category": "Random LIMIT",
+      "time_ms": 535.2764129638672
+    },
+    {
+      "id": 564,
+      "template": "RND_JOIN",
+      "category": "Random Join",
+      "time_ms": 617.1324253082275
+    },
+    {
+      "id": 502,
+      "template": "RND_FILTER_isIRI",
+      "category": "Random FILTER",
+      "time_ms": 710.6356620788574
+    },
+    {
+      "id": 458,
+      "template": "RND_FILTER_BOUND",
+      "category": "Random FILTER",
+      "time_ms": 591.6123390197754
+    },
+    {
+      "id": 286,
+      "template": "RND_LIMIT_OFFSET",
+      "category": "Random LIMIT",
+      "time_ms": 428.7075996398926
+    },
+    {
+      "id": 1509,
+      "template": "RND_UNION",
+      "category": "Random UNION",
+      "time_ms": 389.5866870880127
+    },
+    {
+      "id": 210,
+      "template": "RND_PATH_inverse",
+      "category": "Random Path",
+      "time_ms": 779.1047096252441
+    }
+  ],
+  "stats": {
+    "count": 10,
+    "min": 389.5866870880127,
+    "max": 779.1047096252441,
+    "mean": 578.7115573883057,
+    "p50": 604.3723821640015,
+    "p90": 717.4825668334961,
+    "p95": 748.29363822937,
+    "p99": 772.9424953460693
+  }
+}

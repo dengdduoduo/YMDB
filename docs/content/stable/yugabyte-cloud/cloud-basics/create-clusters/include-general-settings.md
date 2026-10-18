@@ -1,0 +1,17 @@
+<!--
++++
+private = true
+block_indexing = true
++++
+-->
+
+### General
+
+![Add Cluster Wizard - General](/images/yb-cloud/cloud-addcluster-general.png)
+
+Set the following options:
+
+- **Cluster Name**: Enter a name for the cluster.
+- **Provider**: Choose a cloud provider.
+- **Security Profile**: Choose **Advanced** to configure your cluster with [added security features](../../../cloud-secure-clusters/#security-profile). Advanced security requires that the cluster be deployed in a VPC and has scheduled backups, and does not allow [public access](../../../cloud-secure-clusters/add-connections/).
+- **Database Version**: Dedicated clusters are deployed using a [stable](../../../../faq/yugabytedb-managed-faq/#what-version-of-yugabytedb-does-my-cluster-run-on) release. If you have arranged a custom build with Yugabyte, it is also listed here.

@@ -1,0 +1,1721 @@
+// Copyright (c) YugabyteDB, Inc.
+
+package com.yugabyte.yw.commissioner.tasks.local;
+
+import static com.yugabyte.yw.common.TestHelper.testDatabase;
+import static com.yugabyte.yw.common.Util.YUGABYTE_DB;
+import static com.yugabyte.yw.forms.UniverseConfigureTaskParams.ClusterOperationType.CREATE;
+import static org.hamcrest.MatcherAssert.assertThat;
+import static org.hamcrest.Matchers.lessThan;
+import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertTrue;
+import static play.inject.Bindings.bind;
+
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.node.ObjectNode;
+import com.google.api.client.util.Throwables;
+import com.google.common.base.Stopwatch;
+import com.google.common.net.HostAndPort;
+import com.typesafe.config.ConfigFactory;
+import com.yugabyte.yw.cloud.PublicCloudConstants;
+import com.yugabyte.yw.commissioner.AutoMasterFailoverScheduler;
+import com.yugabyte.yw.commissioner.Commissioner;
+import com.yugabyte.yw.commissioner.Common;
+import com.yugabyte.yw.commissioner.tasks.CommissionerBaseTest;
+import com.yugabyte.yw.commissioner.tasks.UniverseTaskBase;
+import com.yugabyte.yw.commissioner.tasks.UniverseTaskBase.ServerType;
+import com.yugabyte.yw.commissioner.tasks.subtasks.CheckClusterConsistency;
+import com.yugabyte.yw.common.ApiUtils;
+import com.yugabyte.yw.common.ConfigHelper;
+import com.yugabyte.yw.common.CustomerTaskManager;
+import com.yugabyte.yw.common.DnsManager;
+import com.yugabyte.yw.common.LocalNodeManager;
+import com.yugabyte.yw.common.LocalNodeUniverseManager;
+import com.yugabyte.yw.common.ModelFactory;
+import com.yugabyte.yw.common.NodeUIApiHelper;
+import com.yugabyte.yw.common.PlacementInfoUtil;
+import com.yugabyte.yw.common.ReleaseManager;
+import com.yugabyte.yw.common.RetryTaskUntilCondition;
+import com.yugabyte.yw.common.ShellResponse;
+import com.yugabyte.yw.common.TableSpaceStructures;
+import com.yugabyte.yw.common.UnrecoverableException;
+import com.yugabyte.yw.common.Util;
+import com.yugabyte.yw.common.YcqlQueryExecutor;
+import com.yugabyte.yw.common.backuprestore.BackupHelper;
+import com.yugabyte.yw.common.certmgmt.CertificateHelper;
+import com.yugabyte.yw.common.config.GlobalConfKeys;
+import com.yugabyte.yw.common.config.RuntimeConfGetter;
+import com.yugabyte.yw.common.config.RuntimeConfService;
+import com.yugabyte.yw.common.config.impl.SettableRuntimeConfigFactory;
+import com.yugabyte.yw.common.gflags.GFlagsUtil;
+import com.yugabyte.yw.common.gflags.SpecificGFlags;
+import com.yugabyte.yw.common.services.YBClientService;
+import com.yugabyte.yw.common.utils.Pair;
+import com.yugabyte.yw.controllers.apiModels.MasterLBStateResponse;
+import com.yugabyte.yw.controllers.handlers.MetaMasterHandler;
+import com.yugabyte.yw.controllers.handlers.UniverseCRUDHandler;
+import com.yugabyte.yw.controllers.handlers.UniverseTableHandler;
+import com.yugabyte.yw.controllers.handlers.UpgradeUniverseHandler;
+import com.yugabyte.yw.forms.RestartTaskParams;
+import com.yugabyte.yw.forms.RunQueryFormData;
+import com.yugabyte.yw.forms.UniverseDefinitionTaskParams;
+import com.yugabyte.yw.forms.UniverseDefinitionTaskParams.Cluster;
+import com.yugabyte.yw.forms.UniverseResp;
+import com.yugabyte.yw.forms.UpgradeTaskParams;
+import com.yugabyte.yw.models.AccessKey;
+import com.yugabyte.yw.models.AvailabilityZone;
+import com.yugabyte.yw.models.Customer;
+import com.yugabyte.yw.models.CustomerTask;
+import com.yugabyte.yw.models.InstanceType;
+import com.yugabyte.yw.models.Provider;
+import com.yugabyte.yw.models.ProviderDetails;
+import com.yugabyte.yw.models.Region;
+import com.yugabyte.yw.models.TaskInfo;
+import com.yugabyte.yw.models.Universe;
+import com.yugabyte.yw.models.Users;
+import com.yugabyte.yw.models.YugawareProperty;
+import com.yugabyte.yw.models.helpers.CloudInfoInterface;
+import com.yugabyte.yw.models.helpers.CommonUtils;
+import com.yugabyte.yw.models.helpers.NodeDetails;
+import com.yugabyte.yw.models.helpers.NodeDetails.NodeState;
+import com.yugabyte.yw.models.helpers.PlacementInfo;
+import com.yugabyte.yw.models.helpers.TaskType;
+import com.yugabyte.yw.models.helpers.provider.LocalCloudInfo;
+import com.yugabyte.yw.scheduler.JobScheduler;
+import java.io.BufferedReader;
+import java.io.File;
+import java.io.FileInputStream;
+import java.io.FileReader;
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.RandomAccessFile;
+import java.net.URL;
+import java.net.URLConnection;
+import java.nio.channels.FileChannel;
+import java.nio.channels.FileLock;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.nio.file.StandardCopyOption;
+import java.text.SimpleDateFormat;
+import java.time.Duration;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.Comparator;
+import java.util.Date;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.Iterator;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+import java.util.Set;
+import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.TimeUnit;
+import java.util.function.Consumer;
+import java.util.function.Function;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+import java.util.stream.Collectors;
+import kamon.instrumentation.play.GuiceModule;
+import lombok.extern.slf4j.Slf4j;
+import org.apache.commons.compress.archivers.tar.TarArchiveEntry;
+import org.apache.commons.compress.archivers.tar.TarArchiveInputStream;
+import org.apache.commons.compress.compressors.gzip.GzipCompressorInputStream;
+import org.apache.commons.io.FileUtils;
+import org.apache.commons.lang3.StringUtils;
+import org.junit.AssumptionViolatedException;
+import org.junit.Before;
+import org.junit.BeforeClass;
+import org.junit.Rule;
+import org.junit.rules.TestRule;
+import org.junit.rules.TestWatcher;
+import org.junit.rules.Timeout;
+import org.junit.runner.Description;
+import org.junit.runners.model.Statement;
+import org.yb.CommonNet;
+import org.yb.CommonNet.PlacementInfoPB;
+import org.yb.CommonNet.ReplicationInfoPB;
+import org.yb.CommonTypes.TableType;
+import org.yb.client.GetMasterClusterConfigResponse;
+import org.yb.client.YBClientApi;
+import org.yb.master.CatalogEntityInfo;
+import play.Application;
+import play.inject.guice.GuiceApplicationBuilder;
+import play.libs.Json;
+
+@Slf4j
+public abstract class LocalProviderUniverseTestBase extends CommissionerBaseTest {
+  private static final boolean IS_LINUX = System.getProperty("os.name").equalsIgnoreCase("linux");
+  private static final Set<String> CONTROL_FILES =
+      Set.of(LocalNodeManager.MASTER_EXECUTABLE, LocalNodeManager.TSERVER_EXECUTABLE);
+  private static final SimpleDateFormat DATE_FORMAT = new SimpleDateFormat("yyMMdd'T'HHmmss");
+
+  protected static final String INSTANCE_TYPE_CODE = "c3.xlarge";
+  protected static final String INSTANCE_TYPE_CODE_2 = "c5.xlarge";
+
+  private static final String YB_PATH_ENV_KEY = "YB_PATH";
+  private static final String BASE_DIR_ENV_KEY = "TEST_BASE_DIR";
+  // Downloaded YB/YBC release binaries are cached in a shared, non-per-process directory so that
+  // parallel test forks download and extract the (~400MB) release only once for the whole run
+  // instead of once per fork. Node data still lives under the per-fork baseDir.
+  private static final String BINARIES_DIR_ENV_KEY = "TEST_BINARIES_DIR";
+  private static final String DEFAULT_BINARIES_DIR = "/tmp/yb_local_test_binaries";
+  // Written into a cached release directory only after it is fully extracted and post-installed;
+  // gates cache reuse so a partial/interrupted download is never treated as usable.
+  private static final String DOWNLOAD_COMPLETE_MARKER = ".download_complete";
+  // Per-artifact download locks and the scratch space releases are unpacked into before being
+  // published into the cache under their final name.
+  private static final String LOCK_SUBDIR = ".locks";
+  private static final String STAGING_SUBDIR = ".staging";
+  private static final Map<String, Object> ARTIFACT_MONITORS = new ConcurrentHashMap<>();
+  private static final int DOWNLOAD_ATTEMPTS = 3;
+  private static final String IP_RANGE_START_SYS_PROP = "yb.local.test.ipRangeStart";
+  private static final String IP_RANGE_END_SYS_PROP = "yb.local.test.ipRangeEnd";
+  private static final String IP_RANGE_START_ENV_KEY = "TEST_IP_RANGE_START";
+  private static final String IP_RANGE_END_ENV_KEY = "TEST_IP_RANGE_END";
+  private static final String SKIP_WAIT_FOR_CLUSTER_ENV_KEY = "YB_SKIP_WAIT_FOR_CLUSTER";
+
+  private static final String DEFAULT_BASE_DIR = "/tmp/local";
+  public static String YBC_VERSION = "2.2.0.4-b4";
+  public static String DB_VERSION = "2024.1.0.0-b129";
+  private static final String DOWNLOAD_URL =
+      "https://downloads.yugabyte.com/releases/"
+          + DB_VERSION.split("-")[0]
+          + "/yugabyte-"
+          + DB_VERSION
+          + "-%s-%s.tar.gz";
+
+  private static final String YBC_BASE_S3_URL = "https://downloads.yugabyte.com/ybc/";
+  private static final String YBC_BIN_ENV_KEY = "YBC_PATH";
+  private static final boolean KEEP_FAILED_UNIVERSE = false;
+  private static final boolean KEEP_ALWAYS = false;
+
+  public static Map<String, String> GFLAGS = new HashMap<>();
+
+  private SimpleSqlPayload simpleSqlPayload;
+
+  static {
+    GFLAGS.put("load_balancer_max_over_replicated_tablets", "15");
+    GFLAGS.put("load_balancer_max_concurrent_adds", "15");
+    GFLAGS.put("load_balancer_max_concurrent_removals", "15");
+    GFLAGS.put("load_balancer_max_concurrent_moves", "15");
+    GFLAGS.put("transaction_table_num_tablets", "3");
+    // 0 so WaitForDataMove / leader-blacklist waits do not sit idle for the production-oriented
+    // load-balancer warm-up. Local tests have no real tablet load and start masters fresh each
+    // method, so the warm-up only adds wall time. Note this delay is from becoming master LEADER,
+    // not from process start - so it also hits mid-task after leadership changes.
+    GFLAGS.put(GFlagsUtil.LOAD_BALANCER_INITIAL_DELAY_SECS, "0");
+    // Companion to the above: GetLoadMoveCompletion reports fake remaining-load for this many
+    // seconds after the master becomes leader (to avoid premature 100% right after failover).
+    // Default is also 120s and was the dominant WaitForDataMove cost once LB itself was unblocked.
+    GFLAGS.put("blacklist_progress_initial_delay_secs", "0");
+    // Run the catalog-manager BG task (which drives the LB) more frequently than the 1s default.
+    GFLAGS.put("catalog_manager_bg_task_wait_ms", "100");
+    GFLAGS.put(GFlagsUtil.TMP_DIRECTORY, "");
+  }
+
+  public Map<String, String> getYbcGFlags(UniverseDefinitionTaskParams.UserIntent userIntent) {
+    Map<String, String> ybcGFlags = new HashMap<>();
+    Provider provider = Util.getSingleProvider(userIntent);
+    LocalCloudInfo cloudInfo = CloudInfoInterface.get(provider);
+    String baseBinDir = cloudInfo.getYugabyteBinDir();
+    File binDirectory = new File(baseBinDir);
+
+    ybcGFlags.put("ysqlsh", baseBinDir + "/ysqlsh");
+    ybcGFlags.put("ycqlsh", baseBinDir + "/ycqlsh");
+    ybcGFlags.put("yb_admin", baseBinDir + "/yb-admin");
+    ybcGFlags.put("yb_ctl", baseBinDir + "/yb-ctl");
+    ybcGFlags.put("ysql_dump", binDirectory.getParent() + "/postgres/bin/ysql_dump");
+    ybcGFlags.put("ysql_dumpall", binDirectory.getParent() + "/postgres/bin/ysql_dumpall");
+
+    return ybcGFlags;
+  }
+
+  protected Customer customer;
+  protected Provider provider;
+  protected Users user;
+  protected AccessKey accessKey;
+  protected Region region;
+  protected AvailabilityZone az1;
+  protected AvailabilityZone az2;
+  protected AvailabilityZone az3;
+  protected AvailabilityZone az4;
+  protected InstanceType instanceType;
+  protected InstanceType instanceType2;
+
+  protected static String ybVersion;
+  protected static String ybBinPath;
+  protected static String ybcBinPath;
+  protected static String baseDir;
+  // Shared cache directory for downloaded/extracted YB and YBC binaries (see BINARIES_DIR_ENV_KEY).
+  protected static String binariesBaseDir;
+  protected static String arch;
+  protected static String os;
+  protected static String subDir;
+  protected static String testName;
+  // yb.storage.path for this fork. The test config default is a bare "/tmp", which every fork of a
+  // parallel run would share: certs, keys and licenses all land in the same /tmp/certs tree even
+  // though each fork has its own database, so one fork can read - or clean up - another's files.
+  protected static String storagePath;
+  // Whether to wait until all old tservers are removed from quorum and new ones are added.
+  protected static boolean waitForClusterToStabilize;
+
+  protected LocalNodeManager localNodeManager;
+  protected LocalNodeUniverseManager localNodeUniverseManager;
+  protected UniverseCRUDHandler universeCRUDHandler;
+  protected UpgradeUniverseHandler upgradeUniverseHandler;
+  protected NodeUIApiHelper nodeUIApiHelper;
+  protected YBClientService ybClientService;
+  protected BackupHelper backupHelper;
+  protected YcqlQueryExecutor ycqlQueryExecutor;
+  protected UniverseTableHandler tableHandler;
+  protected CertificateHelper certificateHelper;
+  protected SettableRuntimeConfigFactory settableRuntimeConfigFactory;
+  protected RuntimeConfService runtimeConfService;
+  protected JobScheduler jobScheduler;
+  protected AutoMasterFailoverScheduler autoMasterFailoverScheduler;
+  protected LocalNodeManager.LocalDNSManager localDnsManager =
+      new LocalNodeManager.LocalDNSManager();
+
+  @BeforeClass
+  public static void setUpEnv() {
+    log.debug("Setting up environment");
+    os = IS_LINUX ? "linux" : "darwin";
+    String systemArch = System.getProperty("os.arch");
+    setUpBaseDir();
+
+    if (systemArch.equalsIgnoreCase("aarch64")) {
+      arch = "arm64";
+    } else {
+      arch = "x86_64";
+    }
+
+    waitForClusterToStabilize = System.getenv(SKIP_WAIT_FOR_CLUSTER_ENV_KEY) == null;
+    setUpYBSoftware(os, arch);
+    ybcBinPath = System.getenv(YBC_BIN_ENV_KEY);
+    setUpYBCSoftware(os, arch);
+    subDir = DATE_FORMAT.format(new Date()) + "_" + ProcessHandle.current().pid();
+    File subDirPath = Paths.get(baseDir, subDir).toFile();
+    if (!subDirPath.exists()) {
+      subDirPath.mkdirs();
+    }
+    // A sibling of the per-test directories, so it survives the per-test cleanup: certs created for
+    // one test's universe are still needed while a later test in the same class runs.
+    File storageDirPath = Paths.get(baseDir, subDir, "storage").toFile();
+    storageDirPath.mkdirs();
+    storagePath = storageDirPath.getAbsolutePath();
+    if (!KEEP_FAILED_UNIVERSE && !KEEP_ALWAYS) {
+      subDirPath.deleteOnExit();
+    }
+  }
+
+  @Rule public Timeout globalTimeout = Timeout.seconds(getTestTimeoutSeconds());
+
+  protected int getTestTimeoutSeconds() {
+    return 1200;
+  }
+
+  private static void setUpBaseDir() {
+    if (System.getenv(BASE_DIR_ENV_KEY) != null) {
+      baseDir = System.getenv(BASE_DIR_ENV_KEY);
+    } else {
+      baseDir = DEFAULT_BASE_DIR + "_" + ProcessHandle.current().pid();
+    }
+    if (System.getenv(BINARIES_DIR_ENV_KEY) != null) {
+      binariesBaseDir = System.getenv(BINARIES_DIR_ENV_KEY);
+    } else {
+      binariesBaseDir = DEFAULT_BINARIES_DIR;
+    }
+  }
+
+  // Runs the given action while holding an exclusive lock scoped to a single cached artifact, so
+  // that concurrent test forks do not download/extract the same release simultaneously (or
+  // repeatedly), while forks needing different releases still fetch in parallel. Because the
+  // check-if-present and the download run under the same lock, the first fork downloads while the
+  // rest wait and then find the binaries already present. The OS releases the file lock if a fork
+  // dies, so a crash cannot deadlock the others; the in-JVM monitor is needed on top of it because
+  // FileLock is held per JVM, not per thread.
+  private static void runWithArtifactLock(String artifact, Runnable action) {
+    File lockDir = new File(binariesBaseDir, LOCK_SUBDIR);
+    lockDir.mkdirs();
+    File lockFile = new File(lockDir, artifact + ".lock");
+    synchronized (ARTIFACT_MONITORS.computeIfAbsent(artifact, k -> new Object())) {
+      try (RandomAccessFile raf = new RandomAccessFile(lockFile, "rw");
+          FileChannel channel = raf.getChannel();
+          FileLock lock = channel.lock()) {
+        action.run();
+      } catch (IOException e) {
+        throw new RuntimeException("Failed to acquire cache lock for " + artifact, e);
+      }
+    }
+  }
+
+  private static void setUpYBSoftware(String os, String arch) {
+    String downloadURL = String.format(DOWNLOAD_URL, os, arch);
+    log.debug("Using base dir {}", baseDir);
+
+    ybBinPath = determineYBBinPath();
+    if (ybBinPath == null) {
+      downloadAndSetUpYBSoftware(os, arch, downloadURL, DB_VERSION);
+      ybVersion = DB_VERSION;
+      ybBinPath = deriveYBBinPath(ybVersion);
+    }
+
+    log.debug("YB version {} bin path {}", ybVersion, ybBinPath);
+  }
+
+  private static void setUpYBCSoftware(String os, String arch) {
+    YBC_VERSION = ConfigFactory.load().getString(GlobalConfKeys.ybcStableVersion.getKey());
+    if (ybcBinPath == null) {
+      validateYBCVersion(YBC_VERSION);
+      log.debug("ybc Version to use {}", YBC_VERSION);
+      downloadAndSetUpYBCSoftware(os, arch, YBC_VERSION);
+    } else {
+      File binFile = new File(ybcBinPath);
+      Pattern pattern = Pattern.compile("((\\d+)\\.(\\d+)\\.(\\d+)\\.(\\d+)\\-b[0-9]+)");
+      Matcher matcher = pattern.matcher(binFile.getParent());
+      if (matcher.find()) {
+        YBC_VERSION = matcher.group(1);
+      } else {
+        throw new IllegalStateException("Cannot extract ybc version from " + binFile.getParent());
+      }
+    }
+    log.debug("Using ybc binaries from path {}", ybcBinPath);
+  }
+
+  private static String determineYBBinPath() {
+    if (System.getenv(YB_PATH_ENV_KEY) != null) {
+      File binFile = new File(System.getenv(YB_PATH_ENV_KEY), "bin");
+      if (binFile.exists()) {
+        ybVersion = binFile.getParentFile().getName().replaceAll("yugabyte-", "");
+        return binFile.getPath();
+      }
+    }
+    return null;
+  }
+
+  public static String deriveYBBinPath(String version) {
+    return binariesBaseDir + "/yugabyte/yugabyte-" + version + "/bin";
+  }
+
+  public static void downloadAndSetUpYBSoftware(
+      String os, String arch, String downloadURL, String dbVersion) {
+    File releaseDir = new File(binariesBaseDir + "/yugabyte", "yugabyte-" + dbVersion);
+    File releaseTar =
+        new File(
+            binariesBaseDir + "/yugabyte",
+            String.format("yugabyte-%s-%s-%s.tar.gz", dbVersion, os, arch));
+    // Lock-free fast path: the completion marker is written last, so seeing it means another fork
+    // (or an earlier run) already published this release in full.
+    if (isReleaseCached(releaseDir, releaseTar)) {
+      return;
+    }
+    runWithArtifactLock(
+        releaseDir.getName(),
+        () -> {
+          if (isReleaseCached(releaseDir, releaseTar)) {
+            log.debug("{} already downloaded", dbVersion);
+            return;
+          }
+          log.info("Downloading {} from {}", dbVersion, downloadURL);
+          // Unpack into a private staging directory: the tarball's top-level directory is named
+          // after the version without the build suffix, so two builds of the same version line
+          // would otherwise collide with each other in the shared cache directory.
+          File staging = new File(binariesBaseDir + "/yugabyte/" + STAGING_SUBDIR, dbVersion);
+          try {
+            FileUtils.deleteDirectory(releaseDir);
+            FileUtils.deleteDirectory(staging);
+            Files.createDirectories(staging.toPath());
+            try {
+              downloadFile(downloadURL, releaseTar);
+              extractTarGz(releaseTar, staging);
+              Files.move(
+                  singleDirectoryIn(staging).toPath(),
+                  releaseDir.toPath(),
+                  StandardCopyOption.ATOMIC_MOVE);
+            } finally {
+              FileUtils.deleteDirectory(staging);
+            }
+            // post_install bakes absolute paths into the binaries in older releases, so it has to
+            // run once the release sits at its final location.
+            runPostInstallScript(new File(releaseDir, "bin").getPath());
+            // Mark the extracted release complete only after post-install succeeds, so an
+            // interrupted download cannot be mistaken for a usable cache entry by a later fork/run.
+            Files.createFile(new File(releaseDir, DOWNLOAD_COMPLETE_MARKER).toPath());
+          } catch (IOException | InterruptedException e) {
+            throw new RuntimeException("Failed to download " + downloadURL, e);
+          }
+        });
+  }
+
+  private static boolean isReleaseCached(File releaseDir, File releaseTar) {
+    // The tarball is part of the cache entry, not just an intermediate: release metadata handed to
+    // YBA points at it.
+    return new File(releaseDir, DOWNLOAD_COMPLETE_MARKER).exists()
+        && hasRequiredExecutables(releaseDir)
+        && releaseTar.exists();
+  }
+
+  private static File singleDirectoryIn(File parent) {
+    File[] dirs = parent.listFiles(File::isDirectory);
+    if (dirs == null || dirs.length != 1) {
+      throw new IllegalStateException(
+          "Expected exactly one directory in " + parent + ", got " + Arrays.toString(dirs));
+    }
+    return dirs[0];
+  }
+
+  private static boolean hasRequiredExecutables(File folder) {
+    File binFolder = new File(folder, "bin");
+    if (binFolder.exists()) {
+      Set<String> neededExecutables = new HashSet<>(CONTROL_FILES);
+      for (File file : Optional.ofNullable(binFolder.listFiles()).orElse(new File[0])) {
+        neededExecutables.remove(file.getName());
+      }
+      return neededExecutables.isEmpty();
+    }
+    return false;
+  }
+
+  private static void runPostInstallScript(String binPath)
+      throws IOException, InterruptedException {
+    ProcessBuilder pb = new ProcessBuilder("./post_install.sh").directory(new File(binPath));
+    Process proc = pb.start();
+    int res = proc.waitFor();
+    if (res != 0) {
+      log.error(
+          "post_install exited with {} and output \r\n {}",
+          res,
+          new String(proc.getErrorStream().readAllBytes()));
+      throw new IllegalStateException();
+    }
+  }
+
+  private static void downloadAndSetUpYBCSoftware(String os, String arch, String ybcVersion) {
+    String ybcArtifact = String.format("ybc-%s-%s-%s", ybcVersion, os, arch);
+    File ybcDir = new File(binariesBaseDir + "/ybc", ybcArtifact);
+    ybcBinPath = new File(ybcDir, "bin").getPath();
+    File ybcCompleteMarker = new File(ybcDir, DOWNLOAD_COMPLETE_MARKER);
+    if (ybcCompleteMarker.exists()) {
+      return;
+    }
+    runWithArtifactLock(
+        ybcArtifact,
+        () -> {
+          if (ybcCompleteMarker.exists()) {
+            log.debug("YBC {} already extracted at {}", ybcVersion, ybcBinPath);
+            return;
+          }
+          String ybcDownloadURL = YBC_BASE_S3_URL + ybcVersion + "/" + ybcArtifact + ".tar.gz";
+          File staging = new File(binariesBaseDir + "/ybc/" + STAGING_SUBDIR, ybcArtifact);
+          File ybcTar = new File(staging, ybcArtifact + ".tar.gz");
+          try {
+            FileUtils.deleteDirectory(ybcDir);
+            FileUtils.deleteDirectory(staging);
+            Files.createDirectories(staging.toPath());
+            try {
+              downloadFile(ybcDownloadURL, ybcTar);
+              extractTarGz(ybcTar, staging);
+              Files.delete(ybcTar.toPath());
+              Files.move(
+                  singleDirectoryIn(staging).toPath(),
+                  ybcDir.toPath(),
+                  StandardCopyOption.ATOMIC_MOVE);
+            } finally {
+              FileUtils.deleteDirectory(staging);
+            }
+            // Mark complete only after a successful extract (see YB marker rationale above).
+            Files.createFile(ybcCompleteMarker.toPath());
+            log.info("YBC extracted successfully.");
+          } catch (IOException e) {
+            throw new RuntimeException("Failed to download " + ybcDownloadURL, e);
+          }
+        });
+  }
+
+  private static void downloadFile(String downloadURL, File destination) throws IOException {
+    destination.getParentFile().mkdirs();
+    // Downloaded under the per-artifact lock, so a stalled connection blocks every fork waiting on
+    // the same release. Bound both phases so a dead peer fails fast, and retry a few times so a
+    // transient network error does not fail the test that happened to trigger the download.
+    Path partial = Paths.get(destination.getPath() + ".part");
+    IOException lastError = null;
+    for (int attempt = 1; attempt <= DOWNLOAD_ATTEMPTS; attempt++) {
+      try {
+        URLConnection connection = new URL(downloadURL).openConnection();
+        connection.setConnectTimeout((int) Duration.ofSeconds(30).toMillis());
+        connection.setReadTimeout((int) Duration.ofMinutes(5).toMillis());
+        try (InputStream in = connection.getInputStream()) {
+          Files.copy(in, partial, StandardCopyOption.REPLACE_EXISTING);
+        }
+        Files.move(partial, destination.toPath(), StandardCopyOption.REPLACE_EXISTING);
+        log.debug("Downloaded {} to {}", downloadURL, destination);
+        return;
+      } catch (IOException e) {
+        lastError = e;
+        log.warn("Download of {} failed (attempt {}): {}", downloadURL, attempt, e.getMessage());
+        Files.deleteIfExists(partial);
+        try {
+          Thread.sleep(Duration.ofSeconds(5).toMillis());
+        } catch (InterruptedException ie) {
+          Thread.currentThread().interrupt();
+          throw new IOException("Interrupted while downloading " + downloadURL, ie);
+        }
+      }
+    }
+    throw lastError;
+  }
+
+  private static void extractTarGz(File tarFile, File destinationDir) throws IOException {
+    Path destination = destinationDir.toPath();
+    try (TarArchiveInputStream tarInput =
+        new TarArchiveInputStream(new GzipCompressorInputStream(new FileInputStream(tarFile)))) {
+      TarArchiveEntry currentEntry;
+      while ((currentEntry = tarInput.getNextEntry()) != null) {
+        Path extractTo = destination.resolve(currentEntry.getName());
+        if (currentEntry.isDirectory()) {
+          Files.createDirectories(extractTo);
+        } else if (currentEntry.isSymbolicLink()) {
+          Files.createSymbolicLink(extractTo, Path.of(currentEntry.getLinkName()));
+        } else {
+          Files.copy(tarInput, extractTo, StandardCopyOption.REPLACE_EXISTING);
+          int mode = currentEntry.getMode();
+          if ((mode & 0100) != 0) {
+            extractTo.toFile().setExecutable(true);
+          }
+        }
+      }
+    }
+  }
+
+  private static void validateYBCVersion(String ybcVersion) {
+    if (StringUtils.isEmpty(ybcVersion)) {
+      throw new RuntimeException("YBC version is not configured. Can't continue");
+    }
+  }
+
+  private void injectDependencies() {
+    universeCRUDHandler = app.injector().instanceOf(UniverseCRUDHandler.class);
+    upgradeUniverseHandler = app.injector().instanceOf(UpgradeUniverseHandler.class);
+    nodeUIApiHelper = app.injector().instanceOf(NodeUIApiHelper.class);
+    localNodeManager = app.injector().instanceOf(LocalNodeManager.class);
+    localNodeUniverseManager = app.injector().instanceOf(LocalNodeUniverseManager.class);
+    ybClientService = app.injector().instanceOf(YBClientService.class);
+    confGetter = app.injector().instanceOf(RuntimeConfGetter.class);
+    backupHelper = app.injector().instanceOf(BackupHelper.class);
+    ycqlQueryExecutor = app.injector().instanceOf(YcqlQueryExecutor.class);
+    tableHandler = app.injector().instanceOf(UniverseTableHandler.class);
+    certificateHelper = app.injector().instanceOf(CertificateHelper.class);
+    commissioner = app.injector().instanceOf(Commissioner.class);
+    settableRuntimeConfigFactory = app.injector().instanceOf(SettableRuntimeConfigFactory.class);
+    runtimeConfService = app.injector().instanceOf(RuntimeConfService.class);
+    jobScheduler = app.injector().instanceOf(JobScheduler.class);
+    autoMasterFailoverScheduler = app.injector().instanceOf(AutoMasterFailoverScheduler.class);
+    customerTaskManager = app.injector().instanceOf(CustomerTaskManager.class);
+  }
+
+  @Before
+  @Override
+  public void setUpBase() {
+    injectDependencies();
+
+    settableRuntimeConfigFactory.globalRuntimeConf().setValue("yb.releases.use_redesign", "false");
+    settableRuntimeConfigFactory
+        .globalRuntimeConf()
+        .setValue(GlobalConfKeys.startMasterOnRemoveNode.getKey(), "true");
+    settableRuntimeConfigFactory
+        .globalRuntimeConf()
+        .setValue(GlobalConfKeys.startMasterOnStopNode.getKey(), "true");
+
+    settableRuntimeConfigFactory
+        .globalRuntimeConf()
+        .setValue("yb.checks.verify_cluster_uuid.enabled", "true");
+    settableRuntimeConfigFactory
+        .globalRuntimeConf()
+        .setValue("yb.universe.consistency_check.enabled", "true");
+    Pair<Integer, Integer> ipRange = getIpRange();
+    log.info("Using local test IP range [{}, {})", ipRange.getFirst(), ipRange.getSecond());
+    localNodeManager.setIpRangeStart(ipRange.getFirst());
+    localNodeManager.setIpRangeEnd(ipRange.getSecond());
+    File testDir = Paths.get(baseDir, subDir, testName).toFile();
+    testDir.mkdirs();
+
+    YugawareProperty.addConfigProperty(
+        ReleaseManager.CONFIG_TYPE.name(), getMetadataJson(ybVersion, false), "release");
+    YugawareProperty.addConfigProperty(
+        ReleaseManager.YBC_CONFIG_TYPE.name(),
+        getMetadataJson("ybc-" + YBC_VERSION, true),
+        "release");
+    ObjectNode ywMetadata = Json.newObject();
+    ywMetadata.put("yugaware_uuid", UUID.randomUUID().toString());
+    ywMetadata.put("version", ybVersion);
+    YugawareProperty.addConfigProperty(
+        ConfigHelper.ConfigType.YugawareMetadata.name(), ywMetadata, "Yugaware Metadata");
+
+    customer = ModelFactory.testCustomer();
+    user = ModelFactory.testUser(customer);
+    LocalCloudInfo localCloudInfo = new LocalCloudInfo();
+    localCloudInfo.setDataHomeDir(testDir.toString());
+    localCloudInfo.setYugabyteBinDir(ybBinPath);
+    localCloudInfo.setYbcBinDir(ybcBinPath);
+    ProviderDetails.CloudInfo cloudInfo = new ProviderDetails.CloudInfo();
+    cloudInfo.setLocal(localCloudInfo);
+    ProviderDetails providerDetails = new ProviderDetails();
+    providerDetails.setCloudInfo(cloudInfo);
+    provider = ModelFactory.newProvider(customer, Common.CloudType.local, providerDetails);
+    AccessKey.KeyInfo keyInfo = new AccessKey.KeyInfo();
+    String keyCode = "aws_access_code";
+    keyInfo.sshUser = "ssh_user";
+    keyInfo.sshPort = 22;
+    accessKey = AccessKey.create(provider.getUuid(), keyCode, keyInfo);
+
+    region = Region.create(provider, "region-1", "region-1", "default-image");
+    az1 = AvailabilityZone.createOrThrow(region, "az-1", "az-1", "subnet-1");
+    az2 = AvailabilityZone.createOrThrow(region, "az-2", "az-2", "subnet-2");
+    az3 = AvailabilityZone.createOrThrow(region, "az-3", "az-3", "subnet-3");
+    az4 = AvailabilityZone.createOrThrow(region, "az-4", "az-4", "subnet-4");
+
+    instanceType =
+        InstanceType.upsert(
+            provider.getUuid(),
+            INSTANCE_TYPE_CODE,
+            10,
+            5.5,
+            new InstanceType.InstanceTypeDetails());
+    instanceType2 =
+        InstanceType.upsert(
+            provider.getUuid(),
+            INSTANCE_TYPE_CODE_2,
+            12,
+            5.5,
+            new InstanceType.InstanceTypeDetails());
+
+    settableRuntimeConfigFactory
+        .globalRuntimeConf()
+        .setValue("yb.task.verify_cluster_state", "true");
+  }
+
+  /** Range of IPs to use. Two last bytes of each number are used to form 127.0.x.y ip. */
+  protected Pair<Integer, Integer> getIpRange() {
+    String startProp = System.getProperty(IP_RANGE_START_SYS_PROP);
+    String endProp = System.getProperty(IP_RANGE_END_SYS_PROP);
+    if (startProp != null && endProp != null) {
+      log.info("Using ip range [{}, {}) from system property", startProp, endProp);
+      return new Pair<>(Integer.parseInt(startProp), Integer.parseInt(endProp));
+    }
+    String startEnv = System.getenv(IP_RANGE_START_ENV_KEY);
+    String endEnv = System.getenv(IP_RANGE_END_ENV_KEY);
+    if (startEnv != null && endEnv != null) {
+      log.info("Using ip range [{}, {}) from env", startEnv, endEnv);
+      return new Pair<>(Integer.parseInt(startEnv), Integer.parseInt(endEnv));
+    }
+    Pair<Integer, Integer> defaultRange = new Pair<>(2, 100);
+    log.info("Using default ip range [{}, {})", defaultRange.getFirst(), defaultRange.getSecond());
+    return defaultRange;
+  }
+
+  protected JsonNode getMetadataJson(String release, boolean isYbc) {
+    ReleaseManager.ReleaseMetadata releaseMetadata = new ReleaseManager.ReleaseMetadata();
+    releaseMetadata.state = ReleaseManager.ReleaseState.ACTIVE;
+    String parentDirectory = "/";
+    if (!isYbc) {
+      parentDirectory = "/yugabyte/";
+    }
+    releaseMetadata.filePath =
+        binariesBaseDir
+            + parentDirectory
+            + "yugabyte-"
+            + release
+            + "-"
+            + os
+            + "-"
+            + arch
+            + ".tar.gz";
+    ReleaseManager.ReleaseMetadata.Package pkg = new ReleaseManager.ReleaseMetadata.Package();
+    pkg.arch = PublicCloudConstants.Architecture.valueOf(arch);
+    pkg.path = releaseMetadata.filePath;
+    releaseMetadata.packages = Collections.singletonList(pkg);
+    ObjectNode object = Json.newObject();
+    if (isYbc) {
+      release += "-" + os + "-" + arch;
+    }
+    object.set(release, Json.toJson(releaseMetadata));
+    return object;
+  }
+
+  /**
+   * Focus filter: YB_ONLY_TEST=<substring> runs only the methods whose name contains the substring.
+   * It has to be a bare TestRule rather than a TestWatcher hook, because TestWatcher swallows
+   * whatever starting() throws and evaluates the test anyway - the skip would be reported but the
+   * test would still run to completion.
+   */
+  @Rule(order = Integer.MIN_VALUE)
+  public TestRule onlyTestFilter =
+      (base, description) ->
+          new Statement() {
+            @Override
+            public void evaluate() throws Throwable {
+              String only = System.getenv("YB_ONLY_TEST");
+              if (only != null && !only.isEmpty() && !description.getMethodName().contains(only)) {
+                throw new AssumptionViolatedException("skipped by YB_ONLY_TEST=" + only);
+              }
+              base.evaluate();
+            }
+          };
+
+  @Rule(order = Integer.MIN_VALUE + 1)
+  public TestWatcher testWatcher =
+      new TestWatcher() {
+
+        @Override
+        protected void starting(Description description) {
+          // Remove the special characters from the test name as it will be part of the directory
+          // names.
+          testName =
+              description.getClassName().replaceAll(".*\\.", "")
+                  + "_"
+                  + description
+                      .getMethodName()
+                      .replace("(", "_")
+                      .replace(")", "_")
+                      .replace(" ", "_")
+                      .replace("[", "_")
+                      .replace("]", "");
+        }
+
+        @Override
+        protected void succeeded(Description description) {
+          tearDown(false);
+        }
+
+        @Override
+        protected void failed(Throwable e, Description description) {
+          tearDown(true);
+        }
+      };
+
+  private void tearDown(boolean failed) {
+    log.info("tear down " + testName + " failed " + failed);
+    if (simpleSqlPayload != null) {
+      simpleSqlPayload.stop();
+    }
+    if ((!failed || !KEEP_FAILED_UNIVERSE) && !KEEP_ALWAYS) {
+      try {
+        FileUtils.deleteDirectory(Paths.get(baseDir, subDir, testName).toFile());
+      } catch (Exception ignored) {
+      }
+      localNodeManager.shutdown();
+    }
+  }
+
+  // Local provider tests spin up real local processes and manage heavy per-method state, so they
+  // must get a fresh application per method (overriding CommissionerBaseTest's reuse opt-in).
+  @Override
+  protected boolean reusableApplication() {
+    return false;
+  }
+
+  @Override
+  protected Application provideApplication() {
+    return configureApplication(
+            new GuiceApplicationBuilder()
+                .disable(GuiceModule.class)
+                .configure(testDatabase())
+                .configure(localTestConfig()))
+        .overrides(bind(DnsManager.class).toInstance(localDnsManager))
+        .build();
+  }
+
+  private static Map<String, Object> localTestConfig() {
+    Map<String, Object> config = new HashMap<>();
+    config.put("yb.storage.path", storagePath);
+    // Leader blacklist completion either reports 100% within a second or - on these small, briefly
+    // lived universes - stays pinned at 0% and never finishes, so the production default of 60s is
+    // spent idling on every rolling restart. Nothing fails when it expires
+    // (yb.node_ops.leader_blacklist.fail_on_timeout is false), it just waits.
+    config.put("yb.upgrade.blacklist_leader_wait_time_ms", 10000);
+    return config;
+  }
+
+  protected Universe createUniverse(int numNodes, int replicationFactor)
+      throws InterruptedException {
+    return createUniverse(
+        userIntent -> {
+          userIntent.replicationFactor = replicationFactor;
+          userIntent.numNodes = numNodes;
+        });
+  }
+
+  protected UniverseDefinitionTaskParams.UserIntent getDefaultUserIntent() {
+    return getDefaultUserIntent(null, false);
+  }
+
+  protected UniverseDefinitionTaskParams.UserIntent getDefaultUserIntent(
+      String univName, boolean disableTls) {
+    return getDefaultUserIntent(univName, disableTls, 3, 3);
+  }
+
+  protected UniverseDefinitionTaskParams.UserIntent getDefaultUserIntent(
+      String univName, boolean disableTls, int rf, int numNodes) {
+    UniverseDefinitionTaskParams.UserIntent userIntent =
+        ApiUtils.getTestUserIntent(region, provider, instanceType, numNodes);
+    userIntent.replicationFactor = rf;
+    userIntent.universeName = "test-universe";
+    if (univName != null) {
+      userIntent.universeName = univName;
+    }
+    userIntent.ybSoftwareVersion = ybVersion;
+    userIntent.accessKeyCode = accessKey.getKeyCode();
+    if (!disableTls) {
+      userIntent.enableNodeToNodeEncrypt = true;
+      userIntent.enableClientToNodeEncrypt = true;
+    }
+    userIntent.specificGFlags = getGFlags();
+    userIntent.deviceInfo.storageType = PublicCloudConstants.StorageType.Local;
+    return userIntent;
+  }
+
+  protected Universe createUniverse(
+      Consumer<UniverseDefinitionTaskParams.UserIntent> intentModifier)
+      throws InterruptedException {
+    UniverseDefinitionTaskParams.UserIntent userIntent = getDefaultUserIntent();
+    intentModifier.accept(userIntent);
+    return createUniverse(userIntent);
+  }
+
+  protected Universe createUniverse(UniverseDefinitionTaskParams.UserIntent userIntent)
+      throws InterruptedException {
+    return createUniverse(userIntent, (x) -> {});
+  }
+
+  protected Universe createUniverseWithYbc(UniverseDefinitionTaskParams.UserIntent userIntent)
+      throws InterruptedException {
+    return createUniverse(
+        userIntent,
+        (x) -> {
+          x.setEnableYbc(true);
+          x.setYbcSoftwareVersion(LocalProviderUniverseTestBase.YBC_VERSION);
+        });
+  }
+
+  protected Universe createUniverse(
+      UniverseDefinitionTaskParams.UserIntent userIntent,
+      Consumer<UniverseDefinitionTaskParams> paramsCustomizer)
+      throws InterruptedException {
+    UniverseDefinitionTaskParams taskParams = new UniverseDefinitionTaskParams();
+    taskParams.nodePrefix = "univConfCreate";
+    taskParams.upsertPrimaryCluster(userIntent, null, null);
+    PlacementInfoUtil.updateUniverseDefinition(
+        taskParams, customer.getId(), taskParams.getPrimaryCluster().uuid, CREATE);
+    paramsCustomizer.accept(taskParams);
+    return createUniverse(taskParams);
+  }
+
+  protected Universe createUniverse(UniverseDefinitionTaskParams taskParams)
+      throws InterruptedException {
+    taskParams.expectedUniverseVersion = -1;
+    UniverseResp universeResp = universeCRUDHandler.createUniverse(customer, taskParams);
+    TaskInfo taskInfo =
+        waitForTask(universeResp.taskUUID, Universe.getOrBadRequest(universeResp.universeUUID));
+    verifyUniverseTaskSuccess(taskInfo);
+    Universe result = Universe.getOrBadRequest(universeResp.universeUUID);
+    assertEquals(
+        result.getUniverseDetails().getPrimaryCluster().userIntent.masterGFlags,
+        GFlagsUtil.getBaseGFlags(
+            UniverseTaskBase.ServerType.MASTER,
+            result.getUniverseDetails().getPrimaryCluster(),
+            result.getUniverseDetails().clusters));
+    assertEquals(
+        result.getUniverseDetails().getPrimaryCluster().userIntent.tserverGFlags,
+        GFlagsUtil.getBaseGFlags(
+            UniverseTaskBase.ServerType.TSERVER,
+            result.getUniverseDetails().getPrimaryCluster(),
+            result.getUniverseDetails().clusters));
+    return result;
+  }
+
+  protected void initYSQL(Universe universe) {
+    initYSQL(universe, "some_table");
+  }
+
+  protected void initYSQL(Universe universe, String tableName) {
+    initYSQL(universe, tableName, null);
+  }
+
+  protected void initYSQL(Universe universe, String tableName, String tablespace) {
+    initYSQL(
+        universe,
+        tableName,
+        tablespace,
+        universe.getUniverseDetails().getPrimaryCluster().userIntent.isYSQLAuthEnabled());
+  }
+
+  protected void initYSQL(
+      Universe universe, String tableName, String tablespace, boolean authEnabled) {
+    NodeDetails nodeDetails =
+        universe.getUniverseDetails().nodeDetailsSet.stream()
+            .filter(n -> n.state.equals(NodeDetails.NodeState.Live))
+            .findFirst()
+            .orElse(null);
+    if (StringUtils.isBlank(tableName)) {
+      tableName = "some_table";
+    }
+    String createCommand;
+    if (tablespace != null) {
+      createCommand =
+          String.format(
+              "CREATE TABLE %s (id int, name text, age int) tablespace %s", tableName, tablespace);
+    } else {
+      createCommand =
+          String.format(
+              "CREATE TABLE %s (id int, name text, age int, PRIMARY KEY(id, name))", tableName);
+    }
+    ShellResponse response =
+        localNodeUniverseManager.runYsqlCommand(
+            nodeDetails, universe, YUGABYTE_DB, createCommand, 10, authEnabled);
+    assertTrue(response.getMessage(), response.isSuccess());
+    response =
+        localNodeUniverseManager.runYsqlCommand(
+            nodeDetails,
+            universe,
+            YUGABYTE_DB,
+            String.format(
+                "insert into %s values (1, 'John', 20), "
+                    + "(2, 'Mary', 18), (10000, 'Stephen', 50)",
+                tableName),
+            10,
+            authEnabled);
+    assertTrue(response.isSuccess());
+  }
+
+  protected void verifyYSQL(Universe universe) {
+    verifyYSQL(universe, false);
+  }
+
+  protected void verifyYSQL(Universe universe, boolean readFromRR) {
+    verifyYSQL(universe, readFromRR, YUGABYTE_DB);
+  }
+
+  protected void verifyYSQL(Universe universe, boolean readFromRR, String dbName) {
+    verifyYSQL(universe, readFromRR, dbName, "some_table");
+  }
+
+  protected void verifyYSQL(
+      Universe universe, boolean readFromRR, String dbName, String tableName) {
+    boolean authEnabled =
+        universe.getUniverseDetails().getPrimaryCluster().userIntent.isYSQLAuthEnabled();
+    verifyYSQL(universe, readFromRR, dbName, tableName, authEnabled);
+  }
+
+  protected void verifyYSQL(
+      Universe universe, boolean readFromRR, String dbName, String tableName, boolean authEnabled) {
+    verifyYSQL(
+        universe,
+        readFromRR,
+        dbName,
+        tableName,
+        authEnabled,
+        universe.getUniverseDetails().getPrimaryCluster().userIntent.enableConnectionPooling);
+  }
+
+  protected void verifyYSQL(
+      Universe universe,
+      boolean readFromRR,
+      String dbName,
+      String tableName,
+      boolean authEnabled,
+      boolean cpEnabled) {
+    universe = Universe.getOrBadRequest(universe.getUniverseUUID());
+    if (StringUtils.isBlank(tableName)) {
+      tableName = "some_table";
+    }
+    UUID cluserUUID =
+        readFromRR
+            ? universe.getUniverseDetails().getReadOnlyClusters().get(0).uuid
+            : universe.getUniverseDetails().getPrimaryCluster().uuid;
+    NodeDetails nodeDetails =
+        universe.getUniverseDetails().nodeDetailsSet.stream()
+            .filter(n -> n.isInPlacement(cluserUUID) && n.state.equals(NodeDetails.NodeState.Live))
+            .findFirst()
+            .get();
+    ShellResponse response =
+        localNodeUniverseManager.runYsqlCommand(
+            nodeDetails,
+            universe,
+            dbName,
+            String.format("select count(*) from %s", tableName),
+            10,
+            authEnabled,
+            cpEnabled);
+    assertTrue(response.isSuccess());
+    assertEquals("3", CommonUtils.extractJsonisedSqlResponse(response).trim());
+    // Check universe sequence and DB sequence number
+  }
+
+  protected void initYCQL(Universe universe) {
+    initYCQL(universe, false, "");
+  }
+
+  protected void initYCQL(Universe universe, boolean authEnabled, String password) {
+    RunQueryFormData formData = new RunQueryFormData();
+    // Create `yugabyte` keyspace.
+    formData.setQuery("CREATE KEYSPACE IF NOT EXISTS yugabyte;");
+    formData.setTableType(TableType.YQL_TABLE_TYPE);
+    executeYcqlQueryWithRetry(universe, formData, authEnabled, password);
+
+    // Create table.
+    formData.setQuery(
+        "CREATE TABLE IF NOT EXISTS yugabyte.some_table (id int, name text, age int, PRIMARY"
+            + " KEY((id, name)));");
+    executeYcqlQueryWithRetry(universe, formData, authEnabled, password);
+
+    // Insert Data.
+    formData.setQuery("INSERT INTO yugabyte.some_table (id, name, age) VALUES (1, 'John', 20);");
+    executeYcqlQueryWithRetry(universe, formData, authEnabled, password);
+
+    formData.setQuery("INSERT INTO yugabyte.some_table (id, name, age) VALUES (2, 'Mary', 18);");
+    executeYcqlQueryWithRetry(universe, formData, authEnabled, password);
+
+    formData.setQuery(
+        "INSERT INTO yugabyte.some_table (id, name, age) VALUES (10000, 'Stephen', 50);");
+    executeYcqlQueryWithRetry(universe, formData, authEnabled, password);
+  }
+
+  private void executeYcqlQueryWithRetry(
+      Universe universe, RunQueryFormData formData, boolean authEnabled, String password) {
+    doWithRetry(
+        Duration.ofSeconds(1),
+        Duration.ofSeconds(60),
+        () -> {
+          JsonNode response =
+              ycqlQueryExecutor.executeQuery(
+                  universe, formData, authEnabled, Util.DEFAULT_YCQL_USERNAME, password);
+          if (response.has("error")) {
+            throw new RuntimeException(response.get("error").asText());
+          }
+        });
+  }
+
+  protected void verifyYCQL(Universe universe) {
+    verifyYCQL(universe, false, "");
+  }
+
+  protected void verifyYCQL(Universe universe, boolean authEnabled, String password) {
+    RunQueryFormData formData = new RunQueryFormData();
+    formData.setQuery("select count(*) from yugabyte.some_table;");
+    formData.setTableType(TableType.YQL_TABLE_TYPE);
+
+    JsonNode response =
+        ycqlQueryExecutor.executeQuery(
+            universe, formData, authEnabled, Util.DEFAULT_YCQL_USERNAME, password);
+    assertFalse(response.has("error"));
+    assertEquals("3", response.get("result").get(0).get("count").asText());
+  }
+
+  protected TaskInfo doAddReadReplica(
+      Universe universe, UniverseDefinitionTaskParams.UserIntent userIntent)
+      throws InterruptedException {
+    TaskInfo taskInfo = addReadReplica(universe, userIntent);
+    verifyUniverseTaskSuccess(taskInfo);
+    return taskInfo;
+  }
+
+  protected TaskInfo addReadReplica(
+      Universe universe, UniverseDefinitionTaskParams.UserIntent userIntent)
+      throws InterruptedException {
+    UniverseDefinitionTaskParams.Cluster asyncCluster =
+        new UniverseDefinitionTaskParams.Cluster(
+            UniverseDefinitionTaskParams.ClusterType.ASYNC, userIntent);
+
+    UniverseDefinitionTaskParams taskParams = new UniverseDefinitionTaskParams();
+    taskParams.setUniverseUUID(universe.getUniverseUUID());
+    taskParams.clusters =
+        new ArrayList<>(
+            Arrays.asList(universe.getUniverseDetails().getPrimaryCluster(), asyncCluster));
+    taskParams.nodeDetailsSet = universe.getUniverseDetails().nodeDetailsSet;
+    taskParams.expectedUniverseVersion = -1;
+
+    PlacementInfoUtil.updateUniverseDefinition(
+        taskParams, customer.getId(), asyncCluster.uuid, CREATE);
+
+    taskParams.clusters =
+        new ArrayList<>(Collections.singletonList(taskParams.getClusterByUuid(asyncCluster.uuid)));
+    taskParams.nodeDetailsSet =
+        taskParams.nodeDetailsSet.stream()
+            .filter(n -> n.isInPlacement(asyncCluster.uuid))
+            .collect(Collectors.toSet());
+    taskParams.rootCA = universe.getUniverseDetails().rootCA;
+    TaskInfo taskInfo =
+        waitForTask(
+            universeCRUDHandler.createCluster(
+                customer, Universe.getOrBadRequest(universe.getUniverseUUID()), taskParams),
+            Universe.getOrBadRequest(universe.getUniverseUUID()));
+    return taskInfo;
+  }
+
+  protected TaskInfo destroyUniverse(Universe universe, Customer customer)
+      throws InterruptedException {
+    UUID taskID = universeCRUDHandler.destroy(customer, universe, true, false, false);
+    TaskInfo taskInfo = waitForTask(taskID, universe);
+    return taskInfo;
+  }
+
+  protected void verifyUniverseState(Universe universe) {
+    log.info("universe definition json {}", universe.getUniverseDetailsJson());
+    String certificate = universe.getCertificateNodetoNode();
+    verifyDNS(universe);
+    try (YBClientApi client =
+        ybClientService.getClient(universe.getMasterAddresses(), certificate)) {
+      GetMasterClusterConfigResponse masterClusterConfig = client.getMasterClusterConfig();
+      CatalogEntityInfo.SysClusterConfigEntryPB config = masterClusterConfig.getConfig();
+      UniverseDefinitionTaskParams universeDetails = universe.getUniverseDetails();
+      UniverseDefinitionTaskParams.Cluster primaryCluster = universeDetails.getPrimaryCluster();
+      ReplicationInfoPB replicationInfo = config.getReplicationInfo();
+      PlacementInfoPB liveReplicas = replicationInfo.getLiveReplicas();
+      if (primaryCluster.getOverallPlacement().hasRankOrdering()) {
+        Map<Integer, List<String>> prefs = new LinkedHashMap<>();
+        primaryCluster
+            .getOverallPlacement()
+            .azStream()
+            .filter(az -> az.leaderPreference > 0)
+            .sorted(Comparator.comparing(az -> az.leaderPreference))
+            .forEach(
+                az -> {
+                  List<String> lst = prefs.getOrDefault(az.leaderPreference, new ArrayList<>());
+                  lst.add(AvailabilityZone.getOrBadRequest(az.uuid).getCode());
+                  prefs.put(az.leaderPreference, lst);
+                });
+        Iterator<List<String>> it = prefs.values().iterator();
+        for (CommonNet.CloudInfoListPB cloudInfoListPB :
+            replicationInfo.getMultiAffinitizedLeadersList()) {
+          List<String> actual =
+              cloudInfoListPB.getZonesList().stream()
+                  .map(z -> z.getPlacementZone())
+                  .collect(Collectors.toList());
+          assertEquals(actual, it.next());
+        }
+      }
+      verifyAffinitized(primaryCluster, replicationInfo);
+      verifyCluster(universe, primaryCluster, liveReplicas);
+      verifyMasterAddresses(universe);
+      if (!universeDetails.getReadOnlyClusters().isEmpty()) {
+        UniverseDefinitionTaskParams.Cluster asyncCluster =
+            universeDetails.getReadOnlyClusters().get(0);
+        PlacementInfoPB readReplicas = replicationInfo.getReadReplicas(0);
+        verifyCluster(universe, asyncCluster, readReplicas);
+      }
+      if (waitForClusterToStabilize) {
+        RetryTaskUntilCondition condition =
+            new RetryTaskUntilCondition<>(
+                () -> {
+                  try {
+                    return CheckClusterConsistency.checkCurrentServers(
+                            client, universe, null, true, false)
+                        .getErrors();
+                  } catch (Exception e) {
+                    return Collections.singletonList("Got error: " + e.getMessage());
+                  }
+                },
+                List::isEmpty);
+        condition.retryUntilCond(10, TimeUnit.MINUTES.toSeconds(2));
+      }
+    } catch (Exception e) {
+      throw new RuntimeException(e);
+    }
+  }
+
+  private void verifyAffinitized(Cluster cluster, ReplicationInfoPB replicationInfo) {
+    if (cluster.placementInfo.hasRankOrdering()) {
+      Map<Integer, List<PlacementInfo.PlacementAZ>> ranks = new HashMap<>();
+      cluster
+          .placementInfo
+          .azStream()
+          .forEach(
+              az -> {
+                if (az.leaderPreference > 0) {
+                  List<PlacementInfo.PlacementAZ> lst =
+                      ranks.computeIfAbsent(az.leaderPreference, x -> new ArrayList<>());
+                  lst.add(az);
+                }
+              });
+      assertEquals(ranks.size(), replicationInfo.getMultiAffinitizedLeadersCount());
+      Iterator<CommonNet.CloudInfoListPB> iterator =
+          replicationInfo.getMultiAffinitizedLeadersList().iterator();
+      ranks.keySet().stream()
+          .sorted()
+          .forEach(
+              ord -> {
+                Set<String> placementAZS =
+                    ranks.get(ord).stream()
+                        .map(az -> AvailabilityZone.getOrBadRequest(az.uuid).getCode())
+                        .collect(Collectors.toSet());
+                CommonNet.CloudInfoListPB lst = iterator.next();
+                Set<String> cloudAZs =
+                    lst.getZonesList().stream()
+                        .map(z -> z.getPlacementZone())
+                        .collect(Collectors.toSet());
+                assertEquals(placementAZS, cloudAZs);
+              });
+    } else {
+      Set<String> affinitized =
+          cluster
+              .placementInfo
+              .azStream()
+              .filter(az -> az.isAffinitized)
+              .map(az -> AvailabilityZone.getOrBadRequest(az.uuid).getCode())
+              .collect(Collectors.toSet());
+      assertEquals(affinitized.size(), replicationInfo.getAffinitizedLeadersCount());
+      Set<String> affinitizedPbs =
+          replicationInfo.getAffinitizedLeadersList().stream()
+              .map(z -> z.getPlacementZone())
+              .collect(Collectors.toSet());
+      assertEquals(affinitized, affinitizedPbs);
+    }
+  }
+
+  protected void verifyCluster(
+      Universe universe, UniverseDefinitionTaskParams.Cluster cluster, PlacementInfoPB replicas) {
+    assertEquals(cluster.uuid.toString(), replicas.getPlacementUuid().toStringUtf8());
+    assertEquals(cluster.userIntent.replicationFactor, replicas.getNumReplicas());
+    Map<UUID, Integer> nodeCount = localNodeManager.getNodeCount(cluster.uuid);
+    Map<UUID, Integer> placementNodeCount =
+        PlacementInfoUtil.getAzUuidToNumNodes(cluster.placementInfo);
+    assertEquals(placementNodeCount, nodeCount);
+    Set<String> zones =
+        replicas.getPlacementBlocksList().stream()
+            .map(pb -> pb.getCloudInfo().getPlacementZone())
+            .collect(Collectors.toSet());
+    Set<String> placementZones =
+        cluster
+            .placementInfo
+            .azStream()
+            .map(az -> AvailabilityZone.getOrBadRequest(az.uuid).getCode())
+            .collect(Collectors.toSet());
+    assertEquals(zones, placementZones);
+
+    // verify node details matches cluster user intent
+    verifyNodeDetails(universe, cluster);
+  }
+
+  protected void verifyMasterAddresses(Universe universe) {
+    List<String> masterAddresses = new ArrayList<>();
+    for (NodeDetails node : universe.getNodes()) {
+      if (node.state.equals(NodeDetails.NodeState.Live) && node.isMaster) {
+        masterAddresses.add(node.cloudInfo.private_ip + ":7100");
+      }
+    }
+
+    for (NodeDetails node : universe.getNodes()) {
+      if (node.state.equals(NodeDetails.NodeState.Live)) {
+        Map<String, String> varz = getVarz(node, universe, UniverseTaskBase.ServerType.TSERVER);
+        String masterAddress = varz.getOrDefault("tserver_master_addrs", "");
+        String[] gFlagMasterAddress = masterAddress.split(",");
+        assertEquals(gFlagMasterAddress.length, masterAddresses.size());
+      }
+    }
+  }
+
+  protected Map<String, String> getVarz(
+      NodeDetails nodeDetails, Universe universe, UniverseTaskBase.ServerType serverType) {
+    return GFlagsUtil.getActualGFlags(
+        nodeDetails, serverType, universe, true, null, nodeUIApiHelper, false);
+  }
+
+  public Map<String, String> getDiskFlags(
+      NodeDetails nodeDetails, Universe universe, UniverseTaskBase.ServerType serverType) {
+    Map<String, String> results = new HashMap<>();
+    UniverseDefinitionTaskParams.UserIntent userIntent =
+        universe.getCluster(nodeDetails.placementUuid).userIntent;
+    String gflagsFile =
+        localNodeManager.getNodeGFlagsFile(
+            userIntent, serverType, localNodeManager.getNodeInfo(nodeDetails));
+    try (FileReader fr = new FileReader(gflagsFile);
+        BufferedReader br = new BufferedReader(fr)) {
+      String line;
+      while ((line = br.readLine()) != null) {
+        String[] split = line.split("=");
+        String key = split[0].substring(2);
+        String val = split.length == 1 ? "" : split[1];
+        results.put(key, val);
+      }
+    } catch (Exception e) {
+      throw new RuntimeException(e);
+    }
+    return results;
+  }
+
+  protected void restartUniverse(Universe universe, boolean rolling) throws InterruptedException {
+    RestartTaskParams restartTaskParams = new RestartTaskParams();
+    restartTaskParams.setUniverseUUID(universe.getUniverseUUID());
+    restartTaskParams.expectedUniverseVersion = -1;
+    restartTaskParams.upgradeOption =
+        rolling
+            ? UpgradeTaskParams.UpgradeOption.ROLLING_UPGRADE
+            : UpgradeTaskParams.UpgradeOption.NON_ROLLING_UPGRADE;
+    restartTaskParams.clusters = universe.getUniverseDetails().clusters;
+    UUID taskUUID = upgradeUniverseHandler.restartUniverse(restartTaskParams, customer, universe);
+    TaskInfo taskInfo = waitForTask(taskUUID, universe);
+    verifyUniverseTaskSuccess(taskInfo);
+  }
+
+  protected void verifyUniverseTaskSuccess(TaskInfo taskInfo) {
+    Universe universe =
+        Universe.getOrBadRequest(
+            UUID.fromString(taskInfo.getTaskParams().get("universeUUID").textValue()));
+    String separator = System.getProperty("line.separator");
+    StringBuilder errorBuilder = new StringBuilder();
+    if (taskInfo.getTaskState() != TaskInfo.State.Success) {
+      errorBuilder.append("Base task error: " + taskInfo.getErrorMessage());
+      List<String> failedTasksMessages = new ArrayList<>();
+      for (TaskInfo subTask : taskInfo.getSubTasks()) {
+        if (subTask.getTaskState() == TaskInfo.State.Failure) {
+          if (subTask.getTaskType() == TaskType.WaitForServer
+              || subTask.getTaskType() == TaskType.WaitForServerReady) {
+            String nodeName = subTask.getTaskParams().get("nodeName").textValue();
+            UniverseTaskBase.ServerType serverType =
+                UniverseTaskBase.ServerType.valueOf(
+                    subTask.getTaskParams().get("serverType").asText());
+            localNodeManager.dumpProcessOutput(universe, nodeName, serverType);
+          } else {
+            failedTasksMessages.add(
+                CommissionerBaseTest.getBriefTaskInfo(subTask) + ":" + subTask.getErrorMessage());
+          }
+        }
+      }
+      failedTasksMessages.forEach(t -> errorBuilder.append(separator).append(t));
+    }
+    if (taskInfo.getTaskState() != TaskInfo.State.Success) {
+      try {
+        log.debug("Dumping to log");
+        dumpToLog(universe);
+      } catch (InterruptedException e) {
+      }
+    }
+    assertEquals(errorBuilder.toString(), TaskInfo.State.Success, taskInfo.getTaskState());
+  }
+
+  protected String getMasterLeader(Universe universe) {
+    try (YBClientApi client =
+        ybClientService.getClient(
+            universe.getMasterAddresses(), universe.getCertificateNodetoNode())) {
+      HostAndPort leaderMasterHostAndPort = client.getLeaderMasterHostAndPort();
+      return leaderMasterHostAndPort.getHost();
+    } catch (Exception e) {
+      throw new RuntimeException(e);
+    }
+  }
+
+  protected void initAndStartPayload(Universe universe) {
+    simpleSqlPayload = new SimpleSqlPayload(5, 2, 200, universe);
+    simpleSqlPayload.init();
+    simpleSqlPayload.start();
+  }
+
+  protected void verifyPayload() {
+    simpleSqlPayload.stop();
+    assertThat("Low percent errors", simpleSqlPayload.getErrorPercent(), lessThan(0.3d));
+  }
+
+  protected SpecificGFlags getGFlags(String... additional) {
+    Map<String, String> masterGFlags = new HashMap<>(GFLAGS);
+    Map<String, String> tserverGFlags = new HashMap<>(GFLAGS);
+    for (int i = 0; i < additional.length / 2; i++) {
+      masterGFlags.put(additional[i], additional[i + 1]);
+      tserverGFlags.put(additional[i], additional[i + 1]);
+    }
+    // Remove master-only flags from tserver
+    tserverGFlags.remove(GFlagsUtil.LOAD_BALANCER_INITIAL_DELAY_SECS);
+    tserverGFlags.remove("transaction_table_num_tablets");
+    tserverGFlags.remove("load_balancer_max_over_replicated_tablets");
+    tserverGFlags.remove("load_balancer_max_concurrent_adds");
+    tserverGFlags.remove("load_balancer_max_concurrent_removals");
+    tserverGFlags.remove("load_balancer_max_concurrent_moves");
+    tserverGFlags.remove("catalog_manager_bg_task_wait_ms");
+    tserverGFlags.remove("blacklist_progress_initial_delay_secs");
+    return SpecificGFlags.construct(masterGFlags, tserverGFlags);
+  }
+
+  public static String getAllErrorsStr(TaskInfo taskInfo) {
+    StringBuilder sb = new StringBuilder(taskInfo.getErrorMessage());
+    for (TaskInfo subTask : taskInfo.getSubTasks()) {
+      if (!StringUtils.isEmpty(subTask.getErrorMessage())) {
+        sb.append("\n").append(subTask.getErrorMessage());
+      }
+    }
+    return sb.toString();
+  }
+
+  protected TaskInfo waitForTask(UUID taskUUID, Universe... universes) throws InterruptedException {
+    try {
+      return waitForTask(taskUUID);
+    } catch (Exception e) {
+      dumpToLog(universes);
+      throw new RuntimeException(e);
+    }
+  }
+
+  private void dumpToLog(Universe... universes) throws InterruptedException {
+    localNodeManager.checkAllProcessesAlive();
+    for (Universe universe : universes) {
+      Universe u = Universe.getOrBadRequest(universe.getUniverseUUID());
+      for (NodeDetails node : u.getNodes()) {
+        for (UniverseTaskBase.ServerType serverType : node.getAllProcesses()) {
+          localNodeManager.dumpProcessOutput(u, node.getNodeName(), serverType);
+        }
+        if (u.isYbcEnabled()) {
+          // Dump YBC logs as well.
+          localNodeManager.dumpProcessOutput(
+              u, node.getNodeName(), UniverseTaskBase.ServerType.CONTROLLER);
+        }
+      }
+    }
+    Thread.sleep(1000);
+  }
+
+  protected String getBackupBaseDirectory() {
+    return String.format("%s/%s/%s", baseDir, subDir, testName);
+  }
+
+  protected void killProcessesOnNode(UUID universeUuid, String nodeName)
+      throws IOException, InterruptedException {
+    Universe universe = Universe.getOrBadRequest(universeUuid);
+    NodeDetails node = universe.getNode(nodeName);
+    if (node.isTserver) {
+      localNodeManager.killProcess(nodeName, ServerType.TSERVER);
+    }
+    if (node.isMaster) {
+      localNodeManager.killProcess(nodeName, ServerType.MASTER);
+    }
+  }
+
+  protected void startProcessesOnNode(UUID universeUuid, String nodeName)
+      throws IOException, InterruptedException {
+    Universe universe = Universe.getOrBadRequest(universeUuid);
+    NodeDetails node = universe.getNode(nodeName);
+    if (node.isTserver) {
+      localNodeManager.startProcess(universeUuid, nodeName, ServerType.TSERVER);
+    }
+    if (node.isMaster) {
+      localNodeManager.startProcess(universeUuid, nodeName, ServerType.MASTER);
+    }
+  }
+
+  protected void killProcessOnNode(UUID universeUuid, String nodeName, ServerType serverType)
+      throws IOException, InterruptedException {
+    Universe universe = Universe.getOrBadRequest(universeUuid);
+    NodeDetails node = universe.getNode(nodeName);
+    if (serverType == ServerType.TSERVER) {
+      if (!node.isTserver) {
+        throw new IllegalArgumentException("Server type " + serverType + " is not running");
+      }
+    } else if (serverType == ServerType.MASTER) {
+      if (!node.isMaster) {
+        throw new IllegalArgumentException("Server type " + serverType + " is not running");
+      }
+    } else {
+      throw new IllegalArgumentException("Server type " + serverType + " is not supported");
+    }
+    localNodeManager.killProcess(nodeName, serverType);
+  }
+
+  protected void startProcessesOnNode(
+      UUID universeUuid, NodeDetails node, UniverseTaskBase.ServerType serverType)
+      throws IOException, InterruptedException {
+    localNodeManager.startProcess(universeUuid, node.getNodeName(), serverType);
+  }
+
+  protected boolean isMasterProcessRunning(String nodeName) {
+    return localNodeManager.isProcessRunning(nodeName, ServerType.MASTER);
+  }
+
+  protected void waitTillNumOfTservers(YBClientApi ybClient, int expected) {
+    RetryTaskUntilCondition<Integer> condition =
+        new RetryTaskUntilCondition<>(
+            () -> getNumberOfTservers(ybClient), (num) -> num == expected);
+    boolean success = condition.retryUntilCond(500, TimeUnit.SECONDS.toMillis(60));
+    if (!success) {
+      throw new RuntimeException("Failed to wait till expected number of tservers");
+    }
+  }
+
+  protected Integer getNumberOfTservers(YBClientApi ybClient) {
+    try {
+      return ybClient.listTabletServers().getTabletServersCount();
+    } catch (Exception e) {
+      return 0;
+    }
+  }
+
+  // This method waits for the next task to complete.
+  protected TaskInfo waitForNextTask(UUID universeUuid, UUID lastTaskUuid, Duration timeout)
+      throws InterruptedException {
+    Stopwatch stopwatch = Stopwatch.createStarted();
+    do {
+      Universe universe = Universe.getOrBadRequest(universeUuid);
+      UniverseDefinitionTaskParams details = universe.getUniverseDetails();
+      if (details.placementModificationTaskUuid != null
+          && !lastTaskUuid.equals(details.placementModificationTaskUuid)) {
+        // A new task has already started, wait for it to complete.
+        TaskInfo taskInfo = TaskInfo.getOrBadRequest(details.placementModificationTaskUuid);
+        return waitForTask(taskInfo.getUuid());
+      }
+      CustomerTask customerTask = CustomerTask.getLastTaskByTargetUuid(universeUuid);
+      if (!lastTaskUuid.equals(customerTask.getTaskUUID())) {
+        // Last task has already completed.
+        return TaskInfo.getOrBadRequest(customerTask.getTaskUUID());
+      }
+      Thread.sleep(1000);
+    } while (stopwatch.elapsed().compareTo(timeout) < 0);
+    throw new RuntimeException("Timed-out waiting for next task to start");
+  }
+
+  protected void moveAZ(PlacementInfo placementInfo, UUID sourceUUID, UUID targetUUID) {
+    placementInfo
+        .azStream()
+        .filter(az -> az.uuid.equals(sourceUUID))
+        .forEach(az -> az.uuid = targetUUID);
+  }
+
+  protected void verifyNodeModifications(Universe universe, int added, int removed) {
+    assertEquals(
+        added,
+        universe.getUniverseDetails().nodeDetailsSet.stream()
+            .filter(n -> n.state == NodeDetails.NodeState.ToBeAdded)
+            .count());
+    assertEquals(
+        removed,
+        universe.getUniverseDetails().nodeDetailsSet.stream()
+            .filter(n -> n.state == NodeDetails.NodeState.ToBeRemoved)
+            .count());
+  }
+
+  protected Pair<Long, Long> verifyNodeDetails(Universe universe, Cluster cluster) {
+    // (numMasters, numTservers)
+    Pair<Long, Long> nodeCounts =
+        new Pair(
+            universe.getNodes().stream()
+                .filter(n -> n.placementUuid.equals(cluster.uuid) && n.isMaster)
+                .count(),
+            universe.getNodes().stream()
+                .filter(n -> n.placementUuid.equals(cluster.uuid) && n.isTserver)
+                .count());
+    boolean allNodesLive = universe.getNodes().stream().allMatch(n -> n.state == NodeState.Live);
+    log.info(
+        "Verifying node details for cluster {}, numMasters {}, numTservers {}, allNodesLive {}",
+        cluster.uuid,
+        nodeCounts.getFirst(),
+        nodeCounts.getSecond(),
+        allNodesLive);
+
+    if (allNodesLive) {
+      assertEquals(nodeCounts.getSecond().intValue(), cluster.userIntent.numNodes);
+
+      if (cluster.clusterType == UniverseDefinitionTaskParams.ClusterType.PRIMARY
+          && cluster.userIntent.dedicatedNodes) {
+        assertEquals(nodeCounts.getFirst().intValue(), cluster.userIntent.replicationFactor);
+      }
+    }
+    return nodeCounts;
+  }
+
+  protected void verifyMasterLBStatus(
+      Customer customer, Universe universe, boolean isEnabled, boolean isLoadBalancerIdle) {
+    MetaMasterHandler metaMasterHandler = app.injector().instanceOf(MetaMasterHandler.class);
+    MasterLBStateResponse resp =
+        metaMasterHandler.getMasterLBState(customer.getUuid(), universe.getUniverseUUID());
+    assertEquals(resp.isEnabled, isEnabled);
+    assertEquals(resp.isIdle, isLoadBalancerIdle);
+  }
+
+  protected TableSpaceStructures.TableSpaceInfo initTablespace(
+      String name, Object... zonesAndCounts) {
+    TableSpaceStructures.TableSpaceInfo tableSpaceInfo = new TableSpaceStructures.TableSpaceInfo();
+    tableSpaceInfo.name = name;
+    tableSpaceInfo.placementBlocks = new ArrayList<>();
+    int rf = 0;
+    for (int i = 0; i < zonesAndCounts.length / 2; i++) {
+      UUID zoneUUID = (UUID) zonesAndCounts[i * 2];
+      Integer replicas = (Integer) zonesAndCounts[i * 2 + 1];
+      AvailabilityZone zone = AvailabilityZone.getOrBadRequest(zoneUUID);
+      TableSpaceStructures.PlacementBlock placementBlock =
+          new TableSpaceStructures.PlacementBlock();
+      placementBlock.zone = zone.getCode();
+      placementBlock.region = zone.getRegion().getCode();
+      placementBlock.cloud = zone.getRegion().getProviderCloudCode().name();
+      placementBlock.minNumReplicas = replicas;
+      tableSpaceInfo.placementBlocks.add(placementBlock);
+      rf += replicas;
+    }
+    tableSpaceInfo.numReplicas = rf;
+    return tableSpaceInfo;
+  }
+
+  private void verifyDNS(Universe universe) {
+    UUID providerUUID =
+        Util.getSingleProviderUUID(universe.getUniverseDetails().getPrimaryCluster());
+    Provider curProvider = Provider.getOrBadRequest(providerUUID);
+    if (curProvider.getDetails().getCloudInfo().local.getHostedZoneId() != null) {
+      Set<String> dns = localDnsManager.ipsList.getOrDefault(providerUUID, Collections.emptySet());
+      Set<NodeDetails> nodes = universe.getUniverseDetails().getTServers();
+      if (dns.size() != nodes.size()) {
+        throw new IllegalStateException(
+            "Dns doesn't match nodes: "
+                + dns
+                + " vs "
+                + nodes.stream().map(n -> n.cloudInfo.private_ip).collect(Collectors.toSet()));
+      }
+      for (NodeDetails node : nodes) {
+        if (!dns.contains(node.cloudInfo.private_ip)) {
+          throw new RuntimeException(
+              "Node " + node.cloudInfo.private_ip + " is not in accessible the dns list " + dns);
+        }
+      }
+    }
+  }
+
+  public void doWithRetry(
+      Function<Duration, Duration> waitBeforeRetryFunct, Duration timeout, Runnable funct)
+      throws RuntimeException {
+    long currentDelayMs = 0;
+    long timeoutMs = timeout.toMillis();
+    long startTime = System.currentTimeMillis();
+    while (true) {
+      currentDelayMs = waitBeforeRetryFunct.apply(Duration.ofMillis(currentDelayMs)).toMillis();
+      try {
+        funct.run();
+        return;
+      } catch (UnrecoverableException e) {
+        log.error(
+            "Won't retry; Unrecoverable error while running the function: {}", e.getMessage());
+        throw e;
+      } catch (Exception e) {
+        if (System.currentTimeMillis() < startTime + timeoutMs - currentDelayMs) {
+          log.warn("Will retry; Error while running the function: {}", e.getMessage());
+        } else {
+          log.error("Retry timed out; Error while running the function: {}", e.getMessage());
+          Throwables.propagate(e);
+        }
+      }
+      log.debug(
+          "Waiting for {} ms between retry, total delay remaining {} ms",
+          currentDelayMs,
+          timeoutMs - (System.currentTimeMillis() - startTime));
+      try {
+        // Busy waiting is okay here since this is being used in tests.
+        Thread.sleep(currentDelayMs);
+      } catch (InterruptedException e) {
+        log.error("Interrupted while waiting for retry", e);
+        throw new RuntimeException(e);
+      }
+    }
+  }
+
+  protected void doWithRetry(Duration waitBeforeRetry, Duration timeout, Runnable funct) {
+    doWithRetry((prevDelay) -> waitBeforeRetry, timeout, funct);
+  }
+}

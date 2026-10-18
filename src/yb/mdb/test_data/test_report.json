@@ -1,0 +1,485 @@
+{
+  "summary": {
+    "total": 53,
+    "passed": 30,
+    "failed": 21,
+    "errors": 2,
+    "success_rate": 56.6,
+    "avg_time_ms": 1336.0,
+    "min_time_ms": 155.7,
+    "max_time_ms": 60496.5
+  },
+  "by_category": {
+    "Basic Graph Pattern": {
+      "total": 9,
+      "passed": 2,
+      "failed": 7,
+      "errors": 0
+    },
+    "FILTER": {
+      "total": 4,
+      "passed": 3,
+      "failed": 1,
+      "errors": 0
+    },
+    "ORDER BY": {
+      "total": 2,
+      "passed": 0,
+      "failed": 2,
+      "errors": 0
+    },
+    "DISTINCT": {
+      "total": 2,
+      "passed": 2,
+      "failed": 0,
+      "errors": 0
+    },
+    "UNION": {
+      "total": 2,
+      "passed": 0,
+      "failed": 2,
+      "errors": 0
+    },
+    "Multiple Triple Patterns": {
+      "total": 11,
+      "passed": 9,
+      "failed": 1,
+      "errors": 1
+    },
+    "OPTIONAL": {
+      "total": 1,
+      "passed": 0,
+      "failed": 1,
+      "errors": 0
+    },
+    "Property Paths": {
+      "total": 3,
+      "passed": 2,
+      "failed": 0,
+      "errors": 1
+    },
+    "Built-in Functions": {
+      "total": 5,
+      "passed": 3,
+      "failed": 2,
+      "errors": 0
+    },
+    "Complex Queries": {
+      "total": 6,
+      "passed": 6,
+      "failed": 0,
+      "errors": 0
+    },
+    "Edge Cases": {
+      "total": 5,
+      "passed": 3,
+      "failed": 2,
+      "errors": 0
+    },
+    "LIMIT / OFFSET": {
+      "total": 3,
+      "passed": 0,
+      "failed": 3,
+      "errors": 0
+    }
+  },
+  "details": {
+    "Basic Graph Pattern": [
+      {
+        "name": "BGP-01: All companies",
+        "status": "FAIL",
+        "rows": 1,
+        "expected_min": 20,
+        "time_s": 0.1843
+      },
+      {
+        "name": "BGP-02: All persons",
+        "status": "FAIL",
+        "rows": 1,
+        "expected_min": 40,
+        "time_s": 0.1824
+      },
+      {
+        "name": "BGP-03: All products",
+        "status": "FAIL",
+        "rows": 1,
+        "expected_min": 20,
+        "time_s": 0.1674
+      },
+      {
+        "name": "BGP-04: All technologies",
+        "status": "FAIL",
+        "rows": 1,
+        "expected_min": 20,
+        "time_s": 0.1666
+      },
+      {
+        "name": "BGP-05: All departments",
+        "status": "FAIL",
+        "rows": 1,
+        "expected_min": 10,
+        "time_s": 0.1557
+      },
+      {
+        "name": "BGP-06: All cities",
+        "status": "FAIL",
+        "rows": 1,
+        "expected_min": 15,
+        "time_s": 0.1752
+      },
+      {
+        "name": "BGP-07: All projects",
+        "status": "FAIL",
+        "rows": 1,
+        "expected_min": 15,
+        "time_s": 0.1681
+      },
+      {
+        "name": "BGP-08: Company labels",
+        "status": "PASS",
+        "rows": 20,
+        "expected_min": 20,
+        "time_s": 0.1585
+      },
+      {
+        "name": "BGP-09: Person labels",
+        "status": "PASS",
+        "rows": 40,
+        "expected_min": 40,
+        "time_s": 0.1567
+      }
+    ],
+    "FILTER": [
+      {
+        "name": "FILTER-01: Companies in Beijing",
+        "status": "PASS",
+        "rows": 0,
+        "expected_min": 0,
+        "time_s": 0.1562
+      },
+      {
+        "name": "FILTER-02: Companies NOT in Beijing",
+        "status": "PASS",
+        "rows": 0,
+        "expected_min": 0,
+        "time_s": 0.1584
+      },
+      {
+        "name": "FILTER-03: Persons who know someone",
+        "status": "PASS",
+        "rows": 16,
+        "expected_min": 1,
+        "time_s": 0.1821
+      },
+      {
+        "name": "FILTER-04: FILTER with same-term",
+        "status": "FAIL",
+        "rows": 0,
+        "expected_min": 20,
+        "time_s": 0.1644
+      }
+    ],
+    "ORDER BY": [
+      {
+        "name": "ORDER-01: All companies ordered",
+        "status": "FAIL",
+        "rows": 1,
+        "expected_min": 20,
+        "time_s": 0.1746
+      },
+      {
+        "name": "ORDER-02: All persons ordered",
+        "status": "FAIL",
+        "rows": 1,
+        "expected_min": 40,
+        "time_s": 0.1627
+      }
+    ],
+    "DISTINCT": [
+      {
+        "name": "DISTINCT-01: Distinct cities",
+        "status": "PASS",
+        "rows": 3,
+        "expected_min": 1,
+        "time_s": 0.1621
+      },
+      {
+        "name": "DISTINCT-02: Distinct companies hiring",
+        "status": "PASS",
+        "rows": 19,
+        "expected_min": 1,
+        "time_s": 0.1658
+      }
+    ],
+    "UNION": [
+      {
+        "name": "UNION-01: Companies or Persons",
+        "status": "FAIL",
+        "rows": 0,
+        "expected_min": 60,
+        "time_s": 0.1616
+      },
+      {
+        "name": "UNION-02: Products or Technologies",
+        "status": "FAIL",
+        "rows": 0,
+        "expected_min": 40,
+        "time_s": 0.1659
+      }
+    ],
+    "Multiple Triple Patterns": [
+      {
+        "name": "MTP-01: Person works for a company",
+        "status": "ERROR",
+        "rows": 0,
+        "expected_min": 40,
+        "time_s": 60.4965,
+        "error": "TIMEOUT"
+      },
+      {
+        "name": "MTP-02: Company develops product",
+        "status": "PASS",
+        "rows": 12,
+        "expected_min": 1,
+        "time_s": 0.2295
+      },
+      {
+        "name": "MTP-03: Product uses technology",
+        "status": "PASS",
+        "rows": 20,
+        "expected_min": 1,
+        "time_s": 0.1751
+      },
+      {
+        "name": "MTP-04: Company location",
+        "status": "FAIL",
+        "rows": 3,
+        "expected_min": 20,
+        "time_s": 0.1912
+      },
+      {
+        "name": "MTP-05: Manager manages person",
+        "status": "PASS",
+        "rows": 12,
+        "expected_min": 1,
+        "time_s": 0.2033
+      },
+      {
+        "name": "MTP-06: Company funds project",
+        "status": "PASS",
+        "rows": 6,
+        "expected_min": 1,
+        "time_s": 0.1976
+      },
+      {
+        "name": "MTP-07: Department partOf company",
+        "status": "PASS",
+        "rows": 8,
+        "expected_min": 1,
+        "time_s": 0.1822
+      },
+      {
+        "name": "MTP-08: Project uses technology",
+        "status": "PASS",
+        "rows": 20,
+        "expected_min": 1,
+        "time_s": 0.1892
+      },
+      {
+        "name": "MTP-09: Person located in city",
+        "status": "PASS",
+        "rows": 14,
+        "expected_min": 1,
+        "time_s": 0.2377
+      },
+      {
+        "name": "MTP-10: Company founded by person",
+        "status": "PASS",
+        "rows": 6,
+        "expected_min": 1,
+        "time_s": 0.1651
+      },
+      {
+        "name": "MTP-11: Company collaboration",
+        "status": "PASS",
+        "rows": 5,
+        "expected_min": 1,
+        "time_s": 0.1704
+      }
+    ],
+    "OPTIONAL": [
+      {
+        "name": "OPT-01: Person with optional location",
+        "status": "FAIL",
+        "rows": 0,
+        "expected_min": 40,
+        "time_s": 0.173
+      }
+    ],
+    "Property Paths": [
+      {
+        "name": "PP-01: Inverse: who works for a company",
+        "status": "ERROR",
+        "rows": 0,
+        "expected_min": 1,
+        "time_s": 1.4631,
+        "error": "WARNING: Logging before InitGoogleLogging() is written to STDERR\nI0510 23:07:26.305109 3032806 mdb_adapter.cc:449] Connecting to masters at 127.0.0.1:7100\nI0510 23:07:26.305874 3032806 mem_tracker.cc:"
+      },
+      {
+        "name": "PP-02: Zero-or-more: type chain",
+        "status": "PASS",
+        "rows": 0,
+        "expected_min": 0,
+        "time_s": 0.1697
+      },
+      {
+        "name": "PP-03: One-or-more: type chain",
+        "status": "PASS",
+        "rows": 0,
+        "expected_min": 0,
+        "time_s": 0.1707
+      }
+    ],
+    "Built-in Functions": [
+      {
+        "name": "BF-01: isIRI check",
+        "status": "FAIL",
+        "rows": 0,
+        "expected_min": 20,
+        "time_s": 0.1684
+      },
+      {
+        "name": "BF-02: BOUND check",
+        "status": "FAIL",
+        "rows": 1,
+        "expected_min": 20,
+        "time_s": 0.1706
+      },
+      {
+        "name": "BF-03: REGEX on label",
+        "status": "PASS",
+        "rows": 0,
+        "expected_min": 0,
+        "time_s": 0.1725
+      },
+      {
+        "name": "BF-04: STRSTARTS",
+        "status": "PASS",
+        "rows": 0,
+        "expected_min": 0,
+        "time_s": 0.166
+      },
+      {
+        "name": "BF-05: CONTAINS",
+        "status": "PASS",
+        "rows": 0,
+        "expected_min": 0,
+        "time_s": 0.1601
+      }
+    ],
+    "Complex Queries": [
+      {
+        "name": "COM-01: Person-Company-City chain",
+        "status": "PASS",
+        "rows": 19,
+        "expected_min": 1,
+        "time_s": 0.1709
+      },
+      {
+        "name": "COM-02: Product supply chain",
+        "status": "PASS",
+        "rows": 9,
+        "expected_min": 1,
+        "time_s": 0.1611
+      },
+      {
+        "name": "COM-03: Manager chain",
+        "status": "PASS",
+        "rows": 12,
+        "expected_min": 0,
+        "time_s": 0.1627
+      },
+      {
+        "name": "COM-04: Know who works where",
+        "status": "PASS",
+        "rows": 16,
+        "expected_min": 0,
+        "time_s": 0.1924
+      },
+      {
+        "name": "COM-05: Founded company location",
+        "status": "PASS",
+        "rows": 6,
+        "expected_min": 0,
+        "time_s": 0.1675
+      },
+      {
+        "name": "COM-06: Funded project technology",
+        "status": "PASS",
+        "rows": 4,
+        "expected_min": 0,
+        "time_s": 0.1715
+      }
+    ],
+    "Edge Cases": [
+      {
+        "name": "EDGE-01: SELECT * all triples",
+        "status": "PASS",
+        "rows": 393,
+        "expected_min": 1,
+        "time_s": 0.1973
+      },
+      {
+        "name": "EDGE-02: Empty result expected",
+        "status": "PASS",
+        "rows": 0,
+        "expected_min": 0,
+        "time_s": 0.1663
+      },
+      {
+        "name": "EDGE-03: Self-referential sameTerm",
+        "status": "FAIL",
+        "rows": 0,
+        "expected_min": 20,
+        "time_s": 0.1591
+      },
+      {
+        "name": "EDGE-04: Multiple FILTER conditions",
+        "status": "FAIL",
+        "rows": 0,
+        "expected_min": 20,
+        "time_s": 0.1662
+      },
+      {
+        "name": "EDGE-05: Label retrieval for all types",
+        "status": "PASS",
+        "rows": 80,
+        "expected_min": 1,
+        "time_s": 0.1603
+      }
+    ],
+    "LIMIT / OFFSET": [
+      {
+        "name": "LIMIT-01: Top 5 companies",
+        "status": "FAIL",
+        "rows": 1,
+        "expected_min": 5,
+        "time_s": 0.1679
+      },
+      {
+        "name": "LIMIT-02: Companies page 2 (offset 5 limit 5)",
+        "status": "FAIL",
+        "rows": 1,
+        "expected_min": 5,
+        "time_s": 0.1756
+      },
+      {
+        "name": "LIMIT-03: First 3 persons",
+        "status": "FAIL",
+        "rows": 1,
+        "expected_min": 3,
+        "time_s": 0.1676
+      }
+    ]
+  }
+}

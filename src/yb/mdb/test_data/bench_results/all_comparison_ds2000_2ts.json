@@ -1,0 +1,1214 @@
+{
+  "dataset": "ds2000",
+  "tservers": 2,
+  "total_queries": 131,
+  "valid_pairs": 100,
+  "yb_stats": {
+    "min": 543.3855056762695,
+    "max": 1423.9778518676758,
+    "mean": 798.0229306221008,
+    "p50": 727.2418737411499,
+    "p90": 1173.3234167099,
+    "p95": 1228.4222602844238,
+    "p99": 1410.2451348304749
+  },
+  "mdb_stats": {
+    "min": 1.8222332000732422,
+    "max": 21.686792373657227,
+    "mean": 4.919881820678711,
+    "p50": 3.9758682250976562,
+    "p90": 7.910799980163576,
+    "p95": 10.482001304626463,
+    "p99": 18.036284446716326
+  },
+  "ratio_stats": {
+    "min": 33.17952182263726,
+    "max": 488.4383449031787,
+    "mean": 201.10139877216545,
+    "p50": 185.38134628773958,
+    "p90": 346.5857010549102,
+    "p95": 408.1138120833496,
+    "p99": 482.69217344183977
+  },
+  "results": [
+    {
+      "id": 1,
+      "category": "1. Basic Graph Pattern (BGP)",
+      "label": "SELECT *",
+      "yb_ms": 1048.0329990386963,
+      "mdb_ms": 21.686792373657227,
+      "yb_error": null,
+      "mdb_error": null
+    },
+    {
+      "id": 2,
+      "category": "1. Basic Graph Pattern (BGP)",
+      "label": "SELECT specific vars",
+      "yb_ms": 954.275369644165,
+      "mdb_ms": 5.2490234375,
+      "yb_error": null,
+      "mdb_error": null
+    },
+    {
+      "id": 3,
+      "category": "1. Basic Graph Pattern (BGP)",
+      "label": "SELECT with predicate",
+      "yb_ms": 963.8128280639648,
+      "mdb_ms": 10.454416275024414,
+      "yb_error": null,
+      "mdb_error": null
+    },
+    {
+      "id": 4,
+      "category": "1. Basic Graph Pattern (BGP)",
+      "label": "SELECT with literal",
+      "yb_ms": 926.6700744628906,
+      "mdb_ms": 3.7462711334228516,
+      "yb_error": null,
+      "mdb_error": null
+    },
+    {
+      "id": 5,
+      "category": "2. FILTER - Type Functions",
+      "label": "isIRI",
+      "yb_ms": 1173.2594966888428,
+      "mdb_ms": 10.313987731933594,
+      "yb_error": null,
+      "mdb_error": null
+    },
+    {
+      "id": 6,
+      "category": "2. FILTER - Type Functions",
+      "label": "isLiteral",
+      "yb_ms": 866.6515350341797,
+      "mdb_ms": 3.731250762939453,
+      "yb_error": null,
+      "mdb_error": null
+    },
+    {
+      "id": 7,
+      "category": "2. FILTER - Type Functions",
+      "label": "isBlank (negative)",
+      "yb_ms": 1274.9249935150146,
+      "mdb_ms": 2.6102066040039062,
+      "yb_error": null,
+      "mdb_error": null
+    },
+    {
+      "id": 8,
+      "category": "2. FILTER - Type Functions",
+      "label": "BOUND",
+      "yb_ms": 647.4630832672119,
+      "mdb_ms": 3.7457942962646484,
+      "yb_error": null,
+      "mdb_error": null
+    },
+    {
+      "id": 9,
+      "category": "2. FILTER - Type Functions",
+      "label": "!BOUND + OPTIONAL",
+      "yb_ms": 1410.1064205169678,
+      "mdb_ms": 3.658294677734375,
+      "yb_error": null,
+      "mdb_error": null
+    },
+    {
+      "id": 10,
+      "category": "3. FILTER - String Functions",
+      "label": "REGEX",
+      "yb_ms": 731.9953441619873,
+      "mdb_ms": 5.690813064575195,
+      "yb_error": null,
+      "mdb_error": null
+    },
+    {
+      "id": 11,
+      "category": "3. FILTER - String Functions",
+      "label": "STRSTARTS",
+      "yb_ms": 726.4797687530518,
+      "mdb_ms": 4.6234130859375,
+      "yb_error": null,
+      "mdb_error": null
+    },
+    {
+      "id": 12,
+      "category": "3. FILTER - String Functions",
+      "label": "STRENDS",
+      "yb_ms": 749.8602867126465,
+      "mdb_ms": 5.224943161010742,
+      "yb_error": null,
+      "mdb_error": null
+    },
+    {
+      "id": 13,
+      "category": "3. FILTER - String Functions",
+      "label": "CONTAINS",
+      "yb_ms": 752.1767616271973,
+      "mdb_ms": 3.778219223022461,
+      "yb_error": null,
+      "mdb_error": null
+    },
+    {
+      "id": 14,
+      "category": "3. FILTER - String Functions",
+      "label": "STRLEN",
+      "yb_ms": 785.4723930358887,
+      "mdb_ms": 7.157564163208008,
+      "yb_error": null,
+      "mdb_error": null
+    },
+    {
+      "id": 15,
+      "category": "3. FILTER - String Functions",
+      "label": "STR + LANG",
+      "yb_ms": 789.3972396850586,
+      "mdb_ms": 3.4351348876953125,
+      "yb_error": null,
+      "mdb_error": null
+    },
+    {
+      "id": 16,
+      "category": "3. FILTER - String Functions",
+      "label": "STR",
+      "yb_ms": 678.9724826812744,
+      "mdb_ms": 2.4940967559814453,
+      "yb_error": null,
+      "mdb_error": null
+    },
+    {
+      "id": 17,
+      "category": "3. FILTER - String Functions",
+      "label": "DATATYPE",
+      "yb_ms": 729.8891544342041,
+      "mdb_ms": 1.9359588623046875,
+      "yb_error": null,
+      "mdb_error": null
+    },
+    {
+      "id": 18,
+      "category": "3. FILTER - String Functions",
+      "label": "LCASE",
+      "yb_ms": 725.6243228912354,
+      "mdb_ms": 11.00611686706543,
+      "yb_error": null,
+      "mdb_error": null
+    },
+    {
+      "id": 19,
+      "category": "3. FILTER - String Functions",
+      "label": "UCASE",
+      "yb_ms": 726.6149520874023,
+      "mdb_ms": 6.1397552490234375,
+      "yb_error": null,
+      "mdb_error": null
+    },
+    {
+      "id": 20,
+      "category": "3. FILTER - String Functions",
+      "label": "CONCAT",
+      "yb_ms": 711.4014625549316,
+      "mdb_ms": 4.337549209594727,
+      "yb_error": null,
+      "mdb_error": null
+    },
+    {
+      "id": 21,
+      "category": "3. FILTER - String Functions",
+      "label": "SUBSTR",
+      "yb_ms": 874.866247177124,
+      "mdb_ms": 3.416776657104492,
+      "yb_error": null,
+      "mdb_error": null
+    },
+    {
+      "id": 22,
+      "category": "3. FILTER - String Functions",
+      "label": "REPLACE",
+      "yb_ms": 842.6239490509033,
+      "mdb_ms": null,
+      "yb_error": null,
+      "mdb_error": "('Connection aborted.', RemoteDisconnected('Remote end closed connection without response'))"
+    },
+    {
+      "id": 23,
+      "category": "3. FILTER - String Functions",
+      "label": "ENCODE_FOR_URI",
+      "yb_ms": 789.839506149292,
+      "mdb_ms": null,
+      "yb_error": null,
+      "mdb_error": "HTTPConnectionPool(host='localhost', port=9501): Max retries exceeded with url: /sparql (Caused by NewConnectionError('<urllib3.connection.HTTPConnect"
+    },
+    {
+      "id": 24,
+      "category": "4. FILTER - Comparison Operators",
+      "label": "eq =",
+      "yb_ms": 707.5717449188232,
+      "mdb_ms": null,
+      "yb_error": null,
+      "mdb_error": "HTTPConnectionPool(host='localhost', port=9501): Max retries exceeded with url: /sparql (Caused by NewConnectionError('<urllib3.connection.HTTPConnect"
+    },
+    {
+      "id": 25,
+      "category": "4. FILTER - Comparison Operators",
+      "label": "ne !=",
+      "yb_ms": 610.590934753418,
+      "mdb_ms": null,
+      "yb_error": null,
+      "mdb_error": "HTTPConnectionPool(host='localhost', port=9501): Max retries exceeded with url: /sparql (Caused by NewConnectionError('<urllib3.connection.HTTPConnect"
+    },
+    {
+      "id": 26,
+      "category": "4. FILTER - Comparison Operators",
+      "label": "lt <",
+      "yb_ms": 585.2017402648926,
+      "mdb_ms": null,
+      "yb_error": null,
+      "mdb_error": "HTTPConnectionPool(host='localhost', port=9501): Max retries exceeded with url: /sparql (Caused by NewConnectionError('<urllib3.connection.HTTPConnect"
+    },
+    {
+      "id": 27,
+      "category": "4. FILTER - Comparison Operators",
+      "label": "gt >",
+      "yb_ms": 594.7160720825195,
+      "mdb_ms": null,
+      "yb_error": null,
+      "mdb_error": "HTTPConnectionPool(host='localhost', port=9501): Max retries exceeded with url: /sparql (Caused by NewConnectionError('<urllib3.connection.HTTPConnect"
+    },
+    {
+      "id": 28,
+      "category": "4. FILTER - Comparison Operators",
+      "label": "le <=",
+      "yb_ms": 593.0588245391846,
+      "mdb_ms": null,
+      "yb_error": null,
+      "mdb_error": "HTTPConnectionPool(host='localhost', port=9501): Max retries exceeded with url: /sparql (Caused by NewConnectionError('<urllib3.connection.HTTPConnect"
+    },
+    {
+      "id": 29,
+      "category": "4. FILTER - Comparison Operators",
+      "label": "ge >=",
+      "yb_ms": 559.837818145752,
+      "mdb_ms": null,
+      "yb_error": null,
+      "mdb_error": "HTTPConnectionPool(host='localhost', port=9501): Max retries exceeded with url: /sparql (Caused by NewConnectionError('<urllib3.connection.HTTPConnect"
+    },
+    {
+      "id": 30,
+      "category": "5. FILTER - Boolean Logic",
+      "label": "AND &&",
+      "yb_ms": 1159.142255783081,
+      "mdb_ms": null,
+      "yb_error": null,
+      "mdb_error": "HTTPConnectionPool(host='localhost', port=9501): Max retries exceeded with url: /sparql (Caused by NewConnectionError('<urllib3.connection.HTTPConnect"
+    },
+    {
+      "id": 31,
+      "category": "5. FILTER - Boolean Logic",
+      "label": "OR ||",
+      "yb_ms": 936.6133213043213,
+      "mdb_ms": null,
+      "yb_error": null,
+      "mdb_error": "HTTPConnectionPool(host='localhost', port=9501): Max retries exceeded with url: /sparql (Caused by NewConnectionError('<urllib3.connection.HTTPConnect"
+    },
+    {
+      "id": 32,
+      "category": "5. FILTER - Boolean Logic",
+      "label": "NOT !",
+      "yb_ms": 740.4377460479736,
+      "mdb_ms": null,
+      "yb_error": null,
+      "mdb_error": "HTTPConnectionPool(host='localhost', port=9501): Max retries exceeded with url: /sparql (Caused by NewConnectionError('<urllib3.connection.HTTPConnect"
+    },
+    {
+      "id": 33,
+      "category": "6. OPTIONAL Pattern",
+      "label": "OPTIONAL with value",
+      "yb_ms": 1280.2391052246094,
+      "mdb_ms": null,
+      "yb_error": null,
+      "mdb_error": "HTTPConnectionPool(host='localhost', port=9501): Max retries exceeded with url: /sparql (Caused by NewConnectionError('<urllib3.connection.HTTPConnect"
+    },
+    {
+      "id": 34,
+      "category": "6. OPTIONAL Pattern",
+      "label": "OPTIONAL multi",
+      "yb_ms": 1192.0435428619385,
+      "mdb_ms": null,
+      "yb_error": null,
+      "mdb_error": "HTTPConnectionPool(host='localhost', port=9501): Max retries exceeded with url: /sparql (Caused by NewConnectionError('<urllib3.connection.HTTPConnect"
+    },
+    {
+      "id": 35,
+      "category": "7. UNION Pattern",
+      "label": "UNION basic",
+      "yb_ms": 695.298433303833,
+      "mdb_ms": null,
+      "yb_error": null,
+      "mdb_error": "HTTPConnectionPool(host='localhost', port=9501): Max retries exceeded with url: /sparql (Caused by NewConnectionError('<urllib3.connection.HTTPConnect"
+    },
+    {
+      "id": 36,
+      "category": "7. UNION Pattern",
+      "label": "UNION with patterns",
+      "yb_ms": 668.7836647033691,
+      "mdb_ms": null,
+      "yb_error": null,
+      "mdb_error": "HTTPConnectionPool(host='localhost', port=9501): Max retries exceeded with url: /sparql (Caused by NewConnectionError('<urllib3.connection.HTTPConnect"
+    },
+    {
+      "id": 37,
+      "category": "8. BIND",
+      "label": "BIND string",
+      "yb_ms": 833.5967063903809,
+      "mdb_ms": null,
+      "yb_error": null,
+      "mdb_error": "HTTPConnectionPool(host='localhost', port=9501): Max retries exceeded with url: /sparql (Caused by NewConnectionError('<urllib3.connection.HTTPConnect"
+    },
+    {
+      "id": 38,
+      "category": "8. BIND",
+      "label": "BIND concat",
+      "yb_ms": 765.5954360961914,
+      "mdb_ms": null,
+      "yb_error": null,
+      "mdb_error": "HTTPConnectionPool(host='localhost', port=9501): Max retries exceeded with url: /sparql (Caused by NewConnectionError('<urllib3.connection.HTTPConnect"
+    },
+    {
+      "id": 39,
+      "category": "8. BIND",
+      "label": "BIND IRI",
+      "yb_ms": 950.1204490661621,
+      "mdb_ms": null,
+      "yb_error": null,
+      "mdb_error": "HTTPConnectionPool(host='localhost', port=9501): Max retries exceeded with url: /sparql (Caused by NewConnectionError('<urllib3.connection.HTTPConnect"
+    },
+    {
+      "id": 40,
+      "category": "9. VALUES",
+      "label": "VALUES one var",
+      "yb_ms": 892.247200012207,
+      "mdb_ms": null,
+      "yb_error": null,
+      "mdb_error": "HTTPConnectionPool(host='localhost', port=9501): Max retries exceeded with url: /sparql (Caused by NewConnectionError('<urllib3.connection.HTTPConnect"
+    },
+    {
+      "id": 41,
+      "category": "9. VALUES",
+      "label": "VALUES undef",
+      "yb_ms": 764.7616863250732,
+      "mdb_ms": null,
+      "yb_error": null,
+      "mdb_error": "HTTPConnectionPool(host='localhost', port=9501): Max retries exceeded with url: /sparql (Caused by NewConnectionError('<urllib3.connection.HTTPConnect"
+    },
+    {
+      "id": 42,
+      "category": "10. SubSelect (Subquery)",
+      "label": "SubSelect in FILTER",
+      "yb_ms": 1442.9750442504883,
+      "mdb_ms": null,
+      "yb_error": null,
+      "mdb_error": "HTTPConnectionPool(host='localhost', port=9501): Max retries exceeded with url: /sparql (Caused by NewConnectionError('<urllib3.connection.HTTPConnect"
+    },
+    {
+      "id": 43,
+      "category": "10. SubSelect (Subquery)",
+      "label": "NOT EXISTS",
+      "yb_ms": 1320.3215599060059,
+      "mdb_ms": null,
+      "yb_error": null,
+      "mdb_error": "HTTPConnectionPool(host='localhost', port=9501): Max retries exceeded with url: /sparql (Caused by NewConnectionError('<urllib3.connection.HTTPConnect"
+    },
+    {
+      "id": 44,
+      "category": "11. HAVING",
+      "label": "HAVING with BIND",
+      "yb_ms": 880.7575702667236,
+      "mdb_ms": null,
+      "yb_error": null,
+      "mdb_error": "HTTPConnectionPool(host='localhost', port=9501): Max retries exceeded with url: /sparql (Caused by NewConnectionError('<urllib3.connection.HTTPConnect"
+    },
+    {
+      "id": 45,
+      "category": "12. ORDER BY",
+      "label": "ORDER BY ASC",
+      "yb_ms": 783.2381725311279,
+      "mdb_ms": null,
+      "yb_error": null,
+      "mdb_error": "HTTPConnectionPool(host='localhost', port=9501): Max retries exceeded with url: /sparql (Caused by NewConnectionError('<urllib3.connection.HTTPConnect"
+    },
+    {
+      "id": 46,
+      "category": "12. ORDER BY",
+      "label": "ORDER BY DESC",
+      "yb_ms": 772.9239463806152,
+      "mdb_ms": null,
+      "yb_error": null,
+      "mdb_error": "HTTPConnectionPool(host='localhost', port=9501): Max retries exceeded with url: /sparql (Caused by NewConnectionError('<urllib3.connection.HTTPConnect"
+    },
+    {
+      "id": 47,
+      "category": "12. ORDER BY",
+      "label": "ORDER BY multi",
+      "yb_ms": 629.3754577636719,
+      "mdb_ms": null,
+      "yb_error": null,
+      "mdb_error": "HTTPConnectionPool(host='localhost', port=9501): Max retries exceeded with url: /sparql (Caused by NewConnectionError('<urllib3.connection.HTTPConnect"
+    },
+    {
+      "id": 48,
+      "category": "13. DISTINCT",
+      "label": "DISTINCT",
+      "yb_ms": 801.145076751709,
+      "mdb_ms": null,
+      "yb_error": null,
+      "mdb_error": "HTTPConnectionPool(host='localhost', port=9501): Max retries exceeded with url: /sparql (Caused by NewConnectionError('<urllib3.connection.HTTPConnect"
+    },
+    {
+      "id": 49,
+      "category": "14. LIMIT / OFFSET",
+      "label": "LIMIT",
+      "yb_ms": 1042.1979427337646,
+      "mdb_ms": null,
+      "yb_error": null,
+      "mdb_error": "HTTPConnectionPool(host='localhost', port=9501): Max retries exceeded with url: /sparql (Caused by NewConnectionError('<urllib3.connection.HTTPConnect"
+    },
+    {
+      "id": 50,
+      "category": "14. LIMIT / OFFSET",
+      "label": "OFFSET",
+      "yb_ms": 1048.309087753296,
+      "mdb_ms": null,
+      "yb_error": null,
+      "mdb_error": "HTTPConnectionPool(host='localhost', port=9501): Max retries exceeded with url: /sparql (Caused by NewConnectionError('<urllib3.connection.HTTPConnect"
+    },
+    {
+      "id": 51,
+      "category": "15. Multi-BGP (Join)",
+      "label": "Two patterns",
+      "yb_ms": 1216.341257095337,
+      "mdb_ms": 14.326810836791992,
+      "yb_error": null,
+      "mdb_error": null
+    },
+    {
+      "id": 52,
+      "category": "15. Multi-BGP (Join)",
+      "label": "Three patterns",
+      "yb_ms": 1226.865530014038,
+      "mdb_ms": 5.156755447387695,
+      "yb_error": null,
+      "mdb_error": null
+    },
+    {
+      "id": 53,
+      "category": "15. Multi-BGP (Join)",
+      "label": "Property path syntax",
+      "yb_ms": 1173.898696899414,
+      "mdb_ms": 5.118131637573242,
+      "yb_error": null,
+      "mdb_error": null
+    },
+    {
+      "id": 54,
+      "category": "16. FILTER IN / NOT IN",
+      "label": "IN",
+      "yb_ms": 720.1597690582275,
+      "mdb_ms": 8.09168815612793,
+      "yb_error": null,
+      "mdb_error": null
+    },
+    {
+      "id": 55,
+      "category": "16. FILTER IN / NOT IN",
+      "label": "NOT IN",
+      "yb_ms": 712.0175361633301,
+      "mdb_ms": 2.5522708892822266,
+      "yb_error": null,
+      "mdb_error": null
+    },
+    {
+      "id": 56,
+      "category": "17. Arithmetic in BIND/FILTER",
+      "label": "Addition",
+      "yb_ms": 857.5034141540527,
+      "mdb_ms": 3.754854202270508,
+      "yb_error": null,
+      "mdb_error": null
+    },
+    {
+      "id": 57,
+      "category": "17. Arithmetic in BIND/FILTER",
+      "label": "Subtraction",
+      "yb_ms": 837.8758430480957,
+      "mdb_ms": 4.278421401977539,
+      "yb_error": null,
+      "mdb_error": null
+    },
+    {
+      "id": 58,
+      "category": "17. Arithmetic in BIND/FILTER",
+      "label": "Multiplication",
+      "yb_ms": 722.9230403900146,
+      "mdb_ms": 5.94019889831543,
+      "yb_error": null,
+      "mdb_error": null
+    },
+    {
+      "id": 59,
+      "category": "17. Arithmetic in BIND/FILTER",
+      "label": "Division",
+      "yb_ms": 817.793607711792,
+      "mdb_ms": 3.363370895385742,
+      "yb_error": null,
+      "mdb_error": null
+    },
+    {
+      "id": 60,
+      "category": "18. Built-in Functions",
+      "label": "IRI",
+      "yb_ms": 801.5775680541992,
+      "mdb_ms": 10.308980941772461,
+      "yb_error": null,
+      "mdb_error": null
+    },
+    {
+      "id": 61,
+      "category": "18. Built-in Functions",
+      "label": "BNODE",
+      "yb_ms": 1165.123462677002,
+      "mdb_ms": 6.697654724121094,
+      "yb_error": null,
+      "mdb_error": null
+    },
+    {
+      "id": 62,
+      "category": "18. Built-in Functions",
+      "label": "STRDT",
+      "yb_ms": 727.741003036499,
+      "mdb_ms": 11.564254760742188,
+      "yb_error": null,
+      "mdb_error": null
+    },
+    {
+      "id": 63,
+      "category": "18. Built-in Functions",
+      "label": "STRLANG",
+      "yb_ms": 706.9306373596191,
+      "mdb_ms": 5.503654479980469,
+      "yb_error": null,
+      "mdb_error": null
+    },
+    {
+      "id": 64,
+      "category": "18. Built-in Functions",
+      "label": "UUID",
+      "yb_ms": 669.3933010101318,
+      "mdb_ms": 4.131317138671875,
+      "yb_error": null,
+      "mdb_error": null
+    },
+    {
+      "id": 65,
+      "category": "18. Built-in Functions",
+      "label": "STRUUID",
+      "yb_ms": 776.8218517303467,
+      "mdb_ms": 4.234075546264648,
+      "yb_error": null,
+      "mdb_error": null
+    },
+    {
+      "id": 66,
+      "category": "19. Numeric Built-in Functions",
+      "label": "ABS",
+      "yb_ms": 770.2710628509521,
+      "mdb_ms": 3.4134387969970703,
+      "yb_error": null,
+      "mdb_error": null
+    },
+    {
+      "id": 67,
+      "category": "19. Numeric Built-in Functions",
+      "label": "ROUND",
+      "yb_ms": 750.2515316009521,
+      "mdb_ms": 4.29081916809082,
+      "yb_error": null,
+      "mdb_error": null
+    },
+    {
+      "id": 68,
+      "category": "19. Numeric Built-in Functions",
+      "label": "CEIL",
+      "yb_ms": 658.1928730010986,
+      "mdb_ms": 2.9561519622802734,
+      "yb_error": null,
+      "mdb_error": null
+    },
+    {
+      "id": 69,
+      "category": "19. Numeric Built-in Functions",
+      "label": "FLOOR",
+      "yb_ms": 693.3810710906982,
+      "mdb_ms": 5.590915679931641,
+      "yb_error": null,
+      "mdb_error": null
+    },
+    {
+      "id": 70,
+      "category": "20. Conditionals",
+      "label": "IF",
+      "yb_ms": 692.7089691162109,
+      "mdb_ms": 3.767728805541992,
+      "yb_error": null,
+      "mdb_error": null
+    },
+    {
+      "id": 71,
+      "category": "20. Conditionals",
+      "label": "COALESCE",
+      "yb_ms": 1216.5725231170654,
+      "mdb_ms": 2.979278564453125,
+      "yb_error": null,
+      "mdb_error": null
+    },
+    {
+      "id": 72,
+      "category": "21. Complex Combinations",
+      "label": "OPTIONAL+UNION",
+      "yb_ms": 1167.5541400909424,
+      "mdb_ms": 2.932310104370117,
+      "yb_error": null,
+      "mdb_error": null
+    },
+    {
+      "id": 73,
+      "category": "21. Complex Combinations",
+      "label": "BIND+FILTER+ORDER",
+      "yb_ms": 707.7631950378418,
+      "mdb_ms": 4.739999771118164,
+      "yb_error": null,
+      "mdb_error": null
+    },
+    {
+      "id": 74,
+      "category": "21. Complex Combinations",
+      "label": "FILTER+OPTIONAL+DISTINCT",
+      "yb_ms": 1018.8024044036865,
+      "mdb_ms": 3.437042236328125,
+      "yb_error": null,
+      "mdb_error": null
+    },
+    {
+      "id": 75,
+      "category": "21. Complex Combinations",
+      "label": "VALUES+UNION+LIMIT",
+      "yb_ms": 672.0726490020752,
+      "mdb_ms": 2.919912338256836,
+      "yb_error": null,
+      "mdb_error": null
+    },
+    {
+      "id": 76,
+      "category": "22. GROUP BY / Aggregates",
+      "label": "COUNT",
+      "yb_ms": 1007.5786113739014,
+      "mdb_ms": 7.635593414306641,
+      "yb_error": null,
+      "mdb_error": null
+    },
+    {
+      "id": 77,
+      "category": "22. GROUP BY / Aggregates",
+      "label": "SUM",
+      "yb_ms": 604.3305397033691,
+      "mdb_ms": 3.889799118041992,
+      "yb_error": null,
+      "mdb_error": null
+    },
+    {
+      "id": 78,
+      "category": "22. GROUP BY / Aggregates",
+      "label": "MIN",
+      "yb_ms": 569.735050201416,
+      "mdb_ms": 3.2041072845458984,
+      "yb_error": null,
+      "mdb_error": null
+    },
+    {
+      "id": 79,
+      "category": "22. GROUP BY / Aggregates",
+      "label": "MAX",
+      "yb_ms": 591.7520523071289,
+      "mdb_ms": 2.681732177734375,
+      "yb_error": null,
+      "mdb_error": null
+    },
+    {
+      "id": 80,
+      "category": "22. GROUP BY / Aggregates",
+      "label": "AVG",
+      "yb_ms": 543.3855056762695,
+      "mdb_ms": 2.0821094512939453,
+      "yb_error": null,
+      "mdb_error": null
+    },
+    {
+      "id": 81,
+      "category": "22. GROUP BY / Aggregates",
+      "label": "GROUP_CONCAT",
+      "yb_ms": 679.3832778930664,
+      "mdb_ms": 3.8182735443115234,
+      "yb_error": null,
+      "mdb_error": null
+    },
+    {
+      "id": 82,
+      "category": "22. GROUP BY / Aggregates",
+      "label": "SAMPLE",
+      "yb_ms": 1153.3465385437012,
+      "mdb_ms": 2.774953842163086,
+      "yb_error": null,
+      "mdb_error": null
+    },
+    {
+      "id": 83,
+      "category": "22. GROUP BY / Aggregates",
+      "label": "GROUP BY + COUNT",
+      "yb_ms": 824.8429298400879,
+      "mdb_ms": 3.5393238067626953,
+      "yb_error": null,
+      "mdb_error": null
+    },
+    {
+      "id": 84,
+      "category": "23. Query Forms (ASK/CONSTRUCT/DESCRIBE)",
+      "label": "ASK",
+      "yb_ms": 1119.9660301208496,
+      "mdb_ms": 2.320528030395508,
+      "yb_error": null,
+      "mdb_error": null
+    },
+    {
+      "id": 85,
+      "category": "23. Query Forms (ASK/CONSTRUCT/DESCRIBE)",
+      "label": "CONSTRUCT",
+      "yb_ms": 1025.2063274383545,
+      "mdb_ms": null,
+      "yb_error": null,
+      "mdb_error": "Expecting value: line 1 column 1 (char 0)"
+    },
+    {
+      "id": 86,
+      "category": "23b. DESCRIBE",
+      "label": "DESCRIBE",
+      "yb_ms": 621.0837364196777,
+      "mdb_ms": null,
+      "yb_error": null,
+      "mdb_error": "Expecting value: line 1 column 1 (char 0)"
+    },
+    {
+      "id": 87,
+      "category": "24. MINUS Pattern",
+      "label": "MINUS basic",
+      "yb_ms": 1174.1108894348145,
+      "mdb_ms": 5.0067901611328125,
+      "yb_error": null,
+      "mdb_error": null
+    },
+    {
+      "id": 88,
+      "category": "24. MINUS Pattern",
+      "label": "MINUS with pattern",
+      "yb_ms": 1280.7743549346924,
+      "mdb_ms": 2.855062484741211,
+      "yb_error": null,
+      "mdb_error": null
+    },
+    {
+      "id": 89,
+      "category": "25. Property Paths - Basic",
+      "label": "Inverse (^)",
+      "yb_ms": 754.1894912719727,
+      "mdb_ms": 2.084016799926758,
+      "yb_error": null,
+      "mdb_error": null
+    },
+    {
+      "id": 90,
+      "category": "25. Property Paths - Basic",
+      "label": "Zero-or-more (*)",
+      "yb_ms": 778.968334197998,
+      "mdb_ms": 3.257274627685547,
+      "yb_error": null,
+      "mdb_error": null
+    },
+    {
+      "id": 91,
+      "category": "25. Property Paths - Basic",
+      "label": "One-or-more (+)",
+      "yb_ms": 667.1838760375977,
+      "mdb_ms": 3.7043094635009766,
+      "yb_error": null,
+      "mdb_error": null
+    },
+    {
+      "id": 92,
+      "category": "25. Property Paths - Basic",
+      "label": "Alternation (|)",
+      "yb_ms": 580.406665802002,
+      "mdb_ms": 5.301713943481445,
+      "yb_error": null,
+      "mdb_error": null
+    },
+    {
+      "id": 93,
+      "category": "25. Property Paths - Basic",
+      "label": "Optional (?)",
+      "yb_ms": 626.3196468353271,
+      "mdb_ms": 2.643585205078125,
+      "yb_error": null,
+      "mdb_error": null
+    },
+    {
+      "id": 94,
+      "category": "25. Property Paths - Basic",
+      "label": "Sequence (/)",
+      "yb_ms": 852.1182537078857,
+      "mdb_ms": 2.470731735229492,
+      "yb_error": null,
+      "mdb_error": null
+    },
+    {
+      "id": 95,
+      "category": "26. Property Paths - Advanced",
+      "label": "Negation (!)",
+      "yb_ms": 736.4826202392578,
+      "mdb_ms": 4.717588424682617,
+      "yb_error": null,
+      "mdb_error": null
+    },
+    {
+      "id": 96,
+      "category": "26. Property Paths - Advanced",
+      "label": "Quantifier {n,m}",
+      "yb_ms": 587.0473384857178,
+      "mdb_ms": 2.871990203857422,
+      "yb_error": null,
+      "mdb_error": null
+    },
+    {
+      "id": 97,
+      "category": "27. String Functions - Advanced",
+      "label": "STRBEFORE",
+      "yb_ms": 734.6158027648926,
+      "mdb_ms": 3.5893917083740234,
+      "yb_error": null,
+      "mdb_error": null
+    },
+    {
+      "id": 98,
+      "category": "27. String Functions - Advanced",
+      "label": "STRAFTER",
+      "yb_ms": 726.7427444458008,
+      "mdb_ms": 3.236532211303711,
+      "yb_error": null,
+      "mdb_error": null
+    },
+    {
+      "id": 99,
+      "category": "28. RDF/Type Functions",
+      "label": "SAMETERM",
+      "yb_ms": 685.46462059021,
+      "mdb_ms": 2.592325210571289,
+      "yb_error": null,
+      "mdb_error": null
+    },
+    {
+      "id": 100,
+      "category": "28. RDF/Type Functions",
+      "label": "LANG",
+      "yb_ms": 712.8007411956787,
+      "mdb_ms": 3.5271644592285156,
+      "yb_error": null,
+      "mdb_error": null
+    },
+    {
+      "id": 101,
+      "category": "28. RDF/Type Functions",
+      "label": "LANGMATCHES",
+      "yb_ms": 703.5918235778809,
+      "mdb_ms": 6.66046142578125,
+      "yb_error": null,
+      "mdb_error": null
+    },
+    {
+      "id": 102,
+      "category": "28. RDF/Type Functions",
+      "label": "URI",
+      "yb_ms": 775.3057479858398,
+      "mdb_ms": 4.137754440307617,
+      "yb_error": null,
+      "mdb_error": null
+    },
+    {
+      "id": 103,
+      "category": "28. RDF/Type Functions",
+      "label": "isNUMERIC",
+      "yb_ms": 624.42946434021,
+      "mdb_ms": 3.3555030822753906,
+      "yb_error": null,
+      "mdb_error": null
+    },
+    {
+      "id": 104,
+      "category": "28. RDF/Type Functions",
+      "label": "isURI",
+      "yb_ms": 681.8559169769287,
+      "mdb_ms": 3.0210018157958984,
+      "yb_error": null,
+      "mdb_error": null
+    },
+    {
+      "id": 105,
+      "category": "28. RDF/Type Functions",
+      "label": "isBlank",
+      "yb_ms": 674.3650436401367,
+      "mdb_ms": 2.388477325439453,
+      "yb_error": null,
+      "mdb_error": null
+    },
+    {
+      "id": 106,
+      "category": "29. Date/Time Functions",
+      "label": "NOW",
+      "yb_ms": 557.8980445861816,
+      "mdb_ms": 2.4373531341552734,
+      "yb_error": null,
+      "mdb_error": null
+    },
+    {
+      "id": 107,
+      "category": "29. Date/Time Functions",
+      "label": "YEAR",
+      "yb_ms": 616.2996292114258,
+      "mdb_ms": 2.5382041931152344,
+      "yb_error": null,
+      "mdb_error": null
+    },
+    {
+      "id": 108,
+      "category": "29. Date/Time Functions",
+      "label": "MONTH",
+      "yb_ms": 790.9646034240723,
+      "mdb_ms": 6.58726692199707,
+      "yb_error": null,
+      "mdb_error": null
+    },
+    {
+      "id": 109,
+      "category": "29. Date/Time Functions",
+      "label": "DAY",
+      "yb_ms": 667.9346561431885,
+      "mdb_ms": 6.015539169311523,
+      "yb_error": null,
+      "mdb_error": null
+    },
+    {
+      "id": 110,
+      "category": "29. Date/Time Functions",
+      "label": "HOURS",
+      "yb_ms": 623.7943172454834,
+      "mdb_ms": 5.891323089599609,
+      "yb_error": null,
+      "mdb_error": null
+    },
+    {
+      "id": 111,
+      "category": "29. Date/Time Functions",
+      "label": "MINUTES",
+      "yb_ms": 623.3618259429932,
+      "mdb_ms": 6.194591522216797,
+      "yb_error": null,
+      "mdb_error": null
+    },
+    {
+      "id": 112,
+      "category": "29. Date/Time Functions",
+      "label": "SECONDS",
+      "yb_ms": 589.0123844146729,
+      "mdb_ms": 4.770040512084961,
+      "yb_error": null,
+      "mdb_error": null
+    },
+    {
+      "id": 113,
+      "category": "29. Date/Time Functions",
+      "label": "TIMEZONE",
+      "yb_ms": 597.2118377685547,
+      "mdb_ms": 17.99941062927246,
+      "yb_error": null,
+      "mdb_error": null
+    },
+    {
+      "id": 114,
+      "category": "29. Date/Time Functions",
+      "label": "TZ",
+      "yb_ms": 626.8963813781738,
+      "mdb_ms": 4.609346389770508,
+      "yb_error": null,
+      "mdb_error": null
+    },
+    {
+      "id": 115,
+      "category": "30. Hash Functions",
+      "label": "MD5",
+      "yb_ms": 641.3586139678955,
+      "mdb_ms": 7.8907012939453125,
+      "yb_error": null,
+      "mdb_error": null
+    },
+    {
+      "id": 116,
+      "category": "30. Hash Functions",
+      "label": "SHA1",
+      "yb_ms": 591.7484760284424,
+      "mdb_ms": 5.227327346801758,
+      "yb_error": null,
+      "mdb_error": null
+    },
+    {
+      "id": 117,
+      "category": "30. Hash Functions",
+      "label": "SHA256",
+      "yb_ms": 765.7938003540039,
+      "mdb_ms": 3.7641525268554688,
+      "yb_error": null,
+      "mdb_error": null
+    },
+    {
+      "id": 118,
+      "category": "30. Hash Functions",
+      "label": "SHA384",
+      "yb_ms": 581.2830924987793,
+      "mdb_ms": 5.0868988037109375,
+      "yb_error": null,
+      "mdb_error": null
+    },
+    {
+      "id": 119,
+      "category": "30. Hash Functions",
+      "label": "SHA512",
+      "yb_ms": 605.2119731903076,
+      "mdb_ms": 4.2972564697265625,
+      "yb_error": null,
+      "mdb_error": null
+    },
+    {
+      "id": 120,
+      "category": "31. Math/Numeric Extensions",
+      "label": "RAND",
+      "yb_ms": 671.1392402648926,
+      "mdb_ms": 5.98907470703125,
+      "yb_error": null,
+      "mdb_error": null
+    },
+    {
+      "id": 121,
+      "category": "31. Math/Numeric Extensions",
+      "label": "CAST",
+      "yb_ms": 814.1248226165771,
+      "mdb_ms": 5.545377731323242,
+      "yb_error": null,
+      "mdb_error": null
+    },
+    {
+      "id": 122,
+      "category": "31. Math/Numeric Extensions",
+      "label": "POW (mdbfn:pow)",
+      "yb_ms": 632.3938369750977,
+      "mdb_ms": 4.365205764770508,
+      "yb_error": null,
+      "mdb_error": null
+    },
+    {
+      "id": 123,
+      "category": "31. Math/Numeric Extensions",
+      "label": "SQRT (mdbfn:sqrt)",
+      "yb_ms": 637.2685432434082,
+      "mdb_ms": 3.1130313873291016,
+      "yb_error": null,
+      "mdb_error": null
+    },
+    {
+      "id": 124,
+      "category": "32. Aggregates with DISTINCT",
+      "label": "COUNT(DISTINCT)",
+      "yb_ms": 777.6134014129639,
+      "mdb_ms": 4.06193733215332,
+      "yb_error": null,
+      "mdb_error": null
+    },
+    {
+      "id": 125,
+      "category": "32. Aggregates with DISTINCT",
+      "label": "SUM(DISTINCT)",
+      "yb_ms": 669.7494983673096,
+      "mdb_ms": 4.820823669433594,
+      "yb_error": null,
+      "mdb_error": null
+    },
+    {
+      "id": 126,
+      "category": "32. Aggregates with DISTINCT",
+      "label": "GROUP_CONCAT SEPARATOR",
+      "yb_ms": 1423.9778518676758,
+      "mdb_ms": 8.207321166992188,
+      "yb_error": null,
+      "mdb_error": null
+    },
+    {
+      "id": 127,
+      "category": "33. REDUCED Modifier",
+      "label": "REDUCED",
+      "yb_ms": 859.0302467346191,
+      "mdb_ms": 3.037691116333008,
+      "yb_error": null,
+      "mdb_error": null
+    },
+    {
+      "id": 128,
+      "category": "34. Nested OPTIONAL Patterns",
+      "label": "Deep nested OPTIONAL",
+      "yb_ms": 1258.000135421753,
+      "mdb_ms": 6.812095642089844,
+      "yb_error": null,
+      "mdb_error": null
+    },
+    {
+      "id": 129,
+      "category": "35. Unary Plus/Minus",
+      "label": "UnaryMinus",
+      "yb_ms": 639.2638683319092,
+      "mdb_ms": 3.033161163330078,
+      "yb_error": null,
+      "mdb_error": null
+    },
+    {
+      "id": 130,
+      "category": "35. Unary Plus/Minus",
+      "label": "UnaryPlus",
+      "yb_ms": 617.727518081665,
+      "mdb_ms": 2.016305923461914,
+      "yb_error": null,
+      "mdb_error": null
+    },
+    {
+      "id": 131,
+      "category": "36. Path Modifiers (?) with non-type",
+      "label": "Path ? on predicate",
+      "yb_ms": 743.6563968658447,
+      "mdb_ms": 1.8222332000732422,
+      "yb_error": null,
+      "mdb_error": null
+    }
+  ]
+}

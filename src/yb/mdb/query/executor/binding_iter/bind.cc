@@ -1,0 +1,47 @@
+#include "bind.h"
+
+#include "graph_models/rdf_model/conversions.h"
+
+#include "query/executor/binding_iter/binding_expr/binding_expr_printer.h"
+
+void Bind::_begin(Binding& _parent_binding)
+{
+    parent_binding = &_parent_binding;
+    child_iter->begin(*parent_binding);
+}
+
+void Bind::_reset()
+{
+    this->child_iter->reset();
+}
+
+bool Bind::_next()
+{
+    if (child_iter->next()) {
+        parent_binding->add(var, SPARQL::Conversions::term_identity(expr->eval(*parent_binding)));
+        return true;
+    }
+    return false;
+}
+
+void Bind::assign_nulls()
+{
+    parent_binding->add(var, ObjectId::get_null());
+    this->child_iter->assign_nulls();
+}
+
+void Bind::print(std::ostream& os, int indent, bool stats) const
+{
+    if (stats) {
+        print_generic_stats(os, indent);
+    }
+
+    os << std::string(indent, ' ') << "Bind(" << var << '=';
+    {
+        BindingExprPrinter printer(os, indent, stats);
+        printer.print(*expr);
+        os << ")\n";
+    }
+
+    child_iter->print(os, indent + 2, stats);
+}

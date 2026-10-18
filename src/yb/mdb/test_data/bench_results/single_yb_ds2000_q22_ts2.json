@@ -1,0 +1,200 @@
+{
+  "db": "yb",
+  "dataset": "ds2000",
+  "num_queries": 22,
+  "tservers": 2,
+  "import_time_s": 12.556174516677856,
+  "times_ms": [
+    193.54867935180664,
+    246.20294570922852,
+    189.12839889526367,
+    190.29641151428223,
+    193.37773323059082,
+    227.28610038757324,
+    256.32715225219727,
+    214.93792533874512,
+    192.29674339294434,
+    252.92658805847168,
+    189.69392776489258,
+    186.4149570465088,
+    198.42171669006348,
+    194.0159797668457,
+    201.68042182922363,
+    187.83092498779297,
+    211.44556999206543,
+    221.37069702148438,
+    226.54175758361816,
+    218.59502792358398,
+    308.0315589904785,
+    270.9975242614746
+  ],
+  "errors": [],
+  "row_counts": [
+    19,
+    0,
+    7,
+    6,
+    200,
+    200,
+    400,
+    7,
+    14,
+    7,
+    13,
+    0,
+    0,
+    9,
+    5,
+    3,
+    11,
+    5,
+    4,
+    2000,
+    5000,
+    10
+  ],
+  "details": [
+    {
+      "id": 1,
+      "template": "RND_BGP",
+      "category": "Random BGP",
+      "time_ms": 193.54867935180664
+    },
+    {
+      "id": 2,
+      "template": "RND_JOIN",
+      "category": "Random Join",
+      "time_ms": 246.20294570922852
+    },
+    {
+      "id": 3,
+      "template": "RND_FILTER_isIRI",
+      "category": "Random FILTER",
+      "time_ms": 189.12839889526367
+    },
+    {
+      "id": 4,
+      "template": "RND_FILTER_BOUND",
+      "category": "Random FILTER",
+      "time_ms": 190.29641151428223
+    },
+    {
+      "id": 5,
+      "template": "RND_FILTER_REGEX",
+      "category": "Random FILTER",
+      "time_ms": 193.37773323059082
+    },
+    {
+      "id": 6,
+      "template": "RND_FILTER_STRSTARTS",
+      "category": "Random FILTER",
+      "time_ms": 227.28610038757324
+    },
+    {
+      "id": 7,
+      "template": "RND_FILTER_CONTAINS",
+      "category": "Random FILTER",
+      "time_ms": 256.32715225219727
+    },
+    {
+      "id": 8,
+      "template": "RND_FILTER_eq",
+      "category": "Random FILTER",
+      "time_ms": 214.93792533874512
+    },
+    {
+      "id": 9,
+      "template": "RND_FILTER_sameTerm",
+      "category": "Random FILTER",
+      "time_ms": 192.29674339294434
+    },
+    {
+      "id": 10,
+      "template": "RND_OPTIONAL",
+      "category": "Random OPTIONAL",
+      "time_ms": 252.92658805847168
+    },
+    {
+      "id": 11,
+      "template": "RND_UNION",
+      "category": "Random UNION",
+      "time_ms": 189.69392776489258
+    },
+    {
+      "id": 12,
+      "template": "RND_PATH_star",
+      "category": "Random Path",
+      "time_ms": 186.4149570465088
+    },
+    {
+      "id": 13,
+      "template": "RND_PATH_plus",
+      "category": "Random Path",
+      "time_ms": 198.42171669006348
+    },
+    {
+      "id": 14,
+      "template": "RND_PATH_inverse",
+      "category": "Random Path",
+      "time_ms": 194.0159797668457
+    },
+    {
+      "id": 15,
+      "template": "RND_ORDER_ASC",
+      "category": "Random ORDER",
+      "time_ms": 201.68042182922363
+    },
+    {
+      "id": 16,
+      "template": "RND_ORDER_DESC",
+      "category": "Random ORDER",
+      "time_ms": 187.83092498779297
+    },
+    {
+      "id": 17,
+      "template": "RND_DISTINCT",
+      "category": "Random DISTINCT",
+      "time_ms": 211.44556999206543
+    },
+    {
+      "id": 18,
+      "template": "RND_LIMIT",
+      "category": "Random LIMIT",
+      "time_ms": 221.37069702148438
+    },
+    {
+      "id": 19,
+      "template": "RND_LIMIT_OFFSET",
+      "category": "Random LIMIT",
+      "time_ms": 226.54175758361816
+    },
+    {
+      "id": 20,
+      "template": "RND_RDF_TYPE",
+      "category": "Random BGP",
+      "time_ms": 218.59502792358398
+    },
+    {
+      "id": 21,
+      "template": "RND_ASK",
+      "category": "Random ASK",
+      "time_ms": 308.0315589904785
+    },
+    {
+      "id": 22,
+      "template": "RND_SELECT_ALL",
+      "category": "Random SELECT",
+      "time_ms": 270.9975242614746
+    }
+  ],
+  "stats": {
+    "count": 22,
+    "min": 186.4149570465088,
+    "max": 308.0315589904785,
+    "mean": 216.88039736314252,
+    "p50": 206.56299591064453,
+    "p90": 255.9870958328247,
+    "p95": 270.26400566101074,
+    "p99": 300.25441169738764
+  }
+}

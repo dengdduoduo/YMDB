@@ -1,0 +1,151 @@
+// Copyright (c) YugabyteDB, Inc.
+
+package com.yugabyte.yw.commissioner.tasks;
+
+import com.yugabyte.yw.commissioner.BaseTaskDependencies;
+import com.yugabyte.yw.commissioner.Common.CloudType;
+import com.yugabyte.yw.commissioner.ITask;
+import com.yugabyte.yw.commissioner.UserTaskDetails;
+import com.yugabyte.yw.commissioner.UserTaskDetails.SubTaskGroupType;
+import com.yugabyte.yw.commissioner.tasks.params.NodeTaskParams;
+import com.yugabyte.yw.common.Util;
+import com.yugabyte.yw.forms.UniverseDefinitionTaskParams.UserIntent;
+import com.yugabyte.yw.models.Universe;
+import com.yugabyte.yw.models.helpers.NodeDetails;
+import java.util.Collections;
+import java.util.Set;
+import javax.inject.Inject;
+import lombok.extern.slf4j.Slf4j;
+
+@Slf4j
+@ITask.Retryable
+@ITask.Abortable
+public class ReprovisionNode extends UniverseDefinitionTaskBase {
+
+  @Inject
+  protected ReprovisionNode(BaseTaskDependencies baseTaskDependencies) {
+    super(baseTaskDependencies);
+  }
+
+  @Override
+  protected NodeTaskParams taskParams() {
+    return (NodeTaskParams) taskParams;
+  }
+
+  private void runBasicChecks(Universe universe) {
+    NodeDetails currentNode = universe.getNode(taskParams().nodeName);
+    if (currentNode == null) {
+      String msg = "No node " + taskParams().nodeName + " in universe " + universe.getName();
+      log.error(msg);
+      throw new RuntimeException(msg);
+    }
+    if (currentNode.isMaster || currentNode.isTserver) {
+      String msg = "Cannot reprovision " + taskParams().nodeName + " while it is not stopped";
+      log.error(msg);
+      throw new RuntimeException(msg);
+    }
+    taskParams().azUuid = currentNode.azUuid;
+    taskParams().placementUuid = currentNode.placementUuid;
+  }
+
+  @Override
+  public void validateParams(boolean isFirstTry) {
+    super.validateParams(isFirstTry);
+    runBasicChecks(getUniverse());
+  }
+
+  @Override
+  protected void createPrecheckTasks(Universe universe) {
+    // Check again after locking.
+    runBasicChecks(getUniverse());
+    if (!instanceExists(taskParams())) {
+      String msg = "No instance exists for " + taskParams().nodeName;
+      log.error(msg);
+      throw new RuntimeException(msg);
+    }
+  }
+
+  @Override
+  public void run() {
+    log.info(
+        "Started {} task for node {} in univ uuid={}",
+        getName(),
+        taskParams().nodeName,
+        taskParams().getUniverseUUID());
+    try {
+      checkUniverseVersion();
+
+      // Update the DB to prevent other changes from happening.
+      Universe universe =
+          lockAndFreezeUniverseForUpdate(
+              taskParams().expectedUniverseVersion, null /* Txn callback */);
+
+      NodeDetails currentNode = universe.getNode(taskParams().nodeName);
+      UserIntent userIntent = universe.getUniverseDetails().getPrimaryCluster().userIntent;
+      taskParams().azUuid = currentNode.azUuid;
+      taskParams().placementUuid = currentNode.placementUuid;
+
+      preTaskActions();
+
+      // Persist isCpuCgroupConfigured from the provider setting up front so the YNP systemd gate
+      // and the ConfigureServer wrapper copy stay in sync; otherwise a legacy universe gets a
+      // systemd unit pointing at a wrapper that was never shipped and the DB fails to start
+      // (PLAT-21526).
+      // TODO(PLAT-21526): revisit where this runs. ReprovisionNode is node-level, but this persists
+      // a universe-wide flag from the provider default and does so up front. Setting it too early
+      // (before the node is actually re-provisioned) can desync it from real node state, and a
+      // later YNP provisioning that reads the persisted flag could drop the cgroup config. Persist
+      // it at the right granularity/point instead.
+      createPersistCpuCgroupConfiguredTask(universe);
+
+      // Update node state to Reprovisioning.
+      createSetNodeStateTask(currentNode, NodeDetails.NodeState.Reprovisioning)
+          .setSubTaskGroupType(UserTaskDetails.SubTaskGroupType.Provisioning);
+
+      Set<NodeDetails> nodeCollection = Collections.singleton(currentNode);
+      // Need to reinstall node agent.
+      createRemoveNodeAgentTasks(universe, nodeCollection, true /*forceRemove*/);
+      // YNP setup and provisioning require sudo access. For manually provisioned on-prem
+      // universes (skip_provisioning), these steps are performed out-of-band by running
+      // node-agent-provision.sh, so skip them here to avoid failing on the missing sudo
+      // SSH access.
+      boolean isUniverseManuallyProvisioned = Util.isOnPremManualProvisioning(universe);
+      if (!userIntent.getAllCloudTypes().contains(CloudType.local)
+          && !isUniverseManuallyProvisioned) {
+        createSetupYNPTask(universe, nodeCollection)
+            .setSubTaskGroupType(SubTaskGroupType.Provisioning);
+        createYNPProvisioningTask(universe, nodeCollection, false /*isYBPrebuiltImage*/)
+            .setSubTaskGroupType(SubTaskGroupType.Provisioning);
+      }
+      createInstallNodeAgentTasks(universe, nodeCollection)
+          .setSubTaskGroupType(UserTaskDetails.SubTaskGroupType.Provisioning);
+      createWaitForNodeAgentTasks(nodeCollection)
+          .setSubTaskGroupType(UserTaskDetails.SubTaskGroupType.Provisioning);
+
+      if (userIntent.getAllCloudTypes().contains(CloudType.local)) {
+        createSetupServerTasks(nodeCollection, params -> {})
+            .setSubTaskGroupType(UserTaskDetails.SubTaskGroupType.Provisioning);
+      }
+      createConfigureServerTasks(nodeCollection, params -> {})
+          .setSubTaskGroupType(UserTaskDetails.SubTaskGroupType.Provisioning);
+      createGFlagsOverrideTasks(nodeCollection, ServerType.MASTER);
+      createGFlagsOverrideTasks(nodeCollection, ServerType.TSERVER);
+
+      createSetNodeStateTask(currentNode, NodeDetails.NodeState.Stopped)
+          .setSubTaskGroupType(UserTaskDetails.SubTaskGroupType.Provisioning);
+
+      // Mark universe update success to true
+      createMarkUniverseUpdateSuccessTasks()
+          .setSubTaskGroupType(UserTaskDetails.SubTaskGroupType.Provisioning);
+
+      getRunnableTask().runSubTasks();
+    } catch (Throwable t) {
+      log.error("Error executing task {} with error='{}'.", getName(), t.getMessage(), t);
+      throw t;
+    } finally {
+      // Mark the update of the universe as done. This will allow future updates to
+      // the universe.
+      unlockUniverseForUpdate();
+    }
+  }
+}
