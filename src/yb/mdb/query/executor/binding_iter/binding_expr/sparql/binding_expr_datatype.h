@@ -20,6 +20,9 @@ public:
     {
         auto expr_oid = expr->eval(binding);
 
+        if (auto term = RdfTermRegistry::Find(expr_oid.id)) {
+            if (term->kind == 'L') return Conversions::pack_iri(term->qualifier);
+        }
         switch (RDF_OID::get_generic_sub_type(expr_oid)) {
         case RDF_OID::GenericSubType::STRING_DATATYPE: {
             auto&& [datatype, str] = Conversions::unpack_string_datatype(expr_oid);

@@ -8,6 +8,7 @@
 #include "yb/mdb/import/rdf_xml_parser.h"
 #include "yb/mdb/model/rdf_yb_model.h"
 #include "yb/util/logging.h"
+#include "yb/util/uuid.h"
 
 namespace yb::mdb {
 
@@ -15,14 +16,11 @@ Status ImportPipeline::BatchWrite(const std::vector<Triple>& triples) {
   auto& model = RdfYBModel::Instance();
 
   for (const auto& triple : triples) {
-    uint64_t subj_id = VERIFY_RESULT(model.ResolveTerm(id_map_, triple.sub));
-    uint64_t pred_id = VERIFY_RESULT(model.ResolveTerm(id_map_, triple.pred));
-
-    std::string obj_key = triple.obj;
-    if (triple.obj_type == TripleTermType::LITERAL && !triple.object_type.empty()) {
-      obj_key = triple.obj + "|" + triple.object_type;
-    }
-    uint64_t obj_id = VERIFY_RESULT(model.ResolveTerm(id_map_, obj_key));
+    uint64_t subj_id = VERIFY_RESULT(model.ResolveRdfTerm(
+        id_map_, triple.sub_type, triple.sub, "", blank_scope_));
+    uint64_t pred_id = VERIFY_RESULT(model.ResolveRdfTerm(id_map_, triple.pred_type, triple.pred));
+    uint64_t obj_id = VERIFY_RESULT(model.ResolveRdfTerm(
+        id_map_, triple.obj_type, triple.obj, triple.object_type, blank_scope_));
 
     RETURN_NOT_OK(model.WriteTripleToDocDB(subj_id, pred_id, obj_id));
   }
@@ -106,6 +104,7 @@ Result<ImportStats> ImportPipeline::ImportRdfXmlFile(const std::string& file_pat
 
 Result<ImportStats> ImportPipeline::ImportFile(const std::string& file_path) {
   stats_ = ImportStats{};
+  blank_scope_ = Uuid::Generate().ToString();
 
   size_t dot_pos = file_path.rfind('.');
   if (dot_pos == std::string::npos) {
@@ -127,6 +126,7 @@ Result<ImportStats> ImportPipeline::ImportFile(const std::string& file_path) {
 
 Result<ImportStats> ImportPipeline::ImportTriples(const std::vector<Triple>& triples) {
   stats_ = ImportStats{};
+  blank_scope_ = Uuid::Generate().ToString();
   stats_.triples_parsed = static_cast<int64_t>(triples.size());
 
   RETURN_NOT_OK(BatchWrite(triples));

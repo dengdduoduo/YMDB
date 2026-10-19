@@ -22,6 +22,27 @@
 
 namespace yb::mdb {
 
+TEST(NtParserTest, LiteralEscapesAndStatementBoundariesPreserveIdentity) {
+  auto parsed = NtParser::ParseLine(R"(<http://ex/s> <http://ex/p> "a\" b\u0041\n"@EN .)");
+  ASSERT_TRUE(parsed.ok()) << parsed.status();
+  EXPECT_EQ(parsed->obj, "a\" bA\n");
+  EXPECT_EQ(parsed->object_type, "@EN");
+  auto statements = NtParser::SplitStatements(
+      R"(<http://ex/s> <http://ex/p> "a.b" . _:b <http://ex/p> "1.0"^^<urn:dt> .)");
+  ASSERT_TRUE(statements.ok());
+  ASSERT_EQ(statements->size(), 2);
+  EXPECT_TRUE(NtParser::ParseLine((*statements)[0]).ok());
+  EXPECT_TRUE(NtParser::ParseLine((*statements)[1]).ok());
+  statements = NtParser::SplitStatements(
+      "\n<urn:s> <urn:p> \"same\"@en .\r\n<urn:t> <urn:p> \"same\"@fr .\n");
+  ASSERT_TRUE(statements.ok());
+  ASSERT_EQ(statements->size(), 2);
+  EXPECT_TRUE(NtParser::ParseLine((*statements)[0]).ok());
+  EXPECT_TRUE(NtParser::ParseLine((*statements)[1]).ok());
+  EXPECT_FALSE(NtParser::ParseLine(R"(<urn:s> <urn:p> "x"@ .)").ok());
+  EXPECT_FALSE(NtParser::ParseLine(R"(<urn:s> <urn:p> "\uD800" .)").ok());
+}
+
 TEST(NtParserTest, ParseTripleWithUris) {
   auto result = NtParser::ParseLine(
       "<http://ex/s> <http://ex/p> <http://ex/o> .");
@@ -47,7 +68,7 @@ TEST(NtParserTest, ParseTripleWithLanguageLiteral) {
   ASSERT_TRUE(result.ok());
   ASSERT_EQ(result->obj, "Charlie");
   ASSERT_EQ(result->obj_type, TripleTermType::LITERAL);
-  ASSERT_EQ(result->object_type, "en");
+  ASSERT_EQ(result->object_type, "@en");
 }
 
 TEST(NtParserTest, ParseTripleWithTypedLiteral) {

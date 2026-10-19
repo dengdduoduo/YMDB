@@ -60,6 +60,8 @@
 #include "yb/mdb/import/import_pipeline.h"
 #include "yb/mdb/import/insert_executor.h"
 #include "yb/mdb/import/nt_parser.h"
+#include "yb/mdb/import/rdf_term.h"
+#include "yb/util/uuid.h"
 #include "yb/mdb/model/rdf_yb_model.h"
 #include "yb/mdb/storage/yb_client_compat.h"
 #include "yb/mdb/storage/rdf_table_schema.h"
@@ -116,25 +118,22 @@ bool g_cluster_initialized = false;
 std::string g_keyspace;
 
 std::string IdToString(uint64_t id) {
-  if (!g_pack_to_gmap.empty()) {
-    auto pack_it = g_pack_to_gmap.find(id);
-    if (pack_it != g_pack_to_gmap.end()) {
-      id = pack_it->second;
+  auto graph = g_gmap_to_pack.find(id);
+  if (graph != g_gmap_to_pack.end()) {
+    id = graph->second.id;
+  }
+  const auto type = RDF_OID::get_generic_type(ObjectId(id));
+  if (type == RDF_OID::GenericType::BLANK) return "_:mdb" + std::to_string(id);
+  if (type == RDF_OID::GenericType::IRI) {
+    std::string iri;
+    if (!Conversions::try_unpack_iri(ObjectId(id), &iri)) {
+      throw QueryException("Cannot resolve RDF result IRI");
     }
+    return iri;
   }
-  auto it = g_gmap_to_uri.find(id);
-  if (it != g_gmap_to_uri.end()) {
-    return it->second;
-  }
-  if (g_id_map != nullptr) {
-    auto& name = g_id_map->Lookup(id);
-    if (!name.empty()) {
-      return name;
-    }
-  }
-  auto str = Conversions::to_lexical_str(ObjectId(id));
-  if (!str.empty()) {
-    return str;
+  if (type != RDF_OID::GenericType::NULL_ID) {
+    // An empty lexical form is a valid literal, not a missing dictionary entry.
+    return Conversions::to_lexical_str(ObjectId(id));
   }
   return std::to_string(id);
 }
@@ -211,20 +210,11 @@ Status LoadIdMapFromDocDB() {
     if (gmap_id <= 0 || !g_id_map->Restore(static_cast<uint64_t>(gmap_id), uri)) {
       return STATUS(Corruption, "Conflicting persisted RDF term mapping");
     }
-    g_pack_to_gmap[static_cast<uint64_t>(pack_id)] = static_cast<uint64_t>(gmap_id);
-    ObjectId pack_oid(static_cast<uint64_t>(pack_id));
-    g_gmap_to_pack[static_cast<uint64_t>(gmap_id)] = pack_oid;
-    if (!uri.empty()) {
-      auto oid_type = pack_oid.get_type();
-      if (oid_type == ObjectId::MASK_IRI_EXTERN ||
-          oid_type == ObjectId::MASK_IRI_INLINED) {
-        g_gmap_to_uri[static_cast<uint64_t>(gmap_id)] = std::string(uri);
-      } else if (oid_type == ObjectId::MASK_STRING_SIMPLE_EXTERN ||
-                 oid_type == ObjectId::MASK_STRING_XSD_EXTERN ||
-                 oid_type == ObjectId::MASK_STRING_LANG_EXTERN) {
-        uint64_t external_id = static_cast<uint64_t>(pack_id) & ObjectId::MASK_EXTERNAL_ID;
-        Conversions::set_extern_string(external_id, std::string(uri));
-      }
+    try {
+      auto term = yb::mdb::DecodeRdfDictionaryEntry(uri, ObjectId(static_cast<uint64_t>(pack_id)));
+      yb::mdb::RegisterRdfIdentity(static_cast<uint64_t>(gmap_id), term);
+    } catch (const std::exception& error) {
+      return STATUS(Corruption, error.what());
     }
   }
 
@@ -354,6 +344,11 @@ int ExecuteInsertData(const std::string& query_text) {
 
   if (!status.ok()) {
     LOG(WARNING) << "INSERT DATA failed: " << status;
+    return 1;
+  }
+  auto save_status = SaveIdMapToDocDB();
+  if (!save_status.ok()) {
+    LOG(WARNING) << "Failed to persist INSERT DATA dictionary: " << save_status;
     return 1;
   }
   return 0;
@@ -521,6 +516,7 @@ Status ImportNtFileWithIdMap(const std::string& file_path,
     return STATUS(IOError, "Cannot open file: " + file_path);
   }
 
+  const auto blank_scope = yb::Uuid::Generate().ToString();
   auto& model = yb::mdb::RdfYBModel::Instance();
   bool use_txn = model.UseTransactions();
   if (use_txn) {
@@ -548,32 +544,11 @@ Status ImportNtFileWithIdMap(const std::string& file_path,
 
     auto& triple = *result;
 
-    uint64_t subj_id = VERIFY_RESULT(model.ResolveTerm(id_map, triple.sub));
-    uint64_t pred_id = VERIFY_RESULT(model.ResolveTerm(id_map, triple.pred));
-
-    std::string obj_key = triple.obj;
-    if (triple.obj_type == yb::mdb::TripleTermType::LITERAL && !triple.object_type.empty()) {
-      obj_key = triple.obj + "|" + triple.object_type;
-    }
-    uint64_t obj_id = VERIFY_RESULT(model.ResolveTerm(id_map, obj_key));
-
-    ObjectId subj_pack = Conversions::pack_iri(triple.sub);
-    ObjectId pred_pack = Conversions::pack_iri(triple.pred);
-    g_pack_to_gmap[subj_pack.id] = subj_id;
-    g_pack_to_gmap[pred_pack.id] = pred_id;
-
-    if (triple.obj_type != yb::mdb::TripleTermType::LITERAL) {
-      ObjectId obj_pack = Conversions::pack_iri(triple.obj);
-      g_pack_to_gmap[obj_pack.id] = obj_id;
-    } else {
-      ObjectId obj_pack;
-      if (triple.object_type.empty()) {
-        obj_pack = Conversions::pack_string_simple(triple.obj);
-      } else {
-        obj_pack = Conversions::pack_string_xsd(triple.obj);
-      }
-      g_pack_to_gmap[obj_pack.id] = obj_id;
-    }
+    uint64_t subj_id = VERIFY_RESULT(model.ResolveRdfTerm(
+        id_map, triple.sub_type, triple.sub, "", blank_scope));
+    uint64_t pred_id = VERIFY_RESULT(model.ResolveRdfTerm(id_map, triple.pred_type, triple.pred));
+    uint64_t obj_id = VERIFY_RESULT(model.ResolveRdfTerm(
+        id_map, triple.obj_type, triple.obj, triple.object_type, blank_scope));
 
     auto write_status = model.WriteTripleToDocDB(subj_id, pred_id, obj_id);
     if (!write_status.ok()) {
@@ -750,13 +725,6 @@ int YBCMdbImportFile(const char* file_path) {
   LOG(INFO) << "Import: parsed=" << parsed
             << " written=" << written
             << " errors=" << errors;
-
-  g_gmap_to_uri.clear();
-  for (const auto& [i, uri] : g_id_map->Entries()) {
-    if (!uri.empty()) {
-      g_gmap_to_uri[i] = uri;
-    }
-  }
 
   auto save_idmap_status = SaveIdMapToDocDB();
   if (!save_idmap_status.ok()) {

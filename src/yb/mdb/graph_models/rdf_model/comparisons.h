@@ -29,7 +29,15 @@ public:
             }
             return lhs_text.compare(rhs_text);
         }
-        // Keep existing within-literal ordering; this change fixes IRI ordering only.
+        if (RDF_OID::get_generic_type(lhs) == RDF_OID::GenericType::NUMERIC &&
+            RDF_OID::get_generic_type(rhs) == RDF_OID::GenericType::NUMERIC) {
+            return NumericCompare(lhs, rhs);
+        }
+        if (RDF_OID::get_generic_type(lhs) == RDF_OID::GenericType::STRING &&
+            RDF_OID::get_generic_type(rhs) == RDF_OID::GenericType::STRING) {
+            const auto text_order = Conversions::unpack_string(lhs).compare(Conversions::unpack_string(rhs));
+            if (text_order) return text_order;
+        }
         return lhs.id < rhs.id ? -1 : 1;
     }
 
@@ -38,10 +46,32 @@ public:
     }
 
     static int64_t strict_compare(ObjectId lhs, ObjectId rhs, bool* error) {
-        return _compare<Mode::Strict>(lhs, rhs, error);
+        *error = false;
+        auto left = RDF_OID::get_generic_type(lhs), right = RDF_OID::get_generic_type(rhs);
+        if (left == RDF_OID::GenericType::NUMERIC && right == left) return NumericCompare(lhs, rhs);
+        if (left == RDF_OID::GenericType::STRING && right == left) {
+            auto ls = RDF_OID::get_generic_subtype(lhs), rs = RDF_OID::get_generic_subtype(rhs);
+            if (ls == RDF_OID::GenericSubType::STRING_LANG && rs == ls) {
+                auto l = Conversions::unpack_string_lang(lhs), r = Conversions::unpack_string_lang(rhs);
+                if (l.first == r.first) return l.second.compare(r.second);
+            } else if ((ls == RDF_OID::GenericSubType::STRING_SIMPLE || ls == RDF_OID::GenericSubType::STRING_XSD) &&
+                       (rs == RDF_OID::GenericSubType::STRING_SIMPLE || rs == RDF_OID::GenericSubType::STRING_XSD)) {
+                return Conversions::unpack_string(lhs).compare(Conversions::unpack_string(rhs));
+            }
+        }
+        *error = true;
+        return 0;
     }
 
 private:
+    static int64_t NumericCompare(ObjectId lhs, ObjectId rhs) {
+        if (Conversions::calculate_optype(lhs, rhs) == Conversions::OpType::INTEGER) {
+            const auto l = Conversions::unpack_int(lhs), r = Conversions::unpack_int(rhs);
+            return l < r ? -1 : l > r ? 1 : 0;
+        }
+        const auto l = Conversions::to_double(lhs), r = Conversions::to_double(rhs);
+        return l < r ? -1 : l > r ? 1 : 0;
+    }
     enum class Mode { Normal, Strict };
 
     template<Mode mode>

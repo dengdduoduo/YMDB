@@ -1852,91 +1852,27 @@ Any QueryVisitor::visitRdfLiteral(SparqlParser::RdfLiteralContext* ctx) {
 
 
 Any QueryVisitor::visitNumericLiteralUnsigned(SparqlParser::NumericLiteralUnsignedContext* ctx) {
-    LOG_VISITOR
-    if (ctx->INTEGER()) {
-        current_sparql_element = handleIntegerString(ctx->getText(), "http://www.w3.org/2001/XMLSchema#integer");
-    } else if (ctx->DECIMAL()) {
-        bool error;
-        Decimal dec(ctx->getText(), &error);
-        if (error) {
-            throw QueryException("Invalid decimal value: " + ctx->getText());
-        }
-        current_sparql_element = Conversions::pack_decimal(dec.to_double());
-    } else {
-        // Double
-         try {
-            current_sparql_element = Conversions::pack_double(std::stod(ctx->getText()));
-        } catch (const std::out_of_range& e) {
-            current_sparql_element = Conversions::pack_string_datatype(
-                "http://www.w3.org/2001/XMLSchema#double",
-                ctx->getText());
-        } catch (const std::invalid_argument& e) {
-            current_sparql_element = Conversions::pack_string_datatype(
-                "http://www.w3.org/2001/XMLSchema#double",
-                ctx->getText());
-        }
-    }
+    const std::string type = ctx->INTEGER() ? "integer" : ctx->DECIMAL() ? "decimal" : "double";
+    current_sparql_element = Conversions::try_pack_string_datatype(
+        std::string(RdfTermIdentity::kXsd) + type, ctx->getText());
     return 0;
 }
-
 
 Any QueryVisitor::visitNumericLiteralPositive(SparqlParser::NumericLiteralPositiveContext* ctx) {
-    LOG_VISITOR
-    if (ctx->INTEGER_POSITIVE()) {
-        current_sparql_element = handleIntegerString(ctx->getText(), "http://www.w3.org/2001/XMLSchema#positiveInteger");
-    } else if (ctx->DECIMAL_POSITIVE()) {
-        bool error;
-        Decimal dec(ctx->getText(), &error);
-        if (error) {
-            throw QueryException("Invalid decimal value: " + ctx->getText());
-        }
-        current_sparql_element = Conversions::pack_decimal(dec.to_double());
-    } else {
-        // Double
-        try {
-            current_sparql_element = Conversions::pack_double(std::stod(ctx->getText()));
-        } catch (const std::out_of_range& e) {
-            current_sparql_element = Conversions::pack_string_datatype(
-                "http://www.w3.org/2001/XMLSchema#double",
-                ctx->getText());
-        } catch (const std::invalid_argument& e) {
-            current_sparql_element = Conversions::pack_string_datatype(
-                "http://www.w3.org/2001/XMLSchema#double",
-                ctx->getText());
-        }
-    }
+    const std::string type = ctx->INTEGER_POSITIVE() ? "integer" :
+        ctx->DECIMAL_POSITIVE() ? "decimal" : "double";
+    current_sparql_element = Conversions::try_pack_string_datatype(
+        std::string(RdfTermIdentity::kXsd) + type, ctx->getText());
     return 0;
 }
-
 
 Any QueryVisitor::visitNumericLiteralNegative(SparqlParser::NumericLiteralNegativeContext* ctx) {
-    LOG_VISITOR
-    if (ctx->INTEGER_NEGATIVE()) {
-        current_sparql_element = handleIntegerString(ctx->getText(), "http://www.w3.org/2001/XMLSchema#negativeInteger");
-    } else if (ctx->DECIMAL_NEGATIVE()) {
-        bool error;
-        Decimal dec(ctx->getText(), &error);
-        if (error) {
-            throw QueryException("Invalid decimal value: " + ctx->getText());
-        }
-        current_sparql_element = Conversions::pack_decimal(dec.to_double());
-    } else {
-        // Double
-        try {
-            current_sparql_element = Conversions::pack_double(std::stod(ctx->getText()));
-        } catch (const std::out_of_range& e) {
-            current_sparql_element = Conversions::pack_string_datatype(
-                "http://www.w3.org/2001/XMLSchema#double",
-                ctx->getText());
-        } catch (const std::invalid_argument& e) {
-            current_sparql_element = Conversions::pack_string_datatype(
-                "http://www.w3.org/2001/XMLSchema#double",
-                ctx->getText());
-        }
-    }
+    const std::string type = ctx->INTEGER_NEGATIVE() ? "integer" :
+        ctx->DECIMAL_NEGATIVE() ? "decimal" : "double";
+    current_sparql_element = Conversions::try_pack_string_datatype(
+        std::string(RdfTermIdentity::kXsd) + type, ctx->getText());
     return 0;
 }
-
 
 Any QueryVisitor::visitBooleanLiteral(SparqlParser::BooleanLiteralContext* ctx) {
     LOG_VISITOR

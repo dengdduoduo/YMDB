@@ -21,6 +21,7 @@ struct Triple {
   TripleTermType sub_type;
   TripleTermType pred_type;
   TripleTermType obj_type;
+  // Empty means xsd:string, '@tag' means language, otherwise an absolute datatype IRI.
   std::string object_type;
 
   bool operator==(const Triple& other) const {

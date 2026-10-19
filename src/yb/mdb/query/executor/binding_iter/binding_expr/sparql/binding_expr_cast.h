@@ -291,20 +291,20 @@ public:
             case CastType::xsd_string:
                 return Conversions::pack_string_simple(Conversions::to_lexical_str(oid));
             case CastType::xsd_float: {
-                float flt = oid == Conversions::pack_bool(true) ? 1.0 : 0.0;
+                float flt = oid.is_true() ? 1.0 : 0.0;
                 return Conversions::pack_float(flt);
             }
             case CastType::xsd_double: {
-                double dbl = oid == Conversions::pack_bool(true) ? 1.0 : 0.0;
+                double dbl = oid.is_true() ? 1.0 : 0.0;
                 return Conversions::pack_double(dbl);
             }
             case CastType::xsd_decimal: {
-                int64_t num = oid == Conversions::pack_bool(true) ? 1 : 0;
+                int64_t num = oid.is_true() ? 1 : 0;
                 Decimal dec(num);
                 return Conversions::pack_decimal(dec);
             }
             case CastType::xsd_integer: {
-                int64_t num = oid == Conversions::pack_bool(true) ? 1 : 0;
+                int64_t num = oid.is_true() ? 1 : 0;
                 return Conversions::pack_int(num);
             }
             case CastType::xsd_dateTime:

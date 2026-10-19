@@ -37,9 +37,6 @@ RdfXmlParser::NamespaceMap RdfXmlParser::ExtractNamespaces(
 
     std::string uri = xml_content.substr(quote_start + 1, quote_end - quote_start - 1);
 
-    if (!uri.empty() && uri.back() != '/') {
-      uri += '/';
-    }
 
     ns_map[prefix] = uri;
     pos = quote_end + 1;
@@ -90,6 +87,7 @@ std::vector<Triple> RdfXmlParser::ParseDescription(
   std::vector<Triple> triples;
 
   std::string about = ExtractAttrValue(element, "rdf:about");
+  const bool blank_subject = about.empty();
   if (about.empty()) {
     about = ExtractAttrValue(element, "rdf:nodeID");
   }
@@ -139,7 +137,7 @@ std::vector<Triple> RdfXmlParser::ParseDescription(
       if (!resource.empty()) {
         Triple triple;
         triple.sub = about;
-        triple.sub_type = TripleTermType::URI;
+        triple.sub_type = blank_subject ? TripleTermType::BLANK : TripleTermType::URI;
         triple.pred = uri;
         triple.pred_type = TripleTermType::URI;
         triple.obj = resource;
@@ -161,25 +159,20 @@ std::vector<Triple> RdfXmlParser::ParseDescription(
     std::string_view content = body.substr(tag_end + 1, close_pos - tag_end - 1);
 
     std::string datatype = ExtractAttrValue(tag, "rdf:datatype");
-
-    while (!content.empty() && (content.front() == ' ' || content.front() == '\t' ||
-                                content.front() == '\n' || content.front() == '\r')) {
-      content.remove_prefix(1);
-    }
-    while (!content.empty() && (content.back() == ' ' || content.back() == '\t' ||
-                                content.back() == '\n' || content.back() == '\r')) {
-      content.remove_suffix(1);
-    }
+    std::string language = ExtractAttrValue(tag, "xml:lang");
+    if (language.empty()) language = ExtractAttrValue(element.substr(0, end_tag + 1), "xml:lang");
 
     Triple triple;
     triple.sub = about;
-    triple.sub_type = TripleTermType::URI;
+    triple.sub_type = blank_subject ? TripleTermType::BLANK : TripleTermType::URI;
     triple.pred = uri;
     triple.pred_type = TripleTermType::URI;
     triple.obj = std::string(content);
     triple.obj_type = TripleTermType::LITERAL;
     if (!datatype.empty()) {
       triple.object_type = datatype;
+    } else if (!language.empty()) {
+      triple.object_type = "@" + language;
     }
     triples.push_back(triple);
 

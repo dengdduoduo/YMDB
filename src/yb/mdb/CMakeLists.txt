@@ -197,3 +197,5 @@ target_compile_options(mdb_distributed_integration_test PRIVATE -Wno-shorten-64-
 # ---- MDB CLI Tool ----
 add_executable(mdb_cli tools/mdb_cli.cc)
 target_link_libraries(mdb_cli yb_mdb)
+# The process-isolation regression invokes this binary from the test directory.
+add_dependencies(mdb_distributed_integration_test mdb_cli)

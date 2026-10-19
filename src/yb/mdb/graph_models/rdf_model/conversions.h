@@ -6,6 +6,10 @@
 #include <cstring>
 #include <mutex>
 #include <unordered_map>
+#include <limits>
+#include <regex>
+#include <sstream>
+#include <iomanip>
 #include "graph_models/common/datatypes/decimal.h"
 #include "graph_models/common/datatypes/datetime.h"
 #include "graph_models/common/datatypes/tensor/tensor.h"
@@ -131,7 +135,7 @@ public:
     }
 
     static ObjectId pack_string_simple(const std::string& str) {
-        if (str.size() <= ObjectId::STR_INLINE_BYTES) {
+        if (str.size() <= ObjectId::STR_INLINE_BYTES && str.find('\0') == std::string::npos) {
             return ObjectId(inline_string_7(str.c_str()) | ObjectId::MASK_STRING_SIMPLE_INLINED);
         }
         uint64_t hash = fnv1a_64(str);
@@ -139,63 +143,59 @@ public:
         {
             std::lock_guard<std::mutex> lock(string_storage_mutex());
             auto& storage = extern_string_storage();
-            if (storage.find(content) == storage.end()) {
-                storage[content] = str;
-            }
+            auto [it, inserted] = storage.emplace(content, str);
+            if (!inserted && it->second != str) throw std::runtime_error("RDF string hash collision");
         }
         return ObjectId(ObjectId::MASK_STRING_SIMPLE_EXTERN | content);
     }
 
     static ObjectId pack_string_xsd(const std::string& str) {
-        if (str.size() <= ObjectId::STR_INLINE_BYTES) {
-            return ObjectId(inline_string_7(str.c_str()) | ObjectId::MASK_STRING_XSD_INLINED);
-        }
-        uint64_t hash = fnv1a_64(str);
-        uint64_t content = hash & ObjectId::MASK_EXTERNAL_ID;
-        {
-            std::lock_guard<std::mutex> lock(string_storage_mutex());
-            auto& storage = extern_string_storage();
-            if (storage.find(content) == storage.end()) {
-                storage[content] = str;
-            }
-        }
-        return ObjectId(ObjectId::MASK_STRING_XSD_EXTERN | content);
+        return pack_string_simple(str);
     }
 
     static ObjectId pack_string_datatype(const std::string& datatype, const std::string& str) {
-        if (str.size() <= ObjectId::STR_DT_INLINE_BYTES) {
-            return ObjectId(inline_string_5(str.c_str()) | ObjectId::MASK_STRING_DATATYPE_INLINED);
-        }
-        uint64_t hash = fnv1a_64(str);
-        uint64_t content = hash & ObjectId::MASK_EXTERNAL_ID;
-        {
-            std::lock_guard<std::mutex> lock(string_storage_mutex());
-            auto& storage = extern_string_storage();
-            if (storage.find(content) == storage.end()) {
-                storage[content] = str;
-            }
-        }
-        return ObjectId(ObjectId::MASK_STRING_DATATYPE_EXTERN | content);
+        if (datatype == std::string(RdfTermIdentity::kXsd) + "string") return pack_string_simple(str);
+        return ObjectId(RdfTermRegistry::Pack(ObjectId::MASK_STRING_DATATYPE_EXTERN,
+                                             {'L', str, datatype}));
     }
 
     static ObjectId pack_string_lang(const std::string& lang, const std::string& str) {
-        if (str.size() <= ObjectId::STR_LANG_INLINE_BYTES) {
-            return ObjectId(inline_string_5(str.c_str()) | ObjectId::MASK_STRING_LANG_INLINED);
-        }
-        uint64_t hash = fnv1a_64(str);
-        uint64_t content = hash & ObjectId::MASK_EXTERNAL_ID;
-        {
-            std::lock_guard<std::mutex> lock(string_storage_mutex());
-            auto& storage = extern_string_storage();
-            if (storage.find(content) == storage.end()) {
-                storage[content] = str;
-            }
-        }
-        return ObjectId(ObjectId::MASK_STRING_LANG_EXTERN | content);
+        return ObjectId(RdfTermRegistry::Pack(ObjectId::MASK_STRING_LANG_EXTERN,
+            {'G', str, RdfTermIdentity::NormalizeLanguage(lang)}));
     }
 
-    static ObjectId try_pack_string_datatype(const std::string&, const std::string& str) {
-        return pack_string_simple(str);
+    static ObjectId try_pack_string_datatype(const std::string& datatype, const std::string& str) {
+        const std::string xsd = RdfTermIdentity::kXsd;
+        if (datatype == xsd + "string") return pack_string_simple(str);
+        uint64_t mask = ObjectId::MASK_STRING_DATATYPE_EXTERN;
+        static const std::regex integer("[+-]?[0-9]+");
+        static const std::regex decimal("[+-]?([0-9]+(\\.[0-9]*)?|\\.[0-9]+)");
+        static const std::regex floating("[+-]?(([0-9]+(\\.[0-9]*)?|\\.[0-9]+)([eE][+-]?[0-9]+)?|INF)|NaN");
+        try {
+            if (datatype == xsd + "integer" && std::regex_match(str, integer)) {
+                size_t end;
+                (void)std::stoll(str, &end);
+                if (end == str.size()) mask = ObjectId::MASK_INT64_EXTERN;
+            } else if (datatype == xsd + "decimal" && std::regex_match(str, decimal)) {
+                bool error = false;
+                Decimal value(str, &error);
+                if (!error) mask = ObjectId::MASK_DECIMAL_EXTERN;
+            } else if ((datatype == xsd + "float" || datatype == xsd + "double") &&
+                       std::regex_match(str, floating)) {
+                size_t end;
+                if (datatype == xsd + "float") (void)std::stof(str, &end);
+                else (void)std::stod(str, &end);
+                if (end == str.size()) mask = datatype == xsd + "float" ?
+                    ObjectId::MASK_FLOAT : ObjectId::MASK_DOUBLE_EXTERN;
+            } else if (datatype == xsd + "boolean") {
+                if (str == "true") return pack_bool(true);
+                if (str == "false") return pack_bool(false);
+                if (str == "1" || str == "0") mask = ObjectId::MASK_BOOL;
+            }
+        } catch (const std::exception&) {
+            // Ill-typed or unrepresentable values retain their RDF identity.
+        }
+        return ObjectId(RdfTermRegistry::Pack(mask, {'L', str, datatype}));
     }
 
     static ObjectId pack_empty_string() {
@@ -203,33 +203,31 @@ public:
     }
 
     static ObjectId pack_int(int64_t i) {
-        return ObjectId((static_cast<uint64_t>(i) << 8) | ObjectId::MASK_POSITIVE_INT);
+        return try_pack_string_datatype(std::string(RdfTermIdentity::kXsd) + "integer",
+                                        std::to_string(i));
     }
 
     static ObjectId pack_float(float f) {
-        uint64_t bits;
-        std::memcpy(&bits, &f, sizeof(float));
-        return ObjectId(ObjectId::MASK_FLOAT | (bits & 0x00'00FFFFFFFFFFFFUL));
+        std::ostringstream text;
+        text << std::setprecision(std::numeric_limits<float>::max_digits10) << f;
+        return ObjectId(RdfTermRegistry::Pack(ObjectId::MASK_FLOAT,
+            {'L', text.str(), std::string(RdfTermIdentity::kXsd) + "float"}));
     }
 
     static ObjectId pack_double(double d) {
-        uint64_t bits;
-        std::memcpy(&bits, &d, sizeof(double));
-        uint64_t content = bits & ObjectId::MASK_EXTERNAL_ID;
-        return ObjectId(ObjectId::MASK_DOUBLE_EXTERN | content);
+        std::ostringstream text;
+        text << std::setprecision(std::numeric_limits<double>::max_digits10) << d;
+        return ObjectId(RdfTermRegistry::Pack(ObjectId::MASK_DOUBLE_EXTERN,
+            {'L', text.str(), std::string(RdfTermIdentity::kXsd) + "double"}));
     }
 
     static ObjectId pack_decimal(const Decimal& dec) {
-        char buffer[Decimal::EXTERN_BUFFER_SIZE];
-        dec.serialize_extern(buffer);
-        uint64_t packed = 0;
-        for (size_t i = 0; i < Decimal::EXTERN_BUFFER_SIZE && i < sizeof(uint64_t); i++) {
-            packed |= static_cast<uint64_t>(static_cast<unsigned char>(buffer[i])) << (i * 8);
-        }
-        return ObjectId(ObjectId::MASK_DECIMAL_EXTERN | packed);
+        return ObjectId(RdfTermRegistry::Pack(ObjectId::MASK_DECIMAL_EXTERN,
+            {'L', dec.to_string(), std::string(RdfTermIdentity::kXsd) + "decimal"}));
     }
 
     static ObjectId pack_decimal(double d) {
+        if (d == 0) return pack_decimal(Decimal(int64_t(0)));
         return pack_decimal(Decimal(d));
     }
 
@@ -239,7 +237,8 @@ public:
         ObjectId packed(ObjectId::MASK_IRI_INLINED | content);
         // Query constants also need their lexical form, even without a graph dictionary entry.
         std::lock_guard<std::mutex> lock(string_storage_mutex());
-        iri_storage().emplace(packed.id, iri);
+        auto [it, inserted] = iri_storage().emplace(packed.id, iri);
+        if (!inserted && it->second != iri) throw std::runtime_error("RDF IRI hash collision");
         return packed;
     }
 
@@ -281,6 +280,7 @@ public:
     static ObjectId unpack_special_path(const std::string&) { return ObjectId::get_null(); }
 
     static std::string unpack_string(ObjectId oid) {
+        if (auto term = RdfTermRegistry::Find(oid.id)) return term->lexical;
         switch (oid.get_type()) {
         case ObjectId::MASK_STRING_SIMPLE_INLINED:
         case ObjectId::MASK_STRING_XSD_INLINED:
@@ -316,6 +316,7 @@ public:
     }
 
     static float unpack_float(ObjectId oid) {
+        if (auto term = RdfTermRegistry::Find(oid.id)) return std::stof(term->lexical);
         uint32_t bits = static_cast<uint32_t>(oid.id & 0xFFFFFFFF);
         float f;
         std::memcpy(&f, &bits, sizeof(float));
@@ -323,10 +324,12 @@ public:
     }
 
     static int64_t unpack_int(ObjectId oid) {
+        if (auto term = RdfTermRegistry::Find(oid.id)) return std::stoll(term->lexical);
         return static_cast<int64_t>((oid.id >> 8) & 0x0000FFFFFFFFFFFF);
     }
 
     static double unpack_double(ObjectId oid) {
+        if (auto term = RdfTermRegistry::Find(oid.id)) return std::stod(term->lexical);
         uint64_t bits = oid.id & ObjectId::MASK_EXTERNAL_ID;
         double d;
         std::memcpy(&d, &bits, sizeof(double));
@@ -334,6 +337,12 @@ public:
     }
 
     static Decimal unpack_decimal(ObjectId oid) {
+        if (auto term = RdfTermRegistry::Find(oid.id)) {
+            bool error = false;
+            Decimal result(term->lexical, &error);
+            if (error) throw std::runtime_error("Invalid stored decimal");
+            return result;
+        }
         uint64_t data = oid.id & ObjectId::MASK_EXTERNAL_ID;
         char buffer[Decimal::EXTERN_BUFFER_SIZE];
         for (size_t i = 0; i < Decimal::EXTERN_BUFFER_SIZE; i++) {
@@ -343,11 +352,15 @@ public:
     }
 
     static std::pair<std::string, std::string> unpack_string_lang(ObjectId oid) {
-        return {"", unpack_string(oid)};
+        auto term = RdfTermRegistry::Find(oid.id);
+        if (!term || term->kind != 'G') throw std::runtime_error("Missing RDF language identity");
+        return {term->qualifier, term->lexical};
     }
 
     static std::pair<std::string, std::string> unpack_string_datatype(ObjectId oid) {
-        return {"", unpack_string(oid)};
+        auto term = RdfTermRegistry::Find(oid.id);
+        if (!term || term->kind != 'L') throw std::runtime_error("Missing RDF datatype identity");
+        return {term->qualifier, term->lexical};
     }
 
     static bool try_unpack_iri(ObjectId oid, std::string* text) {
@@ -386,12 +399,16 @@ public:
     }
 
     static ObjectId to_boolean(ObjectId oid) {
+        if (RDF_OID::get_generic_type(oid) == RDF_OID::GenericType::NUMERIC) {
+            const auto number = to_double(oid);
+            return pack_bool(number != 0 && !std::isnan(number));
+        }
         uint64_t mask = oid.id & ObjectId::TYPE_MASK;
         if (oid.id == ObjectId::BOOL_TRUE || oid.id == ObjectId::BOOL_FALSE) {
             return oid;
         }
         if (mask == ObjectId::MASK_BOOL) {
-            return oid;
+            return pack_bool(oid.is_true());
         }
         if (mask == ObjectId::MASK_STRING_SIMPLE_INLINED ||
             mask == ObjectId::MASK_STRING_SIMPLE_EXTERN ||
@@ -407,6 +424,7 @@ public:
     }
 
     static std::string to_lexical_str(ObjectId oid) {
+        if (auto term = RdfTermRegistry::Find(oid.id)) return term->lexical;
         switch (RDF_OID::get_type(oid)) {
         case RDF_OID::Type::STRING_SIMPLE_INLINE:
         case RDF_OID::Type::STRING_SIMPLE_EXTERN:
@@ -446,9 +464,7 @@ public:
     }
 
     static ObjectId string_simple_to_xsd(ObjectId oid) {
-        return ObjectId(
-            (oid.id & ~ObjectId::SUB_TYPE_MASK) | ObjectId::MASK_STRING_XSD_INLINED
-        );
+        return pack_string_simple(unpack_string(oid));
     }
 
     static double to_double(ObjectId oid) {

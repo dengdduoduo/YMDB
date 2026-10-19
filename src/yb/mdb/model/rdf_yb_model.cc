@@ -13,6 +13,7 @@
 
 #include "yb/mdb/model/rdf_yb_model.h"
 #include "yb/mdb/import/import.h"
+#include "yb/mdb/import/rdf_term.h"
 
 #include <future>
 #include <chrono>
@@ -92,6 +93,21 @@ Result<uint64_t> RdfYBModel::ResolveTerm(IdMap& local_map, std::string_view term
     return STATUS(Corruption, "Persistent RDF dictionary conflicts with local mapping");
   }
   return id;
+}
+
+Result<uint64_t> RdfYBModel::ResolveRdfTerm(
+    IdMap& local_map, TripleTermType type, const std::string& lexical,
+    const std::string& qualifier, const std::string& blank_scope) {
+  try {
+    const auto identity = RdfIdentity(type, lexical, qualifier, blank_scope);
+    // Validate the packed identity before allocating a persistent ID.
+    (void)PackRdfIdentity(identity);
+    auto id = VERIFY_RESULT(ResolveTerm(local_map, RdfDictionaryKey(identity)));
+    RegisterRdfIdentity(id, identity);
+    return id;
+  } catch (const std::exception& error) {
+    return STATUS(Corruption, error.what());
+  }
 }
 
 DocDBRangeCache& RdfYBModel::GetCache(int perm_index) {
@@ -333,6 +349,9 @@ void RdfYBModel::ClearAll() {
   txn_manager_.reset();
   client_ = nullptr;
   term_dictionary_ = PersistentIdMap();
+  g_gmap_to_uri.clear();
+  g_gmap_to_pack.clear();
+  g_pack_to_gmap.clear();
   initialized_ = false;
   connected_ = false;
 }

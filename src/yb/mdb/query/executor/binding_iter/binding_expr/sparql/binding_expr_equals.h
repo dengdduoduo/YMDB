@@ -100,6 +100,10 @@ public:
         }
 
         // If both types are numeric we need to do a numeric comparison
+        if (lhs_generic_type == RDF_OID::GenericType::BOOL &&
+            rhs_generic_type == RDF_OID::GenericType::BOOL) {
+            return Conversions::pack_bool(lhs_oid.is_true() == rhs_oid.is_true());
+        }
         if (lhs_generic_type == RDF_OID::GenericType::NUMERIC
             && rhs_generic_type == RDF_OID::GenericType::NUMERIC)
         {

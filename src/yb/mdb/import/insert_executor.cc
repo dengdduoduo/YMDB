@@ -6,6 +6,7 @@
 #include "yb/mdb/model/rdf_yb_model.h"
 #include "yb/util/logging.h"
 #include "yb/util/scope_exit.h"
+#include "yb/util/uuid.h"
 
 namespace yb::mdb {
 
@@ -28,23 +29,10 @@ Status InsertDataExecutor::Execute(const std::string& insert_data_query,
   }
 
   std::vector<Triple> triples;
-  std::istringstream stream(triple_block);
-  std::string line;
-
-  while (std::getline(stream, line, '.')) {
-    size_t start = line.find_first_not_of(" \t\r\n");
-    if (start == std::string::npos) continue;
-    line = line.substr(start);
-    line += " .";
-
-    auto result = NtParser::ParseLine(line);
-    if (!result.ok()) {
-      stats.errors++;
-      LOG(WARNING) << "INSERT DATA parse error: " << result.status();
-      continue;
-    }
-    triples.push_back(std::move(*result));
-    stats.triples_parsed++;
+  auto lines = VERIFY_RESULT(NtParser::SplitStatements(triple_block));
+  for (const auto& line : lines) {
+    triples.push_back(VERIFY_RESULT(NtParser::ParseLine(line)));
+    ++stats.triples_parsed;
   }
 
   if (triples.empty()) {
@@ -52,6 +40,7 @@ Status InsertDataExecutor::Execute(const std::string& insert_data_query,
   }
 
   auto& model = RdfYBModel::Instance();
+  const auto blank_scope = Uuid::Generate().ToString();
   bool use_txn = model.UseTransactions();
   if (use_txn) {
     RETURN_NOT_OK(model.BeginTransaction());
@@ -61,9 +50,11 @@ Status InsertDataExecutor::Execute(const std::string& insert_data_query,
   });
 
   for (const auto& triple : triples) {
-    uint64_t subj_id = VERIFY_RESULT(model.ResolveTerm(id_map, triple.sub));
-    uint64_t pred_id = VERIFY_RESULT(model.ResolveTerm(id_map, triple.pred));
-    uint64_t obj_id = VERIFY_RESULT(model.ResolveTerm(id_map, triple.obj));
+    uint64_t subj_id = VERIFY_RESULT(model.ResolveRdfTerm(
+        id_map, triple.sub_type, triple.sub, "", blank_scope));
+    uint64_t pred_id = VERIFY_RESULT(model.ResolveRdfTerm(id_map, triple.pred_type, triple.pred));
+    uint64_t obj_id = VERIFY_RESULT(model.ResolveRdfTerm(
+        id_map, triple.obj_type, triple.obj, triple.object_type, blank_scope));
 
     auto status = model.WriteTripleToDocDB(subj_id, pred_id, obj_id);
     if (!status.ok()) {

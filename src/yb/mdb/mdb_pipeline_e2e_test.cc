@@ -32,10 +32,90 @@
 #include "query/query_context.h"
 #include "yb/mdb/adapter/mdb_adapter.h"
 #include "yb/mdb/model/rdf_yb_model.h"
+#include "yb/mdb/import/rdf_term.h"
 
 using namespace SPARQL;
 
 namespace yb::mdb {
+
+TEST(MdbRdfIdentityTest, LanguageAndDatatypeArePartOfIdentity) {
+  for (const std::string text : {"hi", "a long literal with | separators"}) {
+    auto en = Conversions::pack_string_lang("EN-us", text);
+    EXPECT_EQ(en, Conversions::pack_string_lang("en-US", text));
+    EXPECT_NE(en, Conversions::pack_string_lang("fr", text));
+    EXPECT_EQ(Conversions::unpack_string_lang(en), (std::make_pair(std::string("en-us"), text)));
+    auto first = Conversions::try_pack_string_datatype("urn:type:first", text);
+    EXPECT_NE(first, Conversions::try_pack_string_datatype("urn:type:second", text));
+    EXPECT_NE(first, Conversions::pack_string_simple(text));
+    EXPECT_EQ(Conversions::unpack_string_datatype(first),
+              (std::make_pair(std::string("urn:type:first"), text)));
+    EXPECT_EQ(Conversions::pack_string_simple(text), Conversions::pack_string_xsd(text));
+  }
+}
+
+TEST(MdbRdfIdentityTest, NumericIdentityPreservesLexicalFormsAndValues) {
+  const std::string xsd = RdfTermIdentity::kXsd;
+  auto one = Conversions::try_pack_string_datatype(xsd + "integer", "1");
+  auto zero_one = Conversions::try_pack_string_datatype(xsd + "integer", "01");
+  EXPECT_NE(one, zero_one);
+  EXPECT_EQ(Conversions::unpack_int(one), Conversions::unpack_int(zero_one));
+  EXPECT_EQ(Conversions::to_lexical_str(zero_one), "01");
+  EXPECT_EQ(one, Conversions::pack_int(1));
+  EXPECT_EQ(Conversions::unpack_int(Conversions::pack_int(-123)), -123);
+  EXPECT_EQ(Conversions::unpack_int(Conversions::pack_int(INT64_MAX)), INT64_MAX);
+  EXPECT_DOUBLE_EQ(Conversions::unpack_double(Conversions::pack_double(-123.25)), -123.25);
+  EXPECT_FLOAT_EQ(Conversions::unpack_float(Conversions::pack_float(-1.5f)), -1.5f);
+  auto decimal = Conversions::try_pack_string_datatype(xsd + "decimal", "1.00");
+  EXPECT_EQ(Conversions::to_lexical_str(decimal), "1.00");
+  EXPECT_DOUBLE_EQ(Conversions::unpack_decimal(decimal).to_double(), 1);
+  EXPECT_TRUE(Conversions::try_pack_string_datatype(xsd + "boolean", "1").is_true());
+  EXPECT_NE(Conversions::pack_bool(true), Conversions::try_pack_string_datatype(xsd + "boolean", "1"));
+  EXPECT_EQ(RDF_OID::get_generic_type(Conversions::try_pack_string_datatype(xsd + "integer", "bad")),
+            RDF_OID::GenericType::STRING);
+}
+
+TEST(MdbRdfIdentityTest, VersionedKeysAvoidDelimiterAndKindCollisions) {
+  const auto plain = RdfIdentity(TripleTermType::LITERAL, "a|b", "urn:c");
+  const auto other = RdfIdentity(TripleTermType::LITERAL, "a", "urn:b|c");
+  EXPECT_NE(plain.Key(), other.Key());
+  EXPECT_NE(RdfDictionaryKey(plain), RdfDictionaryKey(RdfIdentity(TripleTermType::URI, "a|b")));
+  auto packed = PackRdfIdentity(plain);
+  auto decoded = DecodeRdfDictionaryEntry(plain.Key(), packed);
+  EXPECT_EQ(decoded.Key(), plain.Key());
+  EXPECT_EQ(PackRdfIdentity(decoded), packed);
+  EXPECT_THROW(DecodeRdfDictionaryEntry("old literal|en", packed), std::runtime_error);
+  EXPECT_THROW(RdfTermIdentity::Decode(std::string("\0MDB1L999:", 10)), std::runtime_error);
+  auto first = RdfIdentity(TripleTermType::BLANK, "_:b", "", "import-1");
+  auto second = RdfIdentity(TripleTermType::BLANK, "_:b", "", "import-2");
+  EXPECT_NE(PackRdfIdentity(first), PackRdfIdentity(second));
+  EXPECT_EQ(RDF_OID::get_generic_type(PackRdfIdentity(first)), RDF_OID::GenericType::BLANK);
+}
+
+TEST(MdbRdfIdentityTest, ExpressionsKeepIdentitySeparateFromNumericEquality) {
+  RdfYBModel::Instance().ClearAll();
+  std::multiset<std::string> values;
+  auto collect = [](const char*, const char* value, void* arg) {
+    static_cast<std::multiset<std::string>*>(arg)->insert(value);
+  };
+  EXPECT_EQ(YBCMdbExecuteSparql(
+      "PREFIX xsd: <http://www.w3.org/2001/XMLSchema#> SELECT ?v WHERE { VALUES ?v { \"ok\" } "
+      "FILTER(!sameTerm(\"x\"@en, \"x\"@fr) && sameTerm(\"x\"@EN, \"x\"@en) && "
+      "sameTerm(\"x\", \"x\"^^xsd:string) && !sameTerm(\"01\"^^xsd:integer, 1) && "
+      "\"01\"^^xsd:integer = 1 && \"1\"^^xsd:boolean = true && "
+      "LANG(\"x\"@EN) = \"en\" && DATATYPE(\"x\"^^<urn:custom>) = <urn:custom>) }",
+      collect, &values), 0);
+  EXPECT_EQ(values, (std::multiset<std::string>{"ok"}));
+  values.clear();
+  EXPECT_EQ(YBCMdbExecuteSparql(
+      "PREFIX xsd: <http://www.w3.org/2001/XMLSchema#> SELECT ?v WHERE { "
+      "VALUES ?v { \"ok\" } FILTER(\"1\"^^xsd:boolean && !\"0\"^^xsd:boolean && "
+      "xsd:integer(\"1\"^^xsd:boolean) = 1) }", collect, &values), 0);
+  EXPECT_EQ(values, (std::multiset<std::string>{"ok"}));
+  values.clear();
+  EXPECT_EQ(YBCMdbExecuteSparql(
+      "SELECT ?v WHERE { VALUES ?v { \"\" } }", collect, &values), 0);
+  EXPECT_EQ(values, (std::multiset<std::string>{""}));
+}
 
 namespace {
 

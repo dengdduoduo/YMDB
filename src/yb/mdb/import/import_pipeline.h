@@ -26,6 +26,7 @@ class ImportPipeline {
   Status BatchWrite(const std::vector<Triple>& triples);
 
   IdMap id_map_;
+  std::string blank_scope_;
   ImportStats stats_;
 };
 

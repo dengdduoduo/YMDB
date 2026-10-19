@@ -14,6 +14,7 @@
 #include <gtest/gtest.h>
 
 #include <array>
+#include <algorithm>
 #include <future>
 #include <fstream>
 #include <iostream>

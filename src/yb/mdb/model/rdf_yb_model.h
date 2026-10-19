@@ -38,6 +38,7 @@ class YBTransaction;
 namespace yb::mdb {
 
 class IdMap;
+enum class TripleTermType;
 class DocDBReadContext;
 
 class RdfYBModel {
@@ -53,6 +54,9 @@ class RdfYBModel {
   bool IsConnected() const { return connected_; }
 
   Result<uint64_t> ResolveTerm(IdMap& local_map, std::string_view term);
+  Result<uint64_t> ResolveRdfTerm(
+      IdMap& local_map, TripleTermType type, const std::string& lexical,
+      const std::string& qualifier = "", const std::string& blank_scope = "");
 
   const yb::client::TableHandle* GetTable(int perm_index) const;
 

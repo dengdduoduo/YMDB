@@ -2,6 +2,7 @@
 #include <cstdint>
 #include <ostream>
 #include <type_traits>
+#include "graph_models/rdf_model/term_identity.h"
 
 class ObjectId {
 public:
@@ -92,8 +93,18 @@ public:
 
     bool is_null() const { return id == NULL_ID; }
     bool is_not_found() const { return id == OBJECT_ID_NOT_FOUND; }
-    bool is_true() const { return id == BOOL_TRUE; }
-    bool is_false() const { return id == BOOL_FALSE; }
+    bool is_true() const {
+        if (id == BOOL_TRUE) return true;
+        if (get_type() != MASK_BOOL) return false;
+        auto term = SPARQL::RdfTermRegistry::Find(id);
+        return term && (term->lexical == "true" || term->lexical == "1");
+    }
+    bool is_false() const {
+        if (id == BOOL_FALSE) return true;
+        if (get_type() != MASK_BOOL) return false;
+        auto term = SPARQL::RdfTermRegistry::Find(id);
+        return term && (term->lexical == "false" || term->lexical == "0");
+    }
 
     inline bool operator<(ObjectId rhs) const noexcept  { return id < rhs.id; }
     inline bool operator<=(ObjectId rhs) const noexcept { return id <= rhs.id; }

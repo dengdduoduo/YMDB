@@ -20,6 +20,7 @@
 #include "yb/mdb/adapter/mdb_adapter.h"
 #include "yb/mdb/model/rdf_yb_model.h"
 #include "yb/util/flags.h"
+#include "yb/util/scope_exit.h"
 
 DEFINE_string(mdb_masters, "127.0.0.1:7100", "Master addresses");
 DEFINE_string(mdb_keyspace, "mdb_test", "Keyspace name");
@@ -156,6 +157,8 @@ static int RunQuery(int argc, char* argv[]) {
 
 int main(int argc, char* argv[]) {
   yb::ParseCommandLineFlags(&argc, &argv, true);
+  // Drain transaction RPCs before process-static response buffers are destroyed.
+  auto cleanup = yb::ScopeExit([] { yb::mdb::RdfYBModel::Instance().ClearAll(); });
 
   if (argc < 2) {
     std::cerr << "Usage: mdb_cli <command> [args...]" << std::endl;
