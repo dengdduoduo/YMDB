@@ -31,6 +31,7 @@ struct DocDBScanSpec {
   size_t page_rows = 256;
   CoarseTimePoint deadline = CoarseMonoClock::Now() + MonoDelta::FromSeconds(30);
   const std::atomic<bool>* cancelled = nullptr;
+  bool push_exact_filters = false;
 };
 
 struct DocDBScanBatch {
@@ -47,11 +48,19 @@ class DocDBScanCursor {
   Status Open(const client::TableHandle* table, client::YBSessionPtr session,
               DocDBScanSpec spec);
   Result<DocDBScanBatch> NextBatch();
+  // Queue one page per cursor, then flush once. All cursors must use the same
+  // query session; the client routes the bounded operation set concurrently.
+  static Result<std::vector<DocDBScanBatch>> NextBatches(
+      const std::vector<DocDBScanCursor*>& cursors);
   void Close();
   uint64_t rpc_calls() const { return rpc_calls_; }
+  uint64_t payload_bytes() const { return payload_bytes_; }
+  uint64_t decoded_rows() const { return decoded_rows_; }
+  uint64_t retained_payload_bytes() const { return retained_payload_bytes_; }
 
  private:
-  Result<DocDBScanBatch> ReadPage();
+  Result<client::YBqlReadOpPtr> PreparePage();
+  Result<DocDBScanBatch> ConsumePage(client::YBqlReadOpPtr op);
 
   const client::TableHandle* table_ = nullptr;
   client::YBSessionPtr session_;
@@ -61,6 +70,9 @@ class DocDBScanCursor {
   size_t row_limit_ = 0;
   bool eof_ = false;
   uint64_t rpc_calls_ = 0;
+  uint64_t payload_bytes_ = 0;
+  uint64_t decoded_rows_ = 0;
+  uint64_t retained_payload_bytes_ = 0;
 };
 
 }  // namespace yb::mdb

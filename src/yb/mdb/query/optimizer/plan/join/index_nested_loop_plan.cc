@@ -2,6 +2,7 @@
 
 #include "query/exceptions.h"
 #include "query/executor/binding_iter/index_nested_loop_join.h"
+#include "query/executor/batch_index_join.h"
 
 IndexNestedLoopPlan::IndexNestedLoopPlan(
     std::unique_ptr<Plan> _lhs,
@@ -53,8 +54,10 @@ void IndexNestedLoopPlan::set_input_vars(const std::set<VarId>& /*input_vars*/) 
 
 
 std::unique_ptr<BindingIter> IndexNestedLoopPlan::get_binding_iter() const {
-    return std::make_unique<IndexNestedLoopJoin>(
+    auto vars = get_vars();
+    return yb::mdb::MakeIndexJoin(
         lhs->get_binding_iter(),
-        rhs->get_binding_iter()
+        rhs->get_binding_iter(),
+        std::vector<VarId>(vars.begin(), vars.end())
     );
 }

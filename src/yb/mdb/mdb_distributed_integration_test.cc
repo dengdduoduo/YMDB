@@ -18,10 +18,13 @@
 #include <map>
 #include <memory>
 #include <set>
+#include <sstream>
 #include <string>
 #include <vector>
 
 #include "query/executor/binding.h"
+#include "query/optimizer/plan/join/index_nested_loop_plan.h"
+#include "query/optimizer/rdf_model/plan/triple_plan.h"
 #include "query/optimizer/binding_iter_constructor.h"
 #include "query/parser/sparql_query_parser.h"
 #include "query/query_context.h"
@@ -54,11 +57,16 @@
 #include "yb/mdb/query/distributed/scatter_executor.h"
 #include "yb/mdb/query/distributed/tablet_router.h"
 #include "yb/util/status.h"
+#include "yb/util/subprocess.h"
+#include "yb/util/metrics.h"
+#include "yb/tserver/mini_tablet_server.h"
+#include "yb/mdb/import/rdf_term.h"
 #include "yb/util/test_macros.h"
 
 using namespace SPARQL;
 
 DECLARE_int64(mem_tracker_tcmalloc_gc_release_bytes);
+METRIC_DECLARE_histogram(handler_latency_yb_tserver_TabletServerService_Read);
 
 namespace yb::mdb {
 
@@ -638,6 +646,312 @@ TEST_F(MdbDistributedIntegrationTest, EmptyPlanHandling) {
   ASSERT_OK(gather.Merge(fragment_results, GatherStrategy::UNION_ALL, &gather_result));
   ASSERT_EQ(gather_result.total_input_rows, 0);
   ASSERT_EQ(gather_result.total_output_rows, 0);
+}
+
+TEST_F(MdbDistributedIntegrationTest, TypedIdentitySurvivesFreshCliProcesses) {
+  ASSERT_NO_FATALS(CreateRdfTables());
+  // Every CLI invocation has fresh conversion registries and reloads rdf_idmap.
+  std::string executable;
+  ASSERT_OK(env_->GetExecutablePath(&executable));
+  auto cli = executable.substr(0, executable.find_last_of('/')) + "/../bin/mdb_cli";
+  auto run = [&](std::vector<std::string> args, std::string* output) {
+    args.insert(args.begin(), {cli, "--mdb_masters=" + cluster_->GetMasterAddresses(),
+        "--mdb_keyspace=" + std::string(kNamespace), "--mdb_streaming_reads=true",
+        "--mdb_scan_page_rows=1"});
+    std::string error;
+    const auto status = Subprocess::Call(args, output, &error);
+    EXPECT_TRUE(status.ok()) << status << "\n" << error;
+    return status.ok();
+  };
+  const auto path = GetTestPath("types.nt");
+  {
+    std::ofstream file(path);
+    file << R"(<urn:types:en> <urn:types:p> "same"@EN .
+<urn:types:fr> <urn:types:p> "same"@fr .
+<urn:types:d1> <urn:types:p> "same"^^<urn:type:1> .
+<urn:types:d2> <urn:types:p> "same"^^<urn:type:2> .
+<urn:types:str> <urn:types:p> "urn:types:en" .
+<urn:types:iri> <urn:types:p> <urn:types:en> .
+<urn:types:num> <urn:types:p> "01"^^<http://www.w3.org/2001/XMLSchema#integer> .
+<urn:types:num> <urn:types:p> "1"^^<http://www.w3.org/2001/XMLSchema#integer> .
+_:b <urn:types:blank> "value" .
+)";
+  }
+  std::string output;
+  ASSERT_TRUE(run({"import", path}, &output));
+  const auto second = GetTestPath("other.nt");
+  { std::ofstream file(second); file << "_:b <urn:types:blank> \"value\" .\n"; }
+  ASSERT_TRUE(run({"import", second}, &output));
+  const std::vector<std::pair<std::string, std::string>> checks = {
+      {"SELECT ?s WHERE { ?s <urn:types:p> \"same\"@en }", "urn:types:en"},
+      {"SELECT ?s WHERE { ?s <urn:types:p> \"same\"^^<urn:type:2> }", "urn:types:d2"},
+      {"SELECT ?s WHERE { ?s <urn:types:p> \"urn:types:en\" }", "urn:types:str"},
+      {"SELECT ?s WHERE { ?s <urn:types:p> <urn:types:en> }", "urn:types:iri"},
+      {"SELECT ?o WHERE { <urn:types:en> <urn:types:p> ?o }", "same"},
+      {"SELECT ?o WHERE { <urn:types:d1> <urn:types:p> ?o }", "same"},
+      {"SELECT ?v WHERE { <urn:types:en> <urn:types:p> ?o BIND(LANG(?o) AS ?v) }", "en"},
+      {"SELECT ?v WHERE { <urn:types:d1> <urn:types:p> ?o BIND(DATATYPE(?o) AS ?v) }", "urn:type:1"},
+  };
+  for (const auto& [query, expected] : checks) {
+    ASSERT_TRUE(run({"query", query}, &output));
+    ASSERT_NE(output.find("\t" + expected + "\n"), std::string::npos) << query << "\n" << output;
+    ASSERT_EQ(std::count(output.begin(), output.end(), '\t'), 1) << query << "\n" << output;
+  }
+  ASSERT_TRUE(run({"query", "SELECT DISTINCT ?b WHERE { ?b <urn:types:blank> ?o FILTER(isBlank(?b)) }"}, &output));
+  ASSERT_EQ(std::count(output.begin(), output.end(), '\t'), 2) << output;
+  ASSERT_TRUE(run({"query", "SELECT ?o WHERE { <urn:types:num> <urn:types:p> ?o }"}, &output));
+  ASSERT_NE(output.find("\t01\n"), std::string::npos) << output;
+  ASSERT_NE(output.find("\t1\n"), std::string::npos) << output;
+  ASSERT_TRUE(run({"query", "INSERT DATA { <urn:types:new> <urn:types:p> \"v.with.dot\"@fr . }"}, &output));
+  ASSERT_TRUE(run({"query", "SELECT ?s WHERE { ?s <urn:types:p> \"v.with.dot\"@fr }"}, &output));
+  ASSERT_NE(output.find("\turn:types:new\n"), std::string::npos) << output;
+}
+
+namespace {
+
+std::string P4Iri(uint64_t id) { return "urn:p4:" + std::to_string(id); }
+constexpr const char* kP4Query =
+    "SELECT ?s ?o WHERE { ?s <urn:p4:9000> ?k . ?k <urn:p4:9001> ?o }";
+
+Status P4Seed(const std::vector<DocDBScanBatch::Row>& triples) {
+  auto& model = RdfYBModel::Instance();
+  model.SetBatchJoinOptions(BatchJoinOptions());
+  model.SetUseStreamingReads(true);
+  model.SetStreamingPageRows(1);
+  std::set<uint64_t> terms;
+  for (const auto& row : triples) for (auto id : row) terms.insert(id);
+  for (auto id : terms) RegisterRdfIdentity(id, RdfIdentity(TripleTermType::URI, P4Iri(id)));
+  for (const auto& row : triples) RETURN_NOT_OK(model.WriteTripleToDocDB(row[0], row[1], row[2]));
+  return model.Flush();
+}
+
+struct P4QueryResult {
+  int status = -1;
+  std::multiset<std::vector<std::string>> rows;
+  std::string profile;
+};
+
+P4QueryResult P4Run(const std::string& query, BatchJoinOptions options,
+                   size_t page_rows = 1, size_t columns = 2) {
+  auto& model = RdfYBModel::Instance();
+  model.SetBatchJoinOptions(options);
+  model.SetStreamingPageRows(page_rows);
+  P4QueryResult result;
+  struct Capture {
+    P4QueryResult* result;
+    size_t columns;
+    std::vector<std::string> current;
+  } capture{&result, columns, {}};
+  auto callback = [](const char*, const char* value, void* arg) {
+    auto& state = *static_cast<Capture*>(arg);
+    state.current.emplace_back(value);
+    if (state.current.size() == state.columns) {
+      state.result->rows.insert(std::move(state.current));
+      state.current.clear();
+    }
+  };
+  result.status = YBCMdbExecuteSparql(query.c_str(), callback, &capture);
+  result.profile = YBCMdbGetLastQueryProfile();
+  EXPECT_TRUE(capture.current.empty());
+  return result;
+}
+
+uint64_t P4Field(const std::string& profile, const std::string& field) {
+  const auto prefix = "\"" + field + "\":";
+  const auto pos = profile.find(prefix);
+  EXPECT_NE(pos, std::string::npos) << profile;
+  return pos == std::string::npos ? 0 : std::stoull(profile.substr(pos + prefix.size()));
+}
+
+uint64_t P4ServerReadRpcs(MiniCluster* cluster) {
+  uint64_t total = 0;
+  for (int i = 0; i < 3; ++i) {
+    total += cluster->mini_tablet_server(i)->metric_entity().FindOrCreateMetric<Histogram>(
+        &METRIC_handler_latency_yb_tserver_TabletServerService_Read)->TotalCount();
+  }
+  return total;
+}
+
+}  // namespace
+
+TEST_F(MdbDistributedIntegrationTest, BatchJoinBagPagesSnapshotAndReset) {
+  ASSERT_NO_FATALS(CreateRdfTables());
+  ASSERT_NO_FATALS(InitModel());
+  ASSERT_OK(P4Seed({{101,9000,1}, {102,9000,1}, {103,9000,1},
+                    {1,9001,1001}, {1,9001,1002}}));
+  std::multiset<std::vector<std::string>> expected;
+  for (auto s : {101,102,103}) for (auto o : {1001,1002}) expected.insert({P4Iri(s), P4Iri(o)});
+  BatchJoinOptions scalar, batch;
+  scalar.enabled = false;
+  batch.output_rows = 2;
+  auto reference = P4Run(kP4Query, scalar);
+  ASSERT_EQ(reference.status, 0);
+  ASSERT_EQ(reference.rows, expected);
+  auto actual = P4Run(kP4Query, batch);
+  ASSERT_EQ(actual.status, 0);
+  ASSERT_EQ(actual.rows, expected);
+  ASSERT_EQ(P4Field(actual.profile, "unique_probes"), 1);
+  ASSERT_EQ(P4Field(actual.profile, "duplicate_rows"), 2);
+  ASSERT_GT(P4Field(reference.profile, "read_operations"), P4Field(actual.profile, "read_operations"));
+
+  auto& model = RdfYBModel::Instance();
+  auto context = ASSERT_RESULT(model.NewQueryReadContext());
+  DocDBReadContextScope scope(*context);
+  auto left = std::make_unique<TriplePlan>(Id(VarId(0)), Id(::ObjectId(9000)), Id(VarId(1)));
+  auto right = std::make_unique<TriplePlan>(Id(VarId(1)), Id(::ObjectId(9001)), Id(VarId(2)));
+  IndexNestedLoopPlan plan(std::move(left), std::move(right));
+  auto iter = plan.get_binding_iter();
+  std::ostringstream printed;
+  iter->print(printed, 0, false);
+  ASSERT_NE(printed.str().find("BatchIndexJoin"), std::string::npos);
+  Binding binding(3);
+  iter->begin(binding);
+  ASSERT_TRUE(iter->next());
+  RegisterRdfIdentity(1999, RdfIdentity(TripleTermType::URI, P4Iri(1999)));
+  ASSERT_OK(model.BeginTransaction());
+  ASSERT_OK(model.WriteTripleToDocDB(1, 9001, 1999));
+  ASSERT_OK(model.CommitTransaction());
+  int count = 1;
+  while (iter->next()) ++count;
+  ASSERT_EQ(count, 6);
+  iter->reset();
+  count = 0;
+  while (iter->next()) ++count;
+  ASSERT_EQ(count, 6);  // Reset retains this query's historical read view.
+  auto fresh = P4Run(kP4Query, batch);
+  ASSERT_EQ(fresh.status, 0);
+  ASSERT_EQ(fresh.rows.size(), 9);
+  ASSERT_LE(P4Field(fresh.profile, "peak_buffered_bytes"), batch.memory_bytes);
+}
+
+TEST_F(MdbDistributedIntegrationTest, BatchJoinGroupsRealTabletsAndReducesWireReads) {
+  ASSERT_NO_FATALS(CreateRdfTables());
+  ASSERT_NO_FATALS(InitModel());
+  ASSERT_NO_FATALS(InitRouter());
+  auto& model = RdfYBModel::Instance();
+  auto routing_session = client_->NewSession(MonoDelta::FromSeconds(30));
+  std::map<std::string, std::vector<uint64_t>> by_tablet;
+  for (uint64_t id = 1; id < 2048; ++id) {
+    auto op = NewMdbReadOp(*model.GetTable(0), routing_session);
+    QLAddInt64HashValue(op->mutable_request(), static_cast<int64_t>(id));
+    std::string encoded;
+    ASSERT_OK(op->GetPartitionKey(&encoded));
+    auto* tablet = router_.LocateTablet(0, encoded);
+    ASSERT_NE(tablet, nullptr);
+    auto& keys = by_tablet[tablet->tablet_id];
+    if (keys.size() < 3) keys.push_back(id);
+    bool enough = by_tablet.size() == kNumTablets;
+    for (const auto& entry : by_tablet) enough = enough && entry.second.size() == 3;
+    if (enough) break;
+  }
+  ASSERT_EQ(by_tablet.size(), kNumTablets);
+  std::vector<DocDBScanBatch::Row> triples;
+  std::multiset<std::vector<std::string>> expected;
+  for (const auto& [tablet, keys] : by_tablet) {
+    ASSERT_EQ(keys.size(), 3);
+    for (auto key : keys) {
+      triples.push_back({key, 9001, 20000 + key});
+      for (uint64_t j = 0; j < 2; ++j) {
+        triples.push_back({10000 + key*2+j, 9000, key});
+        expected.insert({P4Iri(10000+key*2+j), P4Iri(20000+key)});
+      }
+    }
+  }
+  ASSERT_OK(P4Seed(triples));
+  BatchJoinOptions scalar, batch;
+  scalar.enabled = false;
+  batch.max_in_flight = 8;
+  auto before = P4ServerReadRpcs(cluster_.get());
+  auto reference = P4Run(kP4Query, scalar, 256);
+  auto scalar_rpcs = P4ServerReadRpcs(cluster_.get()) - before;
+  before = P4ServerReadRpcs(cluster_.get());
+  auto actual = P4Run(kP4Query, batch, 256);
+  auto batch_rpcs = P4ServerReadRpcs(cluster_.get()) - before;
+  ASSERT_EQ(reference.status, 0);
+  ASSERT_EQ(actual.status, 0);
+  ASSERT_EQ(reference.rows, expected);
+  ASSERT_EQ(actual.rows, expected);
+  ASSERT_EQ(P4Field(actual.profile, "unique_probes"), 12);
+  ASSERT_EQ(P4Field(actual.profile, "duplicate_rows"), 12);
+  ASSERT_EQ(P4Field(actual.profile, "tablet_groups"), 4);
+  ASSERT_LE(P4Field(actual.profile, "max_in_flight"), 8);
+  ASSERT_GT(batch_rpcs, 0);
+  ASSERT_LT(batch_rpcs, scalar_rpcs);
+  ASSERT_LT(batch_rpcs, P4Field(actual.profile, "read_operations"));
+  LOG(INFO) << "P4_MEASUREMENT scalar_server_read_rpcs=" << scalar_rpcs
+            << " batch_server_read_rpcs=" << batch_rpcs << " profile=" << actual.profile;
+  // A high-fanout key must stream through bounded pages and output batches.
+  std::vector<DocDBScanBatch::Row> fanout;
+  for (uint64_t i = 0; i < 100; ++i) fanout.push_back({by_tablet.begin()->second.front(),9001,30000+i});
+  ASSERT_OK(P4Seed(fanout));
+  batch.input_rows = 4; batch.output_rows = 3; batch.max_in_flight = 2;
+  auto reference_fanout = P4Run(kP4Query, scalar, 2);
+  auto actual_fanout = P4Run(kP4Query, batch, 2);
+  ASSERT_EQ(reference_fanout.status, 0);
+  ASSERT_EQ(actual_fanout.status, 0);
+  ASSERT_EQ(actual_fanout.rows, reference_fanout.rows);
+  ASSERT_EQ(actual_fanout.rows.size(), 224);
+  ASSERT_LE(P4Field(actual_fanout.profile, "peak_buffered_bytes"), batch.memory_bytes);
+}
+
+TEST_F(MdbDistributedIntegrationTest, BatchJoinMissCacheCancellationBudgetAndRecovery) {
+  ASSERT_NO_FATALS(CreateRdfTables());
+  ASSERT_NO_FATALS(InitModel());
+  ASSERT_OK(P4Seed({{101,9000,1}, {102,9000,1}, {103,9000,1},
+                    {104,9000,2}, {2,9001,1001}, {2,9001,1002}}));
+  BatchJoinOptions options;
+  options.input_rows = 1;
+  auto actual = P4Run(kP4Query, options);
+  ASSERT_EQ(actual.status, 0);
+  ASSERT_EQ(actual.rows.size(), 2);
+  ASSERT_EQ(P4Field(actual.profile, "unique_probes"), 2);
+  ASSERT_EQ(P4Field(actual.profile, "negative_cache_hits"), 2);
+  auto tiny = options;
+  tiny.memory_bytes = 4096;
+  EXPECT_NE(P4Run(kP4Query, tiny).status, 0);
+  ASSERT_EQ(P4Run(kP4Query, options).rows, actual.rows);
+  int callbacks = 0;
+  auto cancel = [](const char*, const char*, void* arg) {
+    ++*static_cast<int*>(arg);
+    DocDBReadContextScope::Current()->cancelled = true;
+  };
+  EXPECT_EQ(YBCMdbExecuteSparql(
+      "SELECT ?s WHERE { ?s <urn:p4:9000> ?k . ?k <urn:p4:9001> ?o }", cancel, &callbacks), 1);
+  ASSERT_EQ(callbacks, 1);
+  ASSERT_EQ(DocDBReadContextScope::Current(), nullptr);
+  ASSERT_EQ(P4Run(kP4Query, options).rows, actual.rows);
+  int expired_callbacks = 0;
+  auto expire = [](const char*, const char*, void* arg) {
+    ++*static_cast<int*>(arg);
+    DocDBReadContextScope::Current()->deadline = CoarseMonoClock::Now();
+  };
+  EXPECT_EQ(YBCMdbExecuteSparql(
+      "SELECT ?s WHERE { ?s <urn:p4:9000> ?k . ?k <urn:p4:9001> ?o }", expire, &expired_callbacks), 1);
+  ASSERT_EQ(expired_callbacks, 1);
+  ASSERT_EQ(P4Run(kP4Query, options).rows, actual.rows);
+}
+
+TEST_F(MdbDistributedIntegrationTest, BatchCursorFailureInOneOperationFailsWholePageSet) {
+  ASSERT_NO_FATALS(CreateRdfTables());
+  ASSERT_NO_FATALS(InitModel());
+  ASSERT_OK(P4Seed({{1,9001,1001}, {1,9001,1002}, {2,9001,1003}}));
+  auto& model = RdfYBModel::Instance();
+  auto context = ASSERT_RESULT(model.NewQueryReadContext());
+  DocDBScanSpec spo, pos;
+  spo.hash_key = 1; spo.page_rows = 1;
+  pos.hash_key = 9001; pos.page_rows = 1;
+  DocDBScanCursor first, second;
+  ASSERT_OK(first.Open(model.GetTable(0), context->session, spo));
+  ASSERT_OK(second.Open(model.GetTable(1), context->session, pos));
+  auto pages = ASSERT_RESULT(DocDBScanCursor::NextBatches({&first, &second}));
+  ASSERT_EQ(pages.size(), 2);
+  ASSERT_FALSE(pages[0].eof);
+  ASSERT_FALSE(pages[1].eof);
+  ASSERT_OK(client_->DeleteTable(model.GetTable(0)->name()));
+  auto failed = DocDBScanCursor::NextBatches({&first, &second});
+  ASSERT_FALSE(failed.ok());
+  ASSERT_FALSE(first.NextBatch().ok());
+  ASSERT_FALSE(second.NextBatch().ok());
 }
 
 }  // namespace yb::mdb

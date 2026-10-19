@@ -51,33 +51,69 @@ Status DocDBScanCursor::Open(
 }
 
 Result<DocDBScanBatch> DocDBScanCursor::NextBatch() {
-  if (!table_) return STATUS(IllegalState, "MDB scan cursor is closed");
-  RETURN_NOT_OK(failure_);
-  auto result = ReadPage();
+  auto batches = VERIFY_RESULT(NextBatches({this}));
+  return std::move(batches.front());
+}
+
+Result<std::vector<DocDBScanBatch>> DocDBScanCursor::NextBatches(
+    const std::vector<DocDBScanCursor*>& cursors) {
+  if (cursors.empty()) return std::vector<DocDBScanBatch>();
+  if (!cursors.front()) return STATUS(InvalidArgument, "Null MDB batch cursor");
+  const auto session = cursors.front()->session_;
+  if (!session) return STATUS(IllegalState, "MDB scan cursor is closed");
+  for (auto* cursor : cursors) {
+    if (!cursor || !cursor->table_ || cursor->session_ != session) {
+      return STATUS(InvalidArgument, "MDB batch cursors need one query-owned session");
+    }
+    RETURN_NOT_OK(cursor->failure_);
+  }
+  auto execute = [&]() -> Result<std::vector<DocDBScanBatch>> {
+    StartPageArena(session);
+    std::vector<client::YBqlReadOpPtr> ops;
+    ops.reserve(cursors.size());
+    for (auto* cursor : cursors) ops.push_back(VERIFY_RESULT(cursor->PreparePage()));
+    bool pending = false;
+    for (size_t i = 0; i < ops.size(); ++i) {
+      if (!ops[i]) continue;
+      ++cursors[i]->rpc_calls_;  // Read operations, not a claim about wire RPC count.
+      session->Apply(ops[i]);
+      pending = true;
+    }
+    if (pending) {
+      auto deadline = cursors.front()->spec_.deadline;
+      for (auto* cursor : cursors) deadline = std::min(deadline, cursor->spec_.deadline);
+      session->SetDeadline(deadline);
+      RETURN_NOT_OK(session->TEST_Flush());
+      if (session->IsRestartRequired()) return STATUS(TryAgain, "MDB query read view requires restart");
+    }
+    std::vector<DocDBScanBatch> batches;
+    batches.reserve(cursors.size());
+    for (size_t i = 0; i < cursors.size(); ++i) {
+      batches.push_back(VERIFY_RESULT(cursors[i]->ConsumePage(std::move(ops[i]))));
+    }
+    return batches;
+  };
+  auto result = execute();
   if (!result.ok()) {
-    // A failed read must never become EOF or silently restart at a new view.
-    failure_ = result.status();
-    previous_.reset();
+    for (auto* cursor : cursors) {
+      cursor->failure_ = result.status();
+      cursor->previous_.reset();
+    }
   }
   return result;
 }
 
-Result<DocDBScanBatch> DocDBScanCursor::ReadPage() {
+Result<client::YBqlReadOpPtr> DocDBScanCursor::PreparePage() {
   if (spec_.cancelled && spec_.cancelled->load(std::memory_order_relaxed)) {
     return STATUS(Aborted, "MDB scan cancelled");
   }
   if (CoarseMonoClock::Now() >= spec_.deadline) {
     return STATUS(TimedOut, "MDB scan deadline exceeded");
   }
-  DocDBScanBatch batch;
-  if (eof_) {
-    batch.eof = true;
-    return batch;
-  }
+  if (eof_) return client::YBqlReadOpPtr();
   if (session_->IsRestartRequired()) {
     return STATUS(TryAgain, "MDB query read view requires restart");
   }
-  StartPageArena(session_);
   auto op = NewMdbReadOp(*table_, session_);
   auto* req = op->mutable_request();
   if (spec_.hash_key) {
@@ -86,8 +122,8 @@ Result<DocDBScanBatch> DocDBScanCursor::ReadPage() {
     RETURN_NOT_OK(op->GetPartitionKey(&key));
     if (key < spec_.partition_start ||
         (!spec_.partition_end.empty() && key >= spec_.partition_end)) {
-      eof_ = batch.eof = true;
-      return batch;
+      eof_ = true;
+      return client::YBqlReadOpPtr();
     }
   } else {
     if (!spec_.partition_start.empty()) {
@@ -96,28 +132,41 @@ Result<DocDBScanBatch> DocDBScanCursor::ReadPage() {
     if (!spec_.partition_end.empty()) {
       const auto end = dockv::PartitionSchema::DecodeMultiColumnHashValue(spec_.partition_end);
       if (end == 0) {
-        eof_ = batch.eof = true;
-        return batch;
+        eof_ = true;
+        return client::YBqlReadOpPtr();
       }
       req->set_max_hash_code(end - 1);
     }
   }
   table_->AddColumns({"c0", "c1", "c2"}, req);
+  if (spec_.push_exact_filters && (spec_.columns[1].min == spec_.columns[1].max ||
+                                   spec_.columns[2].min == spec_.columns[2].max)) {
+    auto* where = req->mutable_where_expr()->mutable_condition();
+    where->set_op(QL_OP_AND);
+    for (int col = 1; col < 3; ++col) {
+      if (spec_.columns[col].min == spec_.columns[col].max) {
+        table_->AddInt64Condition(where, "c" + std::to_string(col), QL_OP_EQUAL,
+                                 static_cast<int64_t>(spec_.columns[col].min));
+      }
+    }
+  }
   req->set_limit(row_limit_);
   req->set_return_paging_state(true);
   if (previous_) {
     *req->mutable_paging_state() = previous_->response().paging_state();
   }
-  session_->SetDeadline(spec_.deadline);
-  ++rpc_calls_;
-  RETURN_NOT_OK(session_->TEST_ApplyAndFlush(op));
-  if (session_->IsRestartRequired()) {
-    return STATUS(TryAgain, "MDB query read view requires restart");
-  }
+  return op;
+}
+
+Result<DocDBScanBatch> DocDBScanCursor::ConsumePage(client::YBqlReadOpPtr op) {
+  DocDBScanBatch batch;
+  if (!op) { batch.eof = true; return batch; }
   if (op->response().status() != QLResponsePB::YQL_STATUS_OK) {
     return STATUS(RuntimeError, "MDB scan failed: " + std::string(op->response().error_message()));
   }
   auto rows = VERIFY_RESULT(op->MakeRowBlock());
+  payload_bytes_ += op->rows_data().size();
+  decoded_rows_ += rows.row_count();
   if (rows.row_count() > row_limit_) {
     return STATUS(Corruption, "MDB scan response exceeds requested row budget");
   }
@@ -151,6 +200,7 @@ Result<DocDBScanBatch> DocDBScanCursor::ReadPage() {
     }
   }
   batch.eof = eof_;
+  retained_payload_bytes_ = eof_ ? 0 : op->rows_data().size();
   previous_ = eof_ ? nullptr : std::move(op);
   // An empty filtered page is not EOF when the server provided continuation.
   return batch;
@@ -165,6 +215,9 @@ void DocDBScanCursor::Close() {
   row_limit_ = 0;
   eof_ = false;
   rpc_calls_ = 0;
+  payload_bytes_ = 0;
+  decoded_rows_ = 0;
+  retained_payload_bytes_ = 0;
 }
 
 }  // namespace yb::mdb

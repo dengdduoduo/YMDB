@@ -155,8 +155,15 @@ bool DocDBScan::NextStreamRow(uint64_t* c0, uint64_t* c1, uint64_t* c2) {
     while (batch_position_ == batch_.rows.size()) {
         if (batch_.eof) return false;
         auto before = cursor_.rpc_calls();
+        auto bytes = cursor_.payload_bytes();
+        auto decoded = cursor_.decoded_rows();
         auto result = cursor_.NextBatch();
-        read_context_->scan_rpc_calls += cursor_.rpc_calls() - before;
+        auto operations = cursor_.rpc_calls() - before;
+        read_context_->scan_rpc_calls += operations;
+        read_context_->stats.read_operations += operations;
+        read_context_->stats.flush_rounds += operations != 0;
+        read_context_->stats.response_payload_bytes += cursor_.payload_bytes() - bytes;
+        read_context_->stats.decoded_rows += cursor_.decoded_rows() - decoded;
         if (!result.ok()) throw QueryException(result.status().ToString());
         batch_ = std::move(*result);
         batch_position_ = 0;
@@ -166,6 +173,66 @@ bool DocDBScan::NextStreamRow(uint64_t* c0, uint64_t* c1, uint64_t* c2) {
     *c1 = row[1];
     *c2 = row[2];
     return true;
+}
+
+bool DocDBScan::CanBatchBoundJoin() const {
+    if (!read_context_ || !table_) return false;
+    uint64_t a, b, c;
+    yb::mdb::DocKeyEncoder::Permute(perm_index_, subject_assigned_, predicate_assigned_,
+                                  object_assigned_, &a, &b, &c);
+    return a && ((subject_.is_var() && subject_assigned_) ||
+                 (predicate_.is_var() && predicate_assigned_) ||
+                 (object_.is_var() && object_assigned_));
+}
+
+yb::Result<std::optional<yb::mdb::DocDBScanSpec>> DocDBScan::ProbeSpec(Binding& input) const {
+    for (const auto& term : {subject_, predicate_, object_}) {
+        if (term.is_OID() && term.get_OID().is_not_found()) {
+            return std::optional<yb::mdb::DocDBScanSpec>();
+        }
+    }
+    auto missing = [&](Id term, bool assigned) {
+        return term.is_var() && assigned &&
+            (input[term.get_var()].is_null() ||
+             g_pack_to_gmap.find(input[term.get_var()].id) == g_pack_to_gmap.end());
+    };
+    if (missing(subject_, subject_assigned_) || missing(predicate_, predicate_assigned_) ||
+        missing(object_, object_assigned_)) return std::optional<yb::mdb::DocDBScanSpec>();
+    yb::mdb::DocDBScanSpec spec;
+    for (int i = 0; i < 3; ++i) {
+        spec.columns[i] = i < num_ranges_ ?
+            yb::mdb::DocDBScanSpec::Range{ranges_[i]->get_min(input), ranges_[i]->get_max(input)} :
+            yb::mdb::DocDBScanSpec::Range{0, kMax};
+    }
+    if (spec.columns[0].min == spec.columns[0].max) spec.hash_key = spec.columns[0].min;
+    spec.page_rows = read_context_->page_rows;
+    spec.page_bytes = read_context_->page_bytes;
+    spec.cancelled = &read_context_->cancelled;
+    spec.deadline = read_context_->deadline;
+    return std::optional<yb::mdb::DocDBScanSpec>(std::move(spec));
+}
+
+bool DocDBScan::Matches(const yb::mdb::DocDBScanBatch::Row& row) const {
+    return (!check_c0_eq_c1_ || row[0] == row[1]) &&
+           (!check_c1_eq_c2_ || row[1] == row[2]) &&
+           (!check_c0_eq_c2_ || row[0] == row[2]);
+}
+
+yb::Status DocDBScan::DecodeRow(const yb::mdb::DocDBScanBatch::Row& row, Binding* output) const {
+    using yb::Status;
+    uint64_t s, p, o;
+    yb::mdb::DocKeyEncoder::ReversePermute(perm_index_, row[0], row[1], row[2], &s, &p, &o);
+    for (const auto& item : {std::make_pair(subject_, std::make_pair(subject_assigned_, s)),
+                             std::make_pair(predicate_, std::make_pair(predicate_assigned_, p)),
+                             std::make_pair(object_, std::make_pair(object_assigned_, o))}) {
+        if (!item.first.is_var() || item.second.first) continue;
+        auto found = g_gmap_to_pack.find(item.second.second);
+        if (found == g_gmap_to_pack.end()) {
+            return STATUS(Corruption, "Missing typed dictionary entry for stored RDF ID");
+        }
+        output->add(item.first.get_var(), found->second);
+    }
+    return yb::Status::OK();
 }
 
 void DocDBScan::assign_nulls() {

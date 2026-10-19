@@ -8,6 +8,7 @@
 #include "yb/client/client_fwd.h"
 #include "yb/util/monotime.h"
 #include "yb/util/result.h"
+#include "query/executor/batch_options.h"
 
 namespace yb::mdb {
 
@@ -27,6 +28,8 @@ class DocDBReadContext {
   size_t page_rows = 256;
   size_t page_bytes = 64 * 1024;
   uint64_t scan_rpc_calls = 0;
+  BatchJoinOptions batch_options;
+  BatchQueryStats stats;
 
  private:
   DocDBReadContext() = default;

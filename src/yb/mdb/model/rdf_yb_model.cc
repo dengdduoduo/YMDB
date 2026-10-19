@@ -274,6 +274,7 @@ Result<std::unique_ptr<DocDBReadContext>> RdfYBModel::NewQueryReadContext() {
   if (!use_transactions_) return STATUS(NotSupported, "Streaming reads require transactions");
   auto context = VERIFY_RESULT(DocDBReadContext::Create(client_, txn_manager_.get()));
   context->page_rows = streaming_page_rows_;
+  context->batch_options = batch_join_options_;
   return context;
 }
 

@@ -86,6 +86,7 @@ namespace {
 // those maps are query-owned too; callbacks must not re-enter this adapter.
 std::mutex adapter_mutex;
 thread_local bool adapter_entered = false;
+thread_local std::string last_query_profile;
 
 class AdapterScope {
  public:
@@ -412,6 +413,7 @@ int ExecuteSparql(
     }
   }
   auto snapshot_cleanup = yb::ScopeExit([&] {
+    if (read_context) last_query_profile = read_context->stats.ToJson();
     if (use_snapshot) model.EndReadSnapshot();
   });
 
@@ -613,6 +615,7 @@ int YBCMdbExecuteSparql(
 {
   AdapterScope scope;
   if (!scope.entered()) return 1;
+  last_query_profile.clear();
   if (query_text == nullptr || row_callback == nullptr) {
     return 1;
   }
@@ -637,6 +640,8 @@ int YBCMdbExecuteSparql(
     return 1;
   }
 }
+
+const char* YBCMdbGetLastQueryProfile() { return last_query_profile.c_str(); }
 
 int YBCMdbInitCluster(const char* master_addrs, const char* keyspace) {
   AdapterScope scope;

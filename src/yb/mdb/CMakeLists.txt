@@ -57,6 +57,8 @@ set(MDB_DISTRIBUTED_SRCS
 )
 
 set(MDB_CORE_SRCS
+    query/executor/batch_operator.cc
+    query/executor/batch_index_join.cc
     query/id.cc
     query/executor/binding_iter/leapfrog_join.cc
     query/executor/binding_iter/docdb_scan.cc
@@ -175,6 +177,10 @@ YB_TEST_TARGET_LINK_LIBRARIES(mdb_docdb_integration_test yb_mdb integration-test
 
 ADD_YB_TEST(mdb_import_test)
 YB_TEST_TARGET_LINK_LIBRARIES(mdb_import_test yb_mdb)
+
+ADD_YB_TEST(mdb_batch_test)
+YB_TEST_TARGET_LINK_LIBRARIES(mdb_batch_test yb_mdb)
+target_compile_options(mdb_batch_test PRIVATE -Wno-shorten-64-to-32)
 
 ADD_YB_TEST(mdb_import_integration_test)
 YB_TEST_TARGET_LINK_LIBRARIES(mdb_import_integration_test yb_mdb integration-tests)

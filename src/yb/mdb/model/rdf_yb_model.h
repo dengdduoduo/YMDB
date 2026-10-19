@@ -27,6 +27,7 @@
 #include "yb/mdb/storage/docdb_range_cache.h"
 #include "yb/mdb/import/persistent_id_map.h"
 #include "yb/common/read_hybrid_time.h"
+#include "query/executor/batch_options.h"
 
 namespace yb::client {
 class TransactionManager;
@@ -86,6 +87,7 @@ class RdfYBModel {
   void SetUseStreamingReads(bool value) { use_streaming_reads_ = value; }
   bool UseStreamingReads() const { return use_streaming_reads_; }
   void SetStreamingPageRows(size_t value) { streaming_page_rows_ = value; }
+  void SetBatchJoinOptions(BatchJoinOptions options) { batch_join_options_ = options; }
   Result<std::unique_ptr<DocDBReadContext>> NewQueryReadContext();
 
   Status BeginTransaction();
@@ -110,6 +112,7 @@ class RdfYBModel {
   bool use_transactions_ = true;
   bool use_streaming_reads_ = false;
   size_t streaming_page_rows_ = 256;
+  BatchJoinOptions batch_join_options_;
   yb::client::YBClient* client_ = nullptr;
   yb::client::TableHandle tables_[6];
   yb::client::YBSessionPtr write_session_;

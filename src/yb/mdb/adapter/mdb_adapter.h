@@ -25,6 +25,10 @@ int YBCMdbInitCluster(const char* master_addrs, const char* keyspace);
 
 int YBCMdbImportFile(const char* file_path);
 
+// Calling-thread profile for the last streaming query, valid until its next
+// query. Empty for non-streaming requests. Counts operations, not wire RPCs.
+const char* YBCMdbGetLastQueryProfile();
+
 typedef void (*YBCMdbRowCallback)(
     const char* name, const char* value, void* ctx);
 

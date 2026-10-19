@@ -27,6 +27,14 @@ DEFINE_bool(mdb_use_partition_load, true, "Use partition loading for queries");
 DEFINE_bool(mdb_use_transactions, true, "Use distributed transactions for import consistency and query snapshots");
 DEFINE_bool(mdb_streaming_reads, false, "Use query-owned transactional paged MDB reads (experimental)");
 DEFINE_uint32(mdb_scan_page_rows, 256, "Maximum rows per MDB streaming storage page");
+DEFINE_bool(mdb_batch_index_join, true, "Batch supported streaming index joins");
+DEFINE_uint32(mdb_join_input_rows, 64, "Maximum outer rows per index-join batch");
+DEFINE_uint32(mdb_join_output_rows, 128, "Maximum output rows per index-join batch");
+DEFINE_uint32(mdb_join_batch_bytes, 65536, "Binding batch buffer byte budget");
+DEFINE_uint32(mdb_join_memory_bytes, 4194304, "Per-join buffered-state budget, excluding shared client/dictionary storage");
+DEFINE_uint32(mdb_join_max_in_flight, 8, "Maximum index probe page operations per flush");
+DEFINE_uint32(mdb_join_negative_cache_entries, 256, "Maximum cached empty index probes per join");
+DEFINE_bool(mdb_query_profile, false, "Print streaming query operation/payload/buffer counts to stderr");
 
 static int RunInit(int argc, char* argv[]) {
   if (argc < 2) {
@@ -59,6 +67,15 @@ static int RunQuery(int argc, char* argv[]) {
   yb::mdb::RdfYBModel::Instance().SetUsePartitionLoad(FLAGS_mdb_use_partition_load);
   yb::mdb::RdfYBModel::Instance().SetUseStreamingReads(FLAGS_mdb_streaming_reads);
   yb::mdb::RdfYBModel::Instance().SetStreamingPageRows(FLAGS_mdb_scan_page_rows);
+  yb::mdb::BatchJoinOptions options;
+  options.enabled = FLAGS_mdb_batch_index_join;
+  options.input_rows = FLAGS_mdb_join_input_rows;
+  options.output_rows = FLAGS_mdb_join_output_rows;
+  options.batch_bytes = FLAGS_mdb_join_batch_bytes;
+  options.memory_bytes = FLAGS_mdb_join_memory_bytes;
+  options.max_in_flight = FLAGS_mdb_join_max_in_flight;
+  options.negative_cache_entries = FLAGS_mdb_join_negative_cache_entries;
+  yb::mdb::RdfYBModel::Instance().SetBatchJoinOptions(options);
   yb::mdb::RdfYBModel::Instance().SetUseTransactions(FLAGS_mdb_use_transactions);
 
   int init_ret = YBCMdbInitCluster(
@@ -85,6 +102,9 @@ static int RunQuery(int argc, char* argv[]) {
   };
 
   int ret = YBCMdbExecuteSparql(query.c_str(), callback, &ctx);
+  if (FLAGS_mdb_query_profile && *YBCMdbGetLastQueryProfile()) {
+    std::cerr << "MDB_QUERY_PROFILE " << YBCMdbGetLastQueryProfile() << std::endl;
+  }
   // A later page can fail after callbacks have delivered earlier rows.
   // Do not print that incomplete result as a successful query answer.
   if (ret != 0) return ret;

@@ -1,0 +1,105 @@
+#include "query/executor/batch_operator.h"
+
+#include <exception>
+#include "query/exceptions.h"
+#include "query/executor/batch_options.h"
+#include "yb/mdb/storage/docdb_read_context.h"
+
+namespace yb::mdb {
+
+Status BindingIterBatchSource::Open(const Binding& input) {
+  Close();
+  binding_ = std::make_unique<Binding>(input.size);
+  binding_->add_all(input);
+  try { iter_->begin(*binding_); }
+  catch (const std::exception& e) { failure_ = STATUS(RuntimeError, e.what()); }
+  return failure_;
+}
+
+Result<BindingBatch> BindingIterBatchSource::NextBatch() {
+  if (!binding_) return STATUS(IllegalState, "Binding batch source is closed");
+  RETURN_NOT_OK(failure_);
+  BindingBatch batch;
+  RETURN_NOT_OK(batch.Init(BindingBatch::DenseLayout(binding_->size), row_limit_, byte_limit_, true));
+  try {
+    while (!batch.full() && !eof_) {
+      if (!iter_->next()) { eof_ = true; break; }
+      RETURN_NOT_OK(batch.Append(*binding_, emitted_++));
+    }
+  } catch (const std::exception& e) {
+    failure_ = STATUS(RuntimeError, e.what());
+    return failure_;
+  }
+  batch.eof = eof_;
+  return batch;
+}
+
+void BindingIterBatchSource::Close() {
+  binding_.reset();
+  eof_ = false;
+  emitted_ = 0;
+  failure_ = Status::OK();
+}
+
+void BatchBindingIter::_begin(Binding& input) {
+  binding_ = &input;
+  _reset();
+}
+
+void BatchBindingIter::_reset() {
+  source_->Close();
+  batch_ = BindingBatch();
+  position_ = 0;
+  failure_ = Status::OK();
+  const auto status = source_->Open(*binding_);
+  if (!status.ok()) throw QueryException(status.ToString());
+}
+
+bool BatchBindingIter::_next() {
+  if (!failure_.ok()) throw QueryException(failure_.ToString());
+  if (auto* context = DocDBReadContextScope::Current()) {
+    if (context->cancelled.load()) throw QueryException("MDB batch query cancelled");
+    if (CoarseMonoClock::Now() >= context->deadline) throw QueryException("MDB batch query deadline exceeded");
+  }
+  while (position_ == batch_.rows()) {
+    if (batch_.eof) return false;
+    batch_ = BindingBatch();
+    auto next = source_->NextBatch();
+    if (!next.ok()) {
+      failure_ = next.status();
+      throw QueryException(failure_.ToString());
+    }
+    batch_ = std::move(*next);
+    position_ = 0;
+  }
+  const auto status = batch_.CopyRow(position_++, binding_);
+  if (!status.ok()) {
+    failure_ = status;
+    throw QueryException(status.ToString());
+  }
+  return true;
+}
+
+void BatchBindingIter::assign_nulls() {
+  for (auto var : output_vars_) binding_->add(var, ::ObjectId::get_null());
+}
+
+void BatchBindingIter::print(std::ostream& os, int indent, bool stats) const {
+  if (stats) print_generic_stats(os, indent);
+  os << std::string(indent, ' ') << "BatchIndexJoin()\n";
+}
+
+std::string BatchQueryStats::ToJson() const {
+  std::string result = "{";
+#define MDB_STAT(name) result += "\"" #name "\":" + std::to_string(name) + ","
+  MDB_STAT(read_operations); MDB_STAT(flush_rounds); MDB_STAT(response_payload_bytes);
+  MDB_STAT(decoded_rows); MDB_STAT(join_operators); MDB_STAT(outer_rows);
+  MDB_STAT(unique_probes); MDB_STAT(duplicate_rows); MDB_STAT(negative_cache_hits);
+  MDB_STAT(tablet_groups); MDB_STAT(output_rows); MDB_STAT(peak_buffered_bytes);
+  MDB_STAT(max_in_flight);
+#undef MDB_STAT
+  result.back() = '}';
+  return result;
+}
+
+}  // namespace yb::mdb

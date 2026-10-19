@@ -30,6 +30,13 @@ public:
     void assign_nulls() override;
     void print(std::ostream& os, int indent, bool stats) const override;
 
+    bool CanBatchBoundJoin() const;
+    yb::Result<std::optional<yb::mdb::DocDBScanSpec>> ProbeSpec(Binding& input) const;
+    bool Matches(const yb::mdb::DocDBScanBatch::Row& row) const;
+    yb::Status DecodeRow(const yb::mdb::DocDBScanBatch::Row& row, Binding* output) const;
+    const yb::client::TableHandle* table() const { return table_; }
+    yb::mdb::DocDBReadContext* read_context() const { return read_context_; }
+
 private:
     bool NextStreamRow(uint64_t* c0, uint64_t* c1, uint64_t* c2);
     yb::mdb::DocDBRangeCache* cache_;
