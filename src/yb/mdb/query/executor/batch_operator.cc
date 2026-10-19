@@ -58,8 +58,10 @@ void BatchBindingIter::_reset() {
 bool BatchBindingIter::_next() {
   if (!failure_.ok()) throw QueryException(failure_.ToString());
   if (auto* context = DocDBReadContextScope::Current()) {
-    if (context->cancelled.load()) throw QueryException("MDB batch query cancelled");
-    if (CoarseMonoClock::Now() >= context->deadline) throw QueryException("MDB batch query deadline exceeded");
+    if (context->cancelled.load()) failure_ = STATUS(Aborted, "MDB batch query cancelled");
+    else if (CoarseMonoClock::Now() >= context->deadline)
+      failure_ = STATUS(TimedOut, "MDB batch query deadline exceeded");
+    if (!failure_.ok()) throw QueryException(failure_.ToString());
   }
   while (position_ == batch_.rows()) {
     if (batch_.eof) return false;
@@ -86,7 +88,7 @@ void BatchBindingIter::assign_nulls() {
 
 void BatchBindingIter::print(std::ostream& os, int indent, bool stats) const {
   if (stats) print_generic_stats(os, indent);
-  os << std::string(indent, ' ') << "BatchIndexJoin()\n";
+  os << std::string(indent, ' ') << name_ << "()\n";
 }
 
 std::string BatchQueryStats::ToJson() const {
@@ -97,8 +99,14 @@ std::string BatchQueryStats::ToJson() const {
   MDB_STAT(unique_probes); MDB_STAT(duplicate_rows); MDB_STAT(negative_cache_hits);
   MDB_STAT(tablet_groups); MDB_STAT(output_rows); MDB_STAT(peak_buffered_bytes);
   MDB_STAT(max_in_flight);
+  MDB_STAT(hash_join_operators); MDB_STAT(hash_build_rows); MDB_STAT(hash_probe_rows);
+  MDB_STAT(hash_output_rows); MDB_STAT(hash_peak_reserved_bytes);
+  MDB_STAT(optimizer_hash_choices); MDB_STAT(optimizer_index_choices);
+  MDB_STAT(optimizer_missing_stats);
+  MDB_STAT(hash_build_right_operators); MDB_STAT(estimated_hash_build_rows);
+  MDB_STAT(estimated_hash_build_bytes);
 #undef MDB_STAT
-  result.back() = '}';
+  result += "\"join_decisions\":\"" + join_decisions + "\"}";
   return result;
 }
 

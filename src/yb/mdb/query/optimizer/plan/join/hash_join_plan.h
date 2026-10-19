@@ -26,6 +26,7 @@ public:
     double estimate_output_size() const override { return estimated_output_size; }
 
     std::set<VarId> get_vars() const override;
+    bool hash_join_safe() const override { return lhs->hash_join_safe() && rhs->hash_join_safe(); }
     void set_input_vars(const std::set<VarId>& input_vars) override;
 
     std::unique_ptr<BindingIter> get_binding_iter() const override;

@@ -59,6 +59,7 @@ set(MDB_DISTRIBUTED_SRCS
 set(MDB_CORE_SRCS
     query/executor/batch_operator.cc
     query/executor/batch_index_join.cc
+    query/executor/hash_join.cc
     query/id.cc
     query/executor/binding_iter/leapfrog_join.cc
     query/executor/binding_iter/docdb_scan.cc

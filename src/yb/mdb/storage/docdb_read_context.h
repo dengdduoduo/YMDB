@@ -9,6 +9,7 @@
 #include "yb/util/monotime.h"
 #include "yb/util/result.h"
 #include "query/executor/batch_options.h"
+#include "yb/mdb/model/query_statistics.h"
 
 namespace yb::mdb {
 
@@ -30,6 +31,8 @@ class DocDBReadContext {
   uint64_t scan_rpc_calls = 0;
   BatchJoinOptions batch_options;
   BatchQueryStats stats;
+  size_t hash_reserved_bytes = 0;
+  std::shared_ptr<const QueryStatistics> statistics;
 
  private:
   DocDBReadContext() = default;

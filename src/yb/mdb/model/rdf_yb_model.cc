@@ -15,6 +15,7 @@
 #include "yb/mdb/import/import.h"
 
 #include <future>
+#include <chrono>
 #include <vector>
 
 #include "yb/client/client.h"
@@ -31,6 +32,7 @@
 #include "yb/gutil/macros.h"
 #include "yb/mdb/storage/yb_client_compat.h"
 #include "yb/mdb/storage/docdb_read_context.h"
+#include "yb/mdb/storage/docdb_scan_cursor.h"
 #include "yb/server/clock.h"
 #include "yb/util/status.h"
 
@@ -105,6 +107,7 @@ void RdfYBModel::InsertTriple(uint64_t s, uint64_t p, uint64_t o) {
 }
 
 Status RdfYBModel::WriteTripleToDocDB(uint64_t s, uint64_t p, uint64_t o) {
+  statistics_.reset();
   if (!connected_) {
     return STATUS(IllegalState, "RdfYBModel not connected to DocDB");
   }
@@ -275,7 +278,34 @@ Result<std::unique_ptr<DocDBReadContext>> RdfYBModel::NewQueryReadContext() {
   auto context = VERIFY_RESULT(DocDBReadContext::Create(client_, txn_manager_.get()));
   context->page_rows = streaming_page_rows_;
   context->batch_options = batch_join_options_;
+  context->statistics = statistics_;
   return context;
+}
+
+Status RdfYBModel::AnalyzeStatistics() {
+  if (HasTransaction()) return STATUS(IllegalState, "Analyze requires no pending transaction");
+  RETURN_NOT_OK(Flush());
+  auto context = VERIFY_RESULT(NewQueryReadContext());
+  auto next = std::make_shared<QueryStatistics>();
+  DocDBScanSpec spec;
+  spec.deadline = context->deadline;
+  spec.cancelled = &context->cancelled;
+  spec.page_rows = context->page_rows;
+  spec.page_bytes = context->page_bytes;
+  DocDBScanCursor cursor;
+  RETURN_NOT_OK(cursor.Open(GetTable(0), context->session, std::move(spec)));
+  for (;;) {
+    auto batch = VERIFY_RESULT(cursor.NextBatch());
+    for (const auto& row : batch.rows) next->Add(row[0], row[1], row[2]);
+    if (batch.eof) break;
+  }
+  next->read_operations = cursor.rpc_calls();
+  next->payload_bytes = cursor.payload_bytes();
+  next->version = ++statistics_version_;
+  next->collected_unix_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+      std::chrono::system_clock::now().time_since_epoch()).count();
+  statistics_ = std::move(next);
+  return Status::OK();
 }
 
 void RdfYBModel::EndReadSnapshot() {
@@ -286,6 +316,7 @@ void RdfYBModel::EndReadSnapshot() {
 }
 
 void RdfYBModel::ClearAll() {
+  statistics_.reset();
   if (current_txn_) {
     (void)AbortTransaction();
   }

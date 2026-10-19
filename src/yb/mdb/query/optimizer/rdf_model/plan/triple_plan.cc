@@ -1,6 +1,9 @@
 #include "triple_plan.h"
 
 #include <cassert>
+#include <algorithm>
+#include "graph_models/rdf_model/rdf_object_id.h"
+#include "yb/mdb/storage/docdb_read_context.h"
 
 #include "graph_models/rdf_model/rdf_model.h"
 #include "query/executor/binding_iter/docdb_scan.h"
@@ -62,6 +65,24 @@ double TriplePlan::estimate_output_size() const {
 
 
 double TriplePlan::_estimate_output_size() const {
+    if (auto* context = yb::mdb::DocDBReadContextScope::Current()) {
+        double count = context->statistics ? context->statistics->triples : 1000.0;
+        if (predicate.is_OID() && context->statistics) {
+            const auto packed = predicate.get_OID().id;
+            const auto id = g_pack_to_gmap.find(packed);
+            const auto logical = id == g_pack_to_gmap.end() ? packed : id->second;
+            const auto found = context->statistics->predicates.find(logical);
+            if (found != context->statistics->predicates.end()) count = found->second;
+            else if (context->statistics->predicates_complete) count = 0;
+        }
+        if (subject_assigned) count /= context->statistics
+            ? std::max(1.0, context->statistics->subjects.Estimate()) : 100.0;
+        if (object_assigned) count /= context->statistics
+            ? std::max(1.0, context->statistics->objects.Estimate()) : 100.0;
+        if (subject_assigned && predicate_assigned && object_assigned) return std::min(1.0, count);
+        return count;
+    }
+
     constexpr double H1 = 0.01;
     constexpr double H2 = 0.00001;
     constexpr double H3 = 0.0000001;

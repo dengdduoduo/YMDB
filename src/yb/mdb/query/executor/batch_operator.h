@@ -39,8 +39,9 @@ class BindingIterBatchSource : public BatchOperator {
 
 class BatchBindingIter : public BindingIter {
  public:
-  BatchBindingIter(std::unique_ptr<BatchOperator> source, std::vector<VarId> output_vars)
-      : source_(std::move(source)), output_vars_(std::move(output_vars)) {}
+  BatchBindingIter(std::unique_ptr<BatchOperator> source, std::vector<VarId> output_vars,
+                   std::string name = "BatchIndexJoin")
+      : source_(std::move(source)), output_vars_(std::move(output_vars)), name_(std::move(name)) {}
   ~BatchBindingIter() override { source_->Close(); }
   void _begin(Binding& input) override;
   bool _next() override;
@@ -54,6 +55,7 @@ class BatchBindingIter : public BindingIter {
   BindingBatch batch_;
   size_t position_ = 0;
   Status failure_;
+  std::string name_;
 };
 
 }  // namespace yb::mdb

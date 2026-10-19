@@ -1,6 +1,9 @@
 #include "greedy_optimizer.h"
 
 #include <limits>
+#include <algorithm>
+#include "query/optimizer/plan/join/hash_join_plan.h"
+#include "yb/mdb/storage/docdb_read_context.h"
 
 #include "query/optimizer/plan/join/index_nested_loop_plan.h"
 
@@ -41,22 +44,33 @@ std::unique_ptr<Plan> GreedyOptimizer::get_plan(const std::vector<std::unique_pt
                 );
                 auto nested_loop_cost = nested_loop_plan->estimate_cost();
 
-                if (nested_loop_cost < best_cost) {
-                    best_cost = nested_loop_cost;
-                    best_index = j;
-                    best_step_plan = std::move(nested_loop_plan);
+                auto* context = yb::mdb::DocDBReadContextScope::Current();
+                bool use_hash = false;
+                if (context && context->batch_options.policy != yb::mdb::JoinPolicy::Index &&
+                    root_plan->hash_join_safe() && base_plans[j]->hash_join_safe()) {
+                    const double left_rows = root_plan->estimate_output_size();
+                    const double right_rows = base_plans[j]->estimate_output_size();
+                    const double build_bytes = std::min(
+                        left_rows * (root_plan->get_vars().size() + 3) * 8,
+                        right_rows * (base_plans[j]->get_vars().size() + 3) * 8);
+                    // Transparent initial rule: missing stats and small inputs keep
+                    // indexed probes. Both large inputs may scan/hash if build fits.
+                    use_hash = context->batch_options.policy == yb::mdb::JoinPolicy::Hash ||
+                        (context->statistics && context->statistics->predicates_complete &&
+                         context->statistics->subjects.Estimate() >= 0 &&
+                         context->statistics->objects.Estimate() >= 0 &&
+                         left_rows >= 64 && right_rows >= 64 &&
+                         build_bytes < context->batch_options.memory_bytes / 2);
                 }
-                // auto hash_join_plan = make_unique<HashJoinPlan>(
-                //     root_plan->clone(),
-                //     base_plans[j]->clone()
-                // );
-                // auto hash_join_cost = hash_join_plan->estimate_cost();
-
-                // if (hash_join_cost < best_cost) {
-                //     best_cost = hash_join_cost;
-                //     best_index = j;
-                //     best_step_plan = move(hash_join_plan);
-                // }
+                std::unique_ptr<Plan> candidate = std::move(nested_loop_plan);
+                if (use_hash) candidate = std::make_unique<HashJoinPlan>(
+                    root_plan->clone(), base_plans[j]->clone());
+                const double cost = use_hash ? candidate->estimate_cost() : nested_loop_cost;
+                if (cost < best_cost) {
+                    best_cost = cost;
+                    best_index = j;
+                    best_step_plan = std::move(candidate);
+                }
             }
         }
 
@@ -80,6 +94,19 @@ std::unique_ptr<Plan> GreedyOptimizer::get_plan(const std::vector<std::unique_pt
                     best_step_plan = std::move(nested_loop_plan);
                 }
             }
+        }
+        if (auto* context = yb::mdb::DocDBReadContextScope::Current()) {
+            const bool hash = dynamic_cast<HashJoinPlan*>(best_step_plan.get()) != nullptr;
+            if (hash) ++context->stats.optimizer_hash_choices;
+            else ++context->stats.optimizer_index_choices;
+            if (!context->stats.join_decisions.empty()) context->stats.join_decisions += ';';
+            context->stats.join_decisions += hash
+                ? (context->batch_options.policy == yb::mdb::JoinPolicy::Hash
+                    ? "forced_hash_bound_bgp" : "auto_hash_both_inputs_ge_64_build_fits")
+                : (context->batch_options.policy == yb::mdb::JoinPolicy::Index
+                    ? "forced_index" : (!context->statistics ? "index_missing_statistics"
+                       : "index_small_input_or_memory_or_unsupported_keys"));
+            if (!context->statistics) ++context->stats.optimizer_missing_stats;
         }
         base_plans[best_index] = nullptr;
         root_plan = std::move(best_step_plan);

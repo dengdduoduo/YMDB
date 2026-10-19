@@ -6,6 +6,8 @@
 
 #include "query/exceptions.h"
 #include "query/executor/batch_operator.h"
+#include "query/executor/hash_join.h"
+#include "yb/mdb/model/query_statistics.h"
 #include "yb/util/test_macros.h"
 
 namespace yb::mdb {
@@ -142,6 +144,109 @@ TEST(MdbBindingBatchTest, LegacyAdapterThrowsAfterLaterPageFailure) {
   ASSERT_TRUE(iter.next());
   EXPECT_THROW(iter.next(), QueryException);
   EXPECT_THROW(iter.next(), QueryException);
+}
+
+}  // namespace yb::mdb
+
+namespace yb::mdb {
+namespace {
+class HashRows : public BindingIter {
+ public:
+  HashRows(std::vector<std::vector<uint64_t>> rows, std::vector<VarId> vars)
+      : rows_(std::move(rows)), vars_(std::move(vars)) {}
+  void _begin(Binding& input) override { input_ = &input; position_ = 0; }
+  bool _next() override {
+    if (position_ == rows_.size()) return false;
+    for (size_t col = 0; col < vars_.size(); ++col)
+      input_->add(vars_[col], ::ObjectId(rows_[position_][col]));
+    ++position_; return true;
+  }
+  void _reset() override { position_ = 0; }
+  void assign_nulls() override {}
+  void print(std::ostream&, int, bool) const override {}
+ private:
+  std::vector<std::vector<uint64_t>> rows_;
+  std::vector<VarId> vars_;
+  Binding* input_ = nullptr;
+  size_t position_ = 0;
+};
+std::unique_ptr<BindingIter> HashInput(std::vector<std::vector<uint64_t>> rows,
+                                     std::vector<VarId> vars) {
+  return std::make_unique<HashRows>(std::move(rows), std::move(vars));
+}
+}
+
+TEST(MdbHashJoinTest, CompositeKeysDuplicatesEmptyAndReopen) {
+  BatchJoinOptions options; options.input_rows = 1; options.output_rows = 1;
+  options.batch_bytes = 512; options.memory_bytes = 32768;
+  HashJoin join(HashInput({{1,2,10},{1,2,10},{1,3,11}}, {VarId(0),VarId(1),VarId(2)}),
+                HashInput({{1,2,20},{1,2,21},{1,4,22}}, {VarId(0),VarId(1),VarId(3)}),
+                {VarId(0),VarId(1)}, {VarId(0),VarId(1),VarId(2)}, nullptr, options);
+  Binding input(5), row(5); input.add(VarId(4), ::ObjectId(77));
+  for (int pass = 0; pass < 2; ++pass) {
+    ASSERT_OK(join.Open(input));
+    size_t count = 0;
+    for (;;) {
+      auto batch = ASSERT_RESULT(join.NextBatch());
+      for (size_t i = 0; i < batch.rows(); ++i) {
+        ASSERT_OK(batch.CopyRow(i, &row));
+        ASSERT_EQ(row[VarId(2)].id, 10);
+        ASSERT_TRUE(row[VarId(3)].id == 20 || row[VarId(3)].id == 21);
+        ASSERT_EQ(row[VarId(4)].id, 77 + pass); ++count;
+      }
+      if (batch.eof) break;
+    }
+    ASSERT_EQ(count, 4);
+    input.add(VarId(4), ::ObjectId(78));
+  }
+  join.Close(); ASSERT_FALSE(join.NextBatch().ok());
+  HashJoin empty(HashInput({}, {VarId(0)}), HashInput({{1}}, {VarId(0)}),
+                 {VarId(0)}, {VarId(0)}, nullptr, options);
+  ASSERT_OK(empty.Open(input));
+  auto batch = ASSERT_RESULT(empty.NextBatch());
+  ASSERT_TRUE(batch.eof); ASSERT_EQ(batch.rows(), 0);
+}
+
+TEST(MdbHashJoinTest, BudgetFailureIsStickyAndNullKeysAreRejected) {
+  BatchJoinOptions options; options.batch_bytes = 512; options.memory_bytes = 16384;
+  std::vector<std::vector<uint64_t>> large(2000, {1});
+  HashJoin join(HashInput(large, {VarId(0)}), HashInput({{1}}, {VarId(0)}),
+                {VarId(0)}, {VarId(0)}, nullptr, options);
+  Binding input(1);
+  ASSERT_OK(join.Open(input));
+  auto failed = join.NextBatch(); ASSERT_FALSE(failed.ok());
+  ASSERT_NE(failed.status().ToString().find("memory limit"), std::string::npos);
+  ASSERT_FALSE(join.NextBatch().ok());
+  HashJoin nulls(HashInput({{::ObjectId::get_null().id}}, {VarId(0)}),
+                 HashInput({{1}}, {VarId(0)}), {VarId(0)}, {VarId(0)}, nullptr, options);
+  ASSERT_OK(nulls.Open(input));
+  failed = nulls.NextBatch(); ASSERT_FALSE(failed.ok());
+  ASSERT_NE(failed.status().ToString().find("unbound"), std::string::npos);
+}
+
+TEST(MdbQueryStatisticsTest, BoundedCountsSketchAndMissingMetadata) {
+  QueryStatistics stats;
+  for (uint64_t i = 0; i < 100; ++i) stats.Add(i / 10, 7, i);
+  ASSERT_EQ(stats.triples, 100);
+  ASSERT_EQ(stats.predicates.at(7), 100);
+  ASSERT_NEAR(stats.subjects.Estimate(), 10, 1);
+  ASSERT_NEAR(stats.objects.Estimate(), 100, 5);
+  ASSERT_NE(stats.ToJson().find("full_snapshot_scan"), std::string::npos);
+  for (uint64_t i = 0; i < 10000; ++i) stats.Add(i, i, i);
+  ASSERT_EQ(stats.predicates.size(), QueryStatistics::kMaxKeys);
+  ASSERT_EQ(stats.subject_degrees.size(), QueryStatistics::kMaxKeys);
+  ASSERT_FALSE(stats.predicates_complete); ASSERT_FALSE(stats.degrees_complete);
+}
+
+TEST(MdbHashJoinTest, BuildReadFailureNeverPublishesPartialResults) {
+  BatchJoinOptions options; options.input_rows = 2; options.output_rows = 1;
+  options.batch_bytes = 512; options.memory_bytes = 32768;
+  HashJoin join(std::make_unique<TestRows>(10, 5), HashInput({{1}}, {VarId(0)}),
+                {VarId(0)}, {VarId(0)}, nullptr, options);
+  Binding input(1); ASSERT_OK(join.Open(input));
+  auto failed = join.NextBatch(); ASSERT_FALSE(failed.ok());
+  ASSERT_NE(failed.status().ToString().find("injected row read failure"), std::string::npos);
+  ASSERT_FALSE(join.NextBatch().ok());
 }
 
 }  // namespace yb::mdb

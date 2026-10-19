@@ -28,6 +28,7 @@
 #include "yb/mdb/import/persistent_id_map.h"
 #include "yb/common/read_hybrid_time.h"
 #include "query/executor/batch_options.h"
+#include "yb/mdb/model/query_statistics.h"
 
 namespace yb::client {
 class TransactionManager;
@@ -89,6 +90,10 @@ class RdfYBModel {
   void SetStreamingPageRows(size_t value) { streaming_page_rows_ = value; }
   void SetBatchJoinOptions(BatchJoinOptions options) { batch_join_options_ = options; }
   Result<std::unique_ptr<DocDBReadContext>> NewQueryReadContext();
+  Status AnalyzeStatistics();
+  std::string StatisticsJson() const {
+    return statistics_ ? statistics_->ToJson() : "{\"available\":false}";
+  }
 
   Status BeginTransaction();
   Status CommitTransaction();
@@ -113,6 +118,8 @@ class RdfYBModel {
   bool use_streaming_reads_ = false;
   size_t streaming_page_rows_ = 256;
   BatchJoinOptions batch_join_options_;
+  std::shared_ptr<const QueryStatistics> statistics_;
+  uint64_t statistics_version_ = 0;
   yb::client::YBClient* client_ = nullptr;
   yb::client::TableHandle tables_[6];
   yb::client::YBSessionPtr write_session_;

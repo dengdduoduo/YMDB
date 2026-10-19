@@ -6,8 +6,12 @@
 
 namespace yb::mdb {
 
+enum class JoinPolicy { Index, Hash, Auto };
+
 struct BatchJoinOptions {
   bool enabled = true;
+  JoinPolicy policy = JoinPolicy::Index;
+  size_t hash_query_memory_bytes = 64 * 1024 * 1024;
   size_t input_rows = 64;
   size_t output_rows = 128;
   size_t batch_bytes = 64 * 1024;
@@ -30,6 +34,18 @@ struct BatchQueryStats {
   uint64_t output_rows = 0;
   uint64_t peak_buffered_bytes = 0;
   uint64_t max_in_flight = 0;
+  uint64_t hash_join_operators = 0;
+  uint64_t hash_build_rows = 0;
+  uint64_t hash_probe_rows = 0;
+  uint64_t hash_output_rows = 0;
+  uint64_t hash_peak_reserved_bytes = 0;
+  uint64_t optimizer_hash_choices = 0;
+  uint64_t optimizer_index_choices = 0;
+  uint64_t optimizer_missing_stats = 0;
+  uint64_t hash_build_right_operators = 0;
+  uint64_t estimated_hash_build_rows = 0;
+  uint64_t estimated_hash_build_bytes = 0;
+  std::string join_decisions;
   std::string ToJson() const;
 };
 

@@ -29,6 +29,9 @@ public:
     // returns a set with the variables mentioned in the relation, excluding the input vars
     virtual std::set<VarId> get_vars() const = 0;
 
+    // Only inner BGP plans with guaranteed-bound output keys opt in.
+    virtual bool hash_join_safe() const { return false; }
+
     virtual void set_input_vars(const std::set<VarId>& input_vars) = 0;
 
     virtual std::unique_ptr<BindingIter> get_binding_iter() const = 0;

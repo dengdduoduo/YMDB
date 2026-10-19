@@ -27,6 +27,9 @@ DEFINE_bool(mdb_use_partition_load, true, "Use partition loading for queries");
 DEFINE_bool(mdb_use_transactions, true, "Use distributed transactions for import consistency and query snapshots");
 DEFINE_bool(mdb_streaming_reads, false, "Use query-owned transactional paged MDB reads (experimental)");
 DEFINE_uint32(mdb_scan_page_rows, 256, "Maximum rows per MDB streaming storage page");
+DEFINE_string(mdb_join_policy, "index", "Streaming BGP join policy: index, hash, auto");
+DEFINE_bool(mdb_analyze_statistics, false, "Collect bounded metadata with a full snapshot scan before query");
+DEFINE_uint32(mdb_hash_query_memory_bytes, 67108864, "Shared buffered-state budget for hash joins in a query");
 DEFINE_bool(mdb_batch_index_join, true, "Batch supported streaming index joins");
 DEFINE_uint32(mdb_join_input_rows, 64, "Maximum outer rows per index-join batch");
 DEFINE_uint32(mdb_join_output_rows, 128, "Maximum output rows per index-join batch");
@@ -68,6 +71,15 @@ static int RunQuery(int argc, char* argv[]) {
   yb::mdb::RdfYBModel::Instance().SetUseStreamingReads(FLAGS_mdb_streaming_reads);
   yb::mdb::RdfYBModel::Instance().SetStreamingPageRows(FLAGS_mdb_scan_page_rows);
   yb::mdb::BatchJoinOptions options;
+  if (FLAGS_mdb_join_policy == "hash") options.policy = yb::mdb::JoinPolicy::Hash;
+  else if (FLAGS_mdb_join_policy == "auto") options.policy = yb::mdb::JoinPolicy::Auto;
+  else if (FLAGS_mdb_join_policy != "index") {
+    std::cerr << "Invalid MDB join policy" << std::endl; return 1;
+  }
+  if (options.policy != yb::mdb::JoinPolicy::Index && !FLAGS_mdb_streaming_reads) {
+    std::cerr << "Hash/auto policy requires streaming reads" << std::endl; return 1;
+  }
+  options.hash_query_memory_bytes = FLAGS_mdb_hash_query_memory_bytes;
   options.enabled = FLAGS_mdb_batch_index_join;
   options.input_rows = FLAGS_mdb_join_input_rows;
   options.output_rows = FLAGS_mdb_join_output_rows;
@@ -84,6 +96,12 @@ static int RunQuery(int argc, char* argv[]) {
     return init_ret;
   }
 
+  if (FLAGS_mdb_analyze_statistics) {
+    auto status = yb::mdb::RdfYBModel::Instance().AnalyzeStatistics();
+    if (!status.ok()) { std::cerr << status.ToString() << std::endl; return 1; }
+  }
+  if (FLAGS_mdb_query_profile)
+    std::cerr << "MDB_STATISTICS " << yb::mdb::RdfYBModel::Instance().StatisticsJson() << std::endl;
   std::string query = argv[0];
   for (int i = 1; i < argc; i++) {
     query += " ";

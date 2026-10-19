@@ -15,6 +15,8 @@
 
 #include <array>
 #include <future>
+#include <fstream>
+#include <iostream>
 #include <map>
 #include <memory>
 #include <set>
@@ -24,6 +26,7 @@
 
 #include "query/executor/binding.h"
 #include "query/optimizer/plan/join/index_nested_loop_plan.h"
+#include "query/optimizer/plan/join/hash_join_plan.h"
 #include "query/optimizer/rdf_model/plan/triple_plan.h"
 #include "query/optimizer/binding_iter_constructor.h"
 #include "query/parser/sparql_query_parser.h"
@@ -952,6 +955,179 @@ TEST_F(MdbDistributedIntegrationTest, BatchCursorFailureInOneOperationFailsWhole
   ASSERT_FALSE(failed.ok());
   ASSERT_FALSE(first.NextBatch().ok());
   ASSERT_FALSE(second.NextBatch().ok());
+}
+
+}  // namespace yb::mdb
+
+namespace yb::mdb {
+
+TEST_F(MdbDistributedIntegrationTest, HashJoinBagMultikeyAndThreeWayEquivalence) {
+  ASSERT_NO_FATALS(CreateRdfTables());
+  ASSERT_NO_FATALS(InitModel());
+  ASSERT_OK(P4Seed({{101,9000,1},{102,9000,1},{103,9000,2},
+                    {1,9001,1001},{1,9001,1002},{2,9001,1003},
+                    {1001,9002,2001},{1002,9002,2002},{1003,9002,2003},
+                    {101,9003,1},{102,9003,2}}));
+  BatchJoinOptions index, hash; hash.policy = JoinPolicy::Hash;
+  hash.input_rows = 1; hash.output_rows = 1;
+  for (const auto& query : {std::string(kP4Query),
+      std::string("SELECT ?s ?o WHERE { ?s <urn:p4:9000> ?k . ?k <urn:p4:9001> ?m . ?m <urn:p4:9002> ?o }"),
+      std::string("SELECT ?s ?k WHERE { ?s <urn:p4:9000> ?k . ?s <urn:p4:9003> ?k }")}) {
+    auto reference = P4Run(query, index), actual = P4Run(query, hash);
+    ASSERT_EQ(reference.status, 0); ASSERT_EQ(actual.status, 0);
+    ASSERT_EQ(actual.rows, reference.rows); ASSERT_FALSE(actual.rows.empty());
+    ASSERT_GT(P4Field(actual.profile, "hash_join_operators"), 0);
+    ASSERT_LE(P4Field(actual.profile, "hash_peak_reserved_bytes"), hash.hash_query_memory_bytes);
+  }
+  for (const auto& query : {
+      "SELECT ?s ?o WHERE { ?s <urn:p4:9000> ?k . ?k <urn:p4:9001> ?o OPTIONAL { ?o <urn:p4:9002> ?v } }",
+      "SELECT ?s ?o WHERE { ?s <urn:p4:9000> ?k . ?k <urn:p4:9001> ?o MINUS { ?o <urn:p4:9002> ?v } }",
+      "SELECT ?s ?o WHERE { ?s <urn:p4:9000> ?k . ?k <urn:p4:9001> ?o FILTER NOT EXISTS { ?o <urn:p4:9002> ?v } }"}) {
+    auto reference = P4Run(query, index), actual = P4Run(query, hash);
+    ASSERT_EQ(reference.status, 0); ASSERT_EQ(actual.status, 0);
+    ASSERT_EQ(actual.rows, reference.rows);
+  }
+}
+
+TEST_F(MdbDistributedIntegrationTest, HashJoinStatisticsAutomaticChoiceAndInvalidation) {
+  ASSERT_NO_FATALS(CreateRdfTables());
+  ASSERT_NO_FATALS(InitModel());
+  std::vector<DocDBScanBatch::Row> triples;
+  for (uint64_t i = 1; i <= 128; ++i) {
+    triples.push_back({10000+i,9000,i}); triples.push_back({i,9001,20000+i});
+  }
+  ASSERT_OK(P4Seed(triples));
+  auto& model = RdfYBModel::Instance();
+  BatchJoinOptions index, hash, automatic;
+  hash.policy = JoinPolicy::Hash; automatic.policy = JoinPolicy::Auto;
+  auto missing = P4Run(kP4Query, automatic, 64);
+  ASSERT_EQ(missing.status, 0);
+  ASSERT_EQ(P4Field(missing.profile, "optimizer_hash_choices"), 0);
+  ASSERT_GT(P4Field(missing.profile, "optimizer_missing_stats"), 0);
+  model.SetStreamingPageRows(64); ASSERT_OK(model.AnalyzeStatistics());
+  const auto statistics = model.StatisticsJson();
+  ASSERT_EQ(P4Field(statistics, "triples_exact"), 256);
+  ASSERT_EQ(P4Field(statistics, "version"), 1);
+  ASSERT_NE(statistics.find("\"9000\":128"), std::string::npos);
+  auto reference = P4Run(kP4Query, index, 64);
+  auto forced = P4Run(kP4Query, hash, 64);
+  auto actual = P4Run(kP4Query, automatic, 64);
+  ASSERT_EQ(reference.status, 0); ASSERT_EQ(forced.status, 0); ASSERT_EQ(actual.status, 0);
+  ASSERT_EQ(actual.rows, reference.rows); ASSERT_EQ(forced.rows, reference.rows);
+  ASSERT_EQ(actual.rows.size(), 128);
+  ASSERT_EQ(P4Field(actual.profile, "optimizer_hash_choices"), 1);
+  ASSERT_GT(P4Field(actual.profile, "response_payload_bytes"), 0);
+  std::cout << "P5_MEASUREMENT index=" << reference.profile << " hash=" << forced.profile
+            << " auto=" << actual.profile << " statistics=" << statistics << std::endl;
+  RegisterRdfIdentity(99999, RdfIdentity(TripleTermType::URI, P4Iri(99999)));
+  ASSERT_OK(model.WriteTripleToDocDB(99999, 9000, 1));
+  ASSERT_EQ(model.StatisticsJson(), "{\"available\":false}");
+  ASSERT_OK(model.Flush());
+  auto after = P4Run(kP4Query, automatic, 64);
+  ASSERT_EQ(after.status, 0); ASSERT_EQ(after.rows.size(), 129);
+  ASSERT_EQ(P4Field(after.profile, "optimizer_hash_choices"), 0);
+}
+
+TEST_F(MdbDistributedIntegrationTest, HashJoinMemoryFailureRecoveryAndHighFanout) {
+  ASSERT_NO_FATALS(CreateRdfTables());
+  ASSERT_NO_FATALS(InitModel());
+  std::vector<DocDBScanBatch::Row> triples;
+  for (uint64_t i = 1; i <= 20; ++i) triples.push_back({10000+i,9000,1});
+  for (uint64_t i = 1; i <= 30; ++i) triples.push_back({1,9001,20000+i});
+  ASSERT_OK(P4Seed(triples));
+  BatchJoinOptions hash; hash.policy = JoinPolicy::Hash; hash.output_rows = 3;
+  auto actual = P4Run(kP4Query, hash, 2);
+  ASSERT_EQ(actual.status, 0); ASSERT_EQ(actual.rows.size(), 600);
+  ASSERT_EQ(P4Field(actual.profile, "hash_output_rows"), 600);
+  auto small = hash; small.memory_bytes = 1024;
+  auto failed = P4Run(kP4Query, small, 2);
+  ASSERT_NE(failed.status, 0); ASSERT_TRUE(failed.rows.empty());
+  auto shared = hash; shared.hash_query_memory_bytes = 1024;
+  failed = P4Run(kP4Query, shared, 2);
+  ASSERT_NE(failed.status, 0); ASSERT_TRUE(failed.rows.empty());
+  auto recovered = P4Run(kP4Query, hash, 2);
+  ASSERT_EQ(recovered.status, 0); ASSERT_EQ(recovered.rows, actual.rows);
+  auto& model = RdfYBModel::Instance();
+  ASSERT_OK(model.AnalyzeStatistics());
+  auto context = ASSERT_RESULT(model.NewQueryReadContext());
+  DocDBReadContextScope scope(*context);
+  // Reverse the physical sides: the right side is now smaller in bytes.
+  HashJoinPlan plan(
+      std::make_unique<TriplePlan>(Id(VarId(1)), Id(::ObjectId(9001)), Id(VarId(2))),
+      std::make_unique<TriplePlan>(Id(VarId(0)), Id(::ObjectId(9000)), Id(VarId(1))));
+  auto iter = plan.get_binding_iter(); Binding binding(3); iter->begin(binding);
+  size_t count = 0; while (iter->next()) ++count;
+  ASSERT_EQ(count, 600); ASSERT_EQ(context->stats.hash_build_right_operators, 1);
+  ASSERT_EQ(context->stats.hash_build_rows, 20);
+  iter.reset(); ASSERT_EQ(context->hash_reserved_bytes, 0);
+
+}
+
+TEST_F(MdbDistributedIntegrationTest, HashJoinSnapshotResetCancellationAndDeadline) {
+  ASSERT_NO_FATALS(CreateRdfTables());
+  ASSERT_NO_FATALS(InitModel());
+  ASSERT_OK(P4Seed({{101,9000,1},{102,9000,1},{1,9001,1001},{1,9001,1002}}));
+  auto& model = RdfYBModel::Instance();
+  BatchJoinOptions options; options.policy = JoinPolicy::Hash; options.output_rows = 1;
+  model.SetBatchJoinOptions(options);
+  auto context = ASSERT_RESULT(model.NewQueryReadContext());
+  DocDBReadContextScope scope(*context);
+  auto left = std::make_unique<TriplePlan>(Id(VarId(0)), Id(::ObjectId(9000)), Id(VarId(1)));
+  auto right = std::make_unique<TriplePlan>(Id(VarId(1)), Id(::ObjectId(9001)), Id(VarId(2)));
+  HashJoinPlan plan(std::move(left), std::move(right));
+  auto iter = plan.get_binding_iter(); Binding binding(4);
+  binding.add(VarId(3), ::ObjectId(71)); iter->begin(binding);
+  ASSERT_TRUE(iter->next());
+  RegisterRdfIdentity(1999, RdfIdentity(TripleTermType::URI, P4Iri(1999)));
+  ASSERT_OK(model.BeginTransaction()); ASSERT_OK(model.WriteTripleToDocDB(1,9001,1999));
+  ASSERT_OK(model.CommitTransaction());
+  size_t count = 1; while (iter->next()) ++count; ASSERT_EQ(count, 4);
+  binding.add(VarId(3), ::ObjectId(72)); iter->reset(); count = 0;
+  while (iter->next()) { ASSERT_EQ(binding[VarId(3)].id, 72); ++count; }
+  ASSERT_EQ(count, 4);
+  iter->reset(); ASSERT_TRUE(iter->next()); context->cancelled.store(true);
+  EXPECT_THROW(iter->next(), QueryException);
+  context->cancelled.store(false); EXPECT_THROW(iter->next(), QueryException);
+  iter->reset(); ASSERT_TRUE(iter->next());
+  context->deadline = CoarseMonoClock::Now() - MonoDelta::FromSeconds(1);
+  EXPECT_THROW(iter->next(), QueryException);
+  context->deadline = CoarseMonoClock::Now() + MonoDelta::FromSeconds(30);
+  EXPECT_THROW(iter->next(), QueryException);
+  iter.reset(); ASSERT_EQ(context->hash_reserved_bytes, 0);
+  auto fresh = P4Run(kP4Query, options); ASSERT_EQ(fresh.status, 0);
+  ASSERT_EQ(fresh.rows.size(), 6);
+}
+
+TEST_F(MdbDistributedIntegrationTest, HashJoinFreshCliPolicyAndStatistics) {
+  ASSERT_NO_FATALS(CreateRdfTables());
+  std::string executable; ASSERT_OK(env_->GetExecutablePath(&executable));
+  const auto cli = executable.substr(0, executable.find_last_of('/')) + "/../bin/mdb_cli";
+  auto run = [&](std::vector<std::string> args, std::string* output, std::string* error) {
+    args.insert(args.begin(), {cli, "--mdb_masters=" + cluster_->GetMasterAddresses(),
+        "--mdb_keyspace=" + std::string(kNamespace), "--mdb_streaming_reads=true"});
+    return Subprocess::Call(args, output, error);
+  };
+  const auto path = GetTestPath("hash-types.nt");
+  { std::ofstream file(path); file << R"(<urn:hash:a> <urn:hash:p> "same"@en .
+<urn:hash:b> <urn:hash:p> "same"@fr .
+<urn:hash:c> <urn:hash:q> "same"@en .
+<urn:hash:d> <urn:hash:q> "same"@en .
+)"; }
+  std::string output, error;
+  ASSERT_OK(run({"import", path}, &output, &error));
+  const std::string query = "SELECT ?s ?t WHERE { ?s <urn:hash:p> ?k . ?t <urn:hash:q> ?k } ORDER BY ?s ?t";
+  ASSERT_OK(run({"--mdb_join_policy=index", "query", query}, &output, &error));
+  const auto expected = output;
+  ASSERT_EQ(std::count(expected.begin(), expected.end(), '\t'), 4);
+  ASSERT_NE(expected.find("urn:hash:a"), std::string::npos);
+  ASSERT_EQ(expected.find("urn:hash:b"), std::string::npos);
+  ASSERT_OK(run({"--mdb_join_policy=hash", "--mdb_query_profile=true", "query", query}, &output, &error));
+  ASSERT_EQ(output, expected);
+  ASSERT_NE(error.find("\"hash_join_operators\":1"), std::string::npos) << error;
+  ASSERT_OK(run({"--mdb_join_policy=auto", "--mdb_analyze_statistics=true", "--mdb_query_profile=true",
+                 "query", query}, &output, &error));
+  ASSERT_EQ(output, expected);
+  ASSERT_NE(error.find("\"triples_exact\":4"), std::string::npos) << error;
 }
 
 }  // namespace yb::mdb
