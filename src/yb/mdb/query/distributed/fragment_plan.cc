@@ -10,6 +10,11 @@
 #include "query/parser/op/sparql/op_join.h"
 #include "query/parser/op/sparql/op_sequence.h"
 #include "query/parser/op/sparql/op_select.h"
+#include "query/parser/op/sparql/op_order_by.h"
+#include "query/parser/op/sparql/op_group_by.h"
+#include "query/parser/expr/sparql/atom/expr_var.h"
+#include "query/parser/expr/sparql/builtin_call/aggregate/expr_agg_count.h"
+#include "query/parser/expr/sparql/builtin_call/aggregate/expr_agg_count_all.h"
 #include "yb/mdb/model/rdf_yb_model.h"
 #include "yb/mdb/query/distributed/fragment_transport.h"
 
@@ -93,16 +98,54 @@ Status ValidateFragmentOpen(const FragmentOpenPB& open) {
 Result<FragmentPlan> FragmentPlan::Build(
     const SPARQL::Op& root, RdfYBModel& model, const WorkerOptions& options) {
   auto* select = dynamic_cast<const SPARQL::OpSelect*>(&root);
-  if (!select || !select->op || select->distinct || select->is_sub_select ||
-      select->limit != SPARQL::Op::DEFAULT_LIMIT || select->offset != 0)
-    return STATUS(NotSupported, "Global SELECT operations remain at MDB coordinator");
-  for (const auto& expression : select->vars_exprs) if (expression)
-    return STATUS(NotSupported, "SELECT expressions remain at MDB coordinator");
+  if (!select || !select->op || select->is_sub_select)
+    return STATUS(NotSupported, "Worker input requires a root SELECT");
+  bool aggregate = false;
+  uint64_t distinct_tuple_sets = 0;
+  for (const auto& expression : select->vars_exprs) if (expression) {
+    // Other aggregates/expressions retain the existing coordinator path until
+    // their value, overflow and resource semantics have independent coverage.
+    auto* count = dynamic_cast<const SPARQL::ExprAggCount*>(expression.get());
+    auto* all = dynamic_cast<const SPARQL::ExprAggCountAll*>(expression.get());
+    if ((!count || !dynamic_cast<const SPARQL::ExprVar*>(count->expr.get())) && !all)
+      return STATUS(NotSupported, "SELECT expression is outside global fragment capabilities");
+    aggregate = true;
+    if (all && all->distinct) ++distinct_tuple_sets;
+  }
+  const SPARQL::Op* input = select->op.get();
+  bool ordered = false, grouped = false;
+  while (true) {
+    if (auto* order = dynamic_cast<const SPARQL::OpOrderBy*>(input)) {
+      if (ordered) return STATUS(NotSupported, "Nested global ordering is unsupported");
+      for (const auto& item : order->items) if (!std::holds_alternative<VarId>(item))
+        return STATUS(NotSupported, "ORDER BY expressions remain at coordinator");
+      ordered = true;
+      input = order->op.get();
+    } else if (auto* group = dynamic_cast<const SPARQL::OpGroupBy*>(input)) {
+      if (grouped) return STATUS(NotSupported, "Nested grouping is unsupported");
+      for (const auto& item : group->items)
+        if (item.second || !dynamic_cast<const SPARQL::ExprVar*>(item.first.get()))
+          return STATUS(NotSupported, "GROUP BY expressions remain at coordinator");
+      grouped = true;
+      input = group->op.get();
+    } else break;
+  }
+  // The legacy constructor orders before aggregation; do not claim that it can
+  // order final aggregate values. Keep that whole query on its original path.
+  if (ordered && (aggregate || grouped))
+    return STATUS(NotSupported, "Ordered aggregation remains at coordinator");
   std::vector<SPARQL::OpTriple> triples;
-  RETURN_NOT_OK(Collect(*select->op, &triples));
+  RETURN_NOT_OK(Collect(*input, &triples));
   if (triples.empty() || triples.size() > 32 || select->vars.empty())
     return STATUS(NotSupported, "Unsupported MDB BGP size");
   FragmentPlan plan;
+  const uint64_t variables = get_query_ctx().get_var_size();
+  if (variables > 128) return STATUS(NotSupported, "Worker variable limit exceeded");
+  // Each COUNT(DISTINCT *) retains a full binding tuple. Account for every
+  // such set, not just the number of returned columns or aggregate outputs.
+  plan.global_row_reservation = 1024 + 128 * variables + 16 * distinct_tuple_sets * variables;
+  plan.coordinator_finalize = aggregate || grouped || ordered || select->distinct ||
+      select->limit != SPARQL::Op::DEFAULT_LIMIT || select->offset != 0;
   auto& physical = plan.physical;
   physical.set_master_addresses(model.Client()->GetMasterLeaderAddress().ToString());
   physical.set_keyspace(model.Namespace());
@@ -112,6 +155,7 @@ Result<FragmentPlan> FragmentPlan::Build(
   physical.set_page_rows(static_cast<uint32_t>(options.page_rows));
   physical.set_memory_bytes(options.memory_bytes);
   for (auto var : select->vars) {
+    if (plan.coordinator_finalize) break;
     physical.add_projection(static_cast<uint32_t>(var.id));
     plan.properties.output_variables.push_back(static_cast<uint32_t>(var.id));
   }
@@ -130,6 +174,11 @@ Result<FragmentPlan> FragmentPlan::Build(
     }
   }
   plan.properties.bound_variables.assign(bound.begin(), bound.end());
+  if (bound.empty()) return STATUS(NotSupported, "Constant-only BGP remains at coordinator");
+  if (plan.coordinator_finalize) for (auto var : bound) {
+    physical.add_projection(var);
+    plan.properties.output_variables.push_back(var);
+  }
   for (auto var : physical.projection()) if (!bound.count(var))
     return STATUS(NotSupported, "Unbound projection remains at MDB coordinator");
   plan.properties.partitioning = PhysicalProperties::Partitioning::YcqlSubjectHash;
@@ -146,6 +195,15 @@ Result<FragmentPlan> FragmentPlan::Build(
   });
   RETURN_NOT_OK(ValidateCoverage(plan.tasks));
   return plan;
+}
+
+std::unique_ptr<SPARQL::Op>* FragmentPlan::InputSlot(SPARQL::Op& root) {
+  auto* slot = &dynamic_cast<SPARQL::OpSelect&>(root).op;
+  while (true) {
+    if (auto* order = dynamic_cast<SPARQL::OpOrderBy*>(slot->get())) slot = &order->op;
+    else if (auto* group = dynamic_cast<SPARQL::OpGroupBy*>(slot->get())) slot = &group->op;
+    else return slot;
+  }
 }
 
 }  // namespace yb::mdb

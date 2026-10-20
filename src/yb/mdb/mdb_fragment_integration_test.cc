@@ -91,13 +91,16 @@ class MdbFragmentIntegrationTest : public MiniClusterTestWithClient<MiniCluster>
   struct Output {
     int status = -1;
     std::multiset<std::string> values;
+    std::vector<std::string> ordered;
     std::string profile;
   };
   Output Query(const std::string& query, WorkerOptions options) {
     RdfYBModel::Instance().SetWorkerOptions(std::move(options));
     Output result;
     auto sink = [](const char*, const char* value, void* arg) {
-      static_cast<Output*>(arg)->values.insert(value);
+      auto* output = static_cast<Output*>(arg);
+      output->values.insert(value);
+      output->ordered.emplace_back(value);
     };
     result.status = YBCMdbExecuteSparql(query.c_str(), sink, &result);
     result.profile = YBCMdbGetLastQueryProfile();
@@ -154,8 +157,9 @@ TEST_F(MdbFragmentIntegrationTest, CrossTabletBagIdentityAndGlobalFallback) {
       "SELECT DISTINCT ?o WHERE { ?s <urn:p6:9000> ?k . ?k <urn:p6:9001> ?o }", workers_);
   ASSERT_EQ(distinct.status, 0);
   ASSERT_EQ(distinct.values, (std::multiset<std::string>{Iri(1001), Iri(1002)}));
-  ASSERT_EQ(Field(distinct.profile, "remote_fragments"), 0);
-  ASSERT_EQ(Field(distinct.profile, "remote_coordinator_fallbacks"), 1);
+  ASSERT_EQ(Field(distinct.profile, "remote_fragments"), 4);
+  ASSERT_EQ(Field(distinct.profile, "global_finalize_operators"), 1);
+  ASSERT_EQ(Field(distinct.profile, "remote_coordinator_fallbacks"), 0);
   const auto missing = Query("SELECT ?s WHERE { ?s <urn:p6:missing> ?o }", workers_);
   ASSERT_EQ(missing.status, 0);
   ASSERT_TRUE(missing.values.empty());
@@ -164,6 +168,174 @@ TEST_F(MdbFragmentIntegrationTest, CrossTabletBagIdentityAndGlobalFallback) {
   const auto repeated = Query("SELECT ?x WHERE { ?x <urn:p6:9002> ?x }", workers_);
   ASSERT_EQ(repeated.status, 0);
   ASSERT_EQ(repeated.values, (std::multiset<std::string>{Iri(7)}));
+}
+
+TEST_F(MdbFragmentIntegrationTest, GlobalDistinctOrderAndSlice) {
+  Seed();
+  const std::string body = " WHERE { ?s <urn:p6:9000> ?k . ?k <urn:p6:9001> ?o }";
+  for (const auto& query : {
+      "SELECT DISTINCT ?o" + body + " ORDER BY DESC(?o) LIMIT 1 OFFSET 1",
+      "SELECT ?o" + body + " ORDER BY ?o LIMIT 4 OFFSET 31",
+      "SELECT ?s" + body + " ORDER BY ?o DESC(?s) LIMIT 7 OFFSET 29",
+      "SELECT ?o" + body + " ORDER BY ?o LIMIT 0",
+      "SELECT ?o" + body + " ORDER BY ?o OFFSET 100",
+      "SELECT DISTINCT ?o" + body + " ORDER BY ?o"}) {
+    const auto local = Query(query, {});
+    const auto remote = Query(query, workers_);
+    ASSERT_EQ(local.status, 0) << query;
+    ASSERT_EQ(remote.status, 0) << query;
+    ASSERT_EQ(remote.ordered, local.ordered) << query;
+    ASSERT_EQ(Field(remote.profile, "remote_fragments"), 4) << remote.profile;
+    ASSERT_EQ(Field(remote.profile, "remote_coordinator_fallbacks"), 0);
+    ASSERT_EQ(Field(remote.profile, "global_input_rows"), 64);
+    ASSERT_EQ(Field(remote.profile, "global_finalize_operators"), 1);
+  }
+  const auto page = Query("SELECT DISTINCT ?o" + body +
+      " ORDER BY DESC(?o) LIMIT 1 OFFSET 1", workers_);
+  ASSERT_EQ(page.ordered, (std::vector<std::string>{Iri(1001)}));
+  const auto zero = Query("SELECT ?o" + body + " LIMIT 0", workers_);
+  ASSERT_TRUE(zero.values.empty());
+}
+
+TEST_F(MdbFragmentIntegrationTest, GlobalCountAndGroups) {
+  Seed();
+  const std::vector<std::string> twos(32, "2");
+  const std::string body = " WHERE { ?s <urn:p6:9000> ?k . ?k <urn:p6:9001> ?o }";
+  const std::vector<std::pair<std::string, std::multiset<std::string>>> cases = {
+    {"SELECT (COUNT(*) AS ?n)" + body, {"64"}},
+    {"SELECT (COUNT(?o) AS ?n)" + body, {"64"}},
+    {"SELECT (COUNT(DISTINCT ?o) AS ?n)" + body, {"2"}},
+    {"SELECT (COUNT(DISTINCT *) AS ?n)" + body, {"64"}},
+    {"SELECT (COUNT(?missing) AS ?n)" + body, {"0"}},
+    {"SELECT (COUNT(*) AS ?n)" + body + " GROUP BY ?o", {"32", "32"}},
+    {"SELECT (COUNT(DISTINCT ?o) AS ?n)" + body + " GROUP BY ?s",
+      std::multiset<std::string>(twos.begin(), twos.end())},
+    {"SELECT (COUNT(*) AS ?n) WHERE { ?s <urn:p6:missing> ?o }", {"0"}},
+    {"SELECT (COUNT(DISTINCT ?o) AS ?n) WHERE { ?s <urn:p6:missing> ?o }", {"0"}},
+    {"SELECT (COUNT(*) AS ?n) WHERE { ?s <urn:p6:missing> ?o } GROUP BY ?s", {}}
+  };
+  for (const auto& item : cases) {
+    const auto remote = Query(item.first, workers_);
+    const auto local = Query(item.first, {});
+    ASSERT_EQ(remote.status, 0) << item.first << remote.profile;
+    ASSERT_EQ(local.status, 0) << item.first;
+    ASSERT_EQ(remote.values, item.second) << item.first;
+    ASSERT_EQ(remote.values, local.values) << item.first;
+    ASSERT_EQ(Field(remote.profile, "global_finalize_operators"), 1);
+    ASSERT_EQ(Field(remote.profile, "remote_coordinator_fallbacks"), 0);
+  }
+  Write(133, 9000, 2);
+  Write(2, 9001, 1001);
+  ASSERT_OK(RdfYBModel::Instance().Flush());
+  const auto grouped = Query("SELECT ?o (COUNT(*) AS ?n)" + body + " GROUP BY ?o", workers_);
+  ASSERT_EQ(grouped.status, 0);
+  ASSERT_EQ(grouped.ordered.size(), 4);
+  std::map<std::string, std::string> groups;
+  for (size_t i = 0; i < grouped.ordered.size(); i += 2)
+    groups.emplace(grouped.ordered[i], grouped.ordered[i + 1]);
+  ASSERT_EQ(groups, (std::map<std::string, std::string>{{Iri(1001), "33"}, {Iri(1002), "32"}}));
+}
+
+TEST_F(MdbFragmentIntegrationTest, GlobalTypedIdentityAndValueOrdering) {
+  RegisterRdfIdentity(500, RdfIdentity(TripleTermType::URI, Iri(500)));
+  RegisterRdfIdentity(9003, RdfIdentity(TripleTermType::URI, Iri(9003)));
+  const std::string xsd = "http://www.w3.org/2001/XMLSchema#";
+  const std::vector<SPARQL::RdfTermIdentity> terms = {
+    RdfIdentity(TripleTermType::URI, "same"),
+    RdfIdentity(TripleTermType::LITERAL, "same"),
+    RdfIdentity(TripleTermType::LITERAL, "same", "@en"),
+    RdfIdentity(TripleTermType::LITERAL, "same", "@fr"),
+    RdfIdentity(TripleTermType::LITERAL, "10", xsd + "integer"),
+    RdfIdentity(TripleTermType::LITERAL, "2", xsd + "integer"),
+    RdfIdentity(TripleTermType::BLANK, "b", "", "scope-a"),
+    RdfIdentity(TripleTermType::BLANK, "b", "", "scope-b")
+  };
+  for (size_t i = 0; i < terms.size(); ++i) {
+    RegisterRdfIdentity(600 + i, terms[i]);
+    ASSERT_OK(RdfYBModel::Instance().WriteTripleToDocDB(500, 9003, 600 + i));
+  }
+  ASSERT_OK(RdfYBModel::Instance().Flush());
+  const auto count = Query("SELECT (COUNT(DISTINCT ?o) AS ?n) WHERE { "
+      "?s <urn:p6:9003> ?o }", workers_);
+  ASSERT_EQ(count.status, 0);
+  ASSERT_EQ(count.values, (std::multiset<std::string>{"8"}));
+  const std::string query = "SELECT DISTINCT ?o WHERE { ?s <urn:p6:9003> ?o } ORDER BY ?o";
+  const auto local = Query(query, {});
+  const auto remote = Query(query, workers_);
+  ASSERT_EQ(local.status, 0);
+  ASSERT_EQ(remote.status, 0);
+  ASSERT_EQ(remote.ordered, local.ordered);
+  ASSERT_EQ(remote.ordered.size(), 8);
+  const auto two = std::find(remote.ordered.begin(), remote.ordered.end(), "2");
+  const auto ten = std::find(remote.ordered.begin(), remote.ordered.end(), "10");
+  ASSERT_NE(two, remote.ordered.end());
+  ASSERT_NE(ten, remote.ordered.end());
+  ASSERT_LT(two, ten);
+  ASSERT_EQ(Field(remote.profile, "remote_coordinator_fallbacks"), 0);
+}
+
+TEST_F(MdbFragmentIntegrationTest, GlobalFailureBudgetAndRecovery) {
+  Seed();
+  const std::string query = "SELECT DISTINCT ?o WHERE { ?s <urn:p6:9000> ?k . "
+      "?k <urn:p6:9001> ?o } ORDER BY ?o";
+  auto limited = workers_;
+  limited.coordinator_memory_bytes = 1;
+  const auto exhausted = Query(query, limited);
+  ASSERT_NE(exhausted.status, 0);
+  ASSERT_TRUE(exhausted.values.empty());
+  ASSERT_EQ(Field(exhausted.profile, "remote_coordinator_fallbacks"), 0);
+  auto broken = workers_;
+  broken.binary = "/bin/false";
+  const auto failed = Query(query, broken);
+  ASSERT_NE(failed.status, 0);
+  ASSERT_TRUE(failed.values.empty());
+  ASSERT_EQ(Field(failed.profile, "remote_coordinator_fallbacks"), 0);
+  const auto recovered = Query(query, workers_);
+  ASSERT_EQ(recovered.status, 0);
+  ASSERT_EQ(recovered.ordered, (std::vector<std::string>{Iri(1001), Iri(1002)}));
+  const std::string tuple_counts = "SELECT (COUNT(DISTINCT *) AS ?a) "
+      "(COUNT(DISTINCT *) AS ?b) WHERE { ?s <urn:p6:9000> ?k . ?k <urn:p6:9001> ?o }";
+  const auto counted = Query(tuple_counts, workers_);
+  ASSERT_EQ(counted.status, 0);
+  ASSERT_EQ(counted.ordered, (std::vector<std::string>{"64", "64"}));
+  auto tuples_limited = workers_;
+  // Five query variables, two full-tuple sets: 1824 reserved bytes per row.
+  // This budget fits input without the tuple-set charge, but not with it.
+  tuples_limited.coordinator_memory_bytes = 110000;
+  const auto tuple_exhausted = Query(tuple_counts, tuples_limited);
+  ASSERT_NE(tuple_exhausted.status, 0);
+  ASSERT_TRUE(tuple_exhausted.values.empty());
+  for (bool expire : {false, true}) {
+    struct Stop { bool expire; size_t cells = 0; } stop{expire};
+    auto sink = [](const char*, const char*, void* arg) {
+      auto& state = *static_cast<Stop*>(arg);
+      ++state.cells;
+      auto* context = DocDBReadContextScope::Current();
+      if (state.expire) context->deadline = CoarseMonoClock::Now();
+      else context->cancelled.store(true);
+    };
+    RdfYBModel::Instance().SetWorkerOptions(workers_);
+    ASSERT_NE(YBCMdbExecuteSparql(query.c_str(), sink, &stop), 0);
+    ASSERT_EQ(stop.cells, 1);
+  }
+}
+
+TEST_F(MdbFragmentIntegrationTest, GlobalUnsupportedEnvelopeFallsBackBeforeLaunch) {
+  Seed();
+  auto unreachable = workers_;
+  unreachable.binary = "/bin/false";
+  for (const std::string query : {
+      "SELECT ?o WHERE { { ?s <urn:p6:9000> ?o } UNION { ?s <urn:p6:9001> ?o } }",
+      "SELECT ?s WHERE { ?s <urn:p6:9000> ?k OPTIONAL { ?k <urn:p6:9001> ?o } }",
+      "SELECT (SUM(?s) AS ?n) WHERE { ?s <urn:p6:9000> ?k }",
+      "SELECT ?s WHERE { ?s <urn:p6:9000> ?k } ORDER BY STR(?s)"}) {
+    const auto remote = Query(query, unreachable);
+    const auto local = Query(query, {});
+    ASSERT_EQ(remote.status, local.status) << query;
+    ASSERT_EQ(remote.values, local.values) << query;
+    ASSERT_EQ(Field(remote.profile, "remote_fragments"), 0);
+    ASSERT_EQ(Field(remote.profile, "remote_coordinator_fallbacks"), 1);
+  }
 }
 
 TEST_F(MdbFragmentIntegrationTest, SharedChildSnapshotAndSlowConsumer) {

@@ -663,7 +663,7 @@ void BindingIterConstructor::make_solution_modifier_operators(
         tmp = std::make_unique<DistinctHash>(std::move(tmp), std::move(projection_vars));
     }
 
-    if (offset > 0 || limit > 0) {
+    if (offset > 0 || limit != Op::DEFAULT_LIMIT) {
         tmp = std::make_unique<Slice>(std::move(tmp), offset, limit);
     }
 

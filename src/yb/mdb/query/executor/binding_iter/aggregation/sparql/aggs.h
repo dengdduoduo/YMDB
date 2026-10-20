@@ -1,6 +1,7 @@
 #pragma once
 
 #include <string>
+#include <set>
 #include <vector>
 
 #include "graph_models/rdf_model/comparisons.h"
@@ -497,21 +498,32 @@ class AggCountAllDistinct : public Agg {
 public:
     AggCountAllDistinct(VarId var_id, std::unique_ptr<BindingExpr> expr, std::vector<VarId> vars)
         : Agg(var_id, std::move(expr)), basic_vars(std::move(vars)) { }
-    void begin() override { }
-    void process() override { }
-    ObjectId get() override { return ObjectId::get_null(); }
+    void begin() override { seen.clear(); }
+    void process() override {
+        std::vector<ObjectId> tuple;
+        tuple.reserve(basic_vars.size());
+        for (auto var : basic_vars) tuple.push_back((*binding)[var]);
+        seen.insert(std::move(tuple));
+    }
+    ObjectId get() override { return Conversions::pack_int(seen.size()); }
     std::ostream& print(std::ostream& os) const override { return os << "AggCountAllDistinct"; }
 private:
     std::vector<VarId> basic_vars;
+    std::set<std::vector<ObjectId>> seen;
 };
 
 class AggCountDistinct : public Agg {
 public:
     using Agg::Agg;
-    void begin() override { }
-    void process() override { }
-    ObjectId get() override { return ObjectId::get_null(); }
+    void begin() override { seen.clear(); }
+    void process() override {
+        const auto value = expr->eval(*binding);
+        if (!value.is_null()) seen.insert(value);
+    }
+    ObjectId get() override { return Conversions::pack_int(seen.size()); }
     std::ostream& print(std::ostream& os) const override { return os << "AggCountDistinct"; }
+  private:
+    std::set<ObjectId> seen;
 };
 
 class AggGroupConcatDistinct : public Agg {

@@ -53,6 +53,9 @@ struct BatchQueryStats {
   uint64_t remote_response_bytes = 0;
   uint64_t remote_peak_frame_bytes = 0;
   uint64_t remote_coordinator_fallbacks = 0;
+  uint64_t global_input_rows = 0;
+  uint64_t global_reserved_bytes = 0;
+  uint64_t global_finalize_operators = 0;
   std::string remote_worker_pids;
   std::string ToJson() const;
 };

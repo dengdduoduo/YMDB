@@ -19,6 +19,9 @@ struct WorkerOptions {
   size_t batch_rows = 128;
   size_t page_rows = 16;
   size_t memory_bytes = 8 * 1024 * 1024;
+  // Limits retained Gather input, including conservative per-row operator slack.
+  // This is not a total process RSS limit. P8 will add external-memory execution.
+  size_t coordinator_memory_bytes = 64 * 1024 * 1024;
 };
 
 }  // namespace yb::mdb

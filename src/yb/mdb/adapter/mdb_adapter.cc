@@ -432,8 +432,33 @@ int ExecuteSparql(
       ++read_context->stats.remote_coordinator_fallbacks;
     } else {
       const auto* select = dynamic_cast<const OpSelect*>(op.get());
+      std::vector<ObjectId> gathered;
+      std::vector<VarId> gathered_vars;
+      uint64_t reserved = 0;
+      if (physical->coordinator_finalize) {
+        for (auto var : physical->physical.projection()) gathered_vars.emplace_back(var);
+      }
       auto status = yb::mdb::GatherFragments(*physical, worker_options, *read_context,
           [&](const std::vector<uint64_t>& row) -> Status {
+            if (physical->coordinator_finalize) {
+              // Bound input plus conservative space for Values, sorting full
+              // bindings/keys, DISTINCT trees and COUNT(DISTINCT) sets. This
+              // reservation excludes shared dictionaries and client infrastructure.
+              const uint64_t row_bytes = physical->global_row_reservation;
+              if (reserved > worker_options.coordinator_memory_bytes ||
+                  row_bytes > worker_options.coordinator_memory_bytes - reserved)
+                return STATUS(RuntimeError, "MDB global Gather input budget exceeded");
+              reserved += row_bytes;
+              for (auto id : row) {
+                auto found = g_gmap_to_pack.find(id);
+                if (found == g_gmap_to_pack.end())
+                  return STATUS(Corruption, "Missing typed dictionary identity for global input");
+                gathered.push_back(found->second);
+              }
+              ++read_context->stats.global_input_rows;
+              read_context->stats.global_reserved_bytes = reserved;
+              return Status::OK();
+            }
             for (size_t col = 0; col < row.size(); ++col) {
               if (g_gmap_to_pack.find(row[col]) == g_gmap_to_pack.end())
                 return STATUS(Corruption, "Missing typed dictionary identity for worker output");
@@ -444,7 +469,13 @@ int ExecuteSparql(
             return Status::OK();
           });
       if (!status.ok()) LOG(WARNING) << "MDB fragment query failed: " << status;
-      return status.ok() ? 0 : 1;
+      if (!status.ok()) return 1;
+      if (!physical->coordinator_finalize) return 0;
+      // Gather all child transaction results before exposing global output.
+      // The original modifier tree executes exactly once over the complete bag.
+      *yb::mdb::FragmentPlan::InputSlot(*op) = std::make_unique<OpValues>(
+          std::move(gathered_vars), std::move(gathered));
+      ++read_context->stats.global_finalize_operators;
     }
   }
 
@@ -515,7 +546,14 @@ int ExecuteSparql(
   }
 
   Binding binding(get_query_ctx().get_var_size());
+  auto check_global_state = [&] {
+    if (read_context && read_context->stats.global_finalize_operators &&
+        (read_context->cancelled.load() || yb::CoarseMonoClock::Now() >= read_context->deadline))
+      throw QueryException("MDB global finalization cancelled or expired");
+  };
+  check_global_state();
   iter->begin(binding);
+  check_global_state();
 
   std::vector<VarId> output_vars;
   if (const auto* select = dynamic_cast<const OpSelect*>(op.get())) {
@@ -525,6 +563,7 @@ int ExecuteSparql(
   }
 
   while (iter->next()) {
+    check_global_state();
     for (const auto& var : output_vars) {
       const auto& oid = binding[var];
       if (oid.is_null()) {
@@ -541,6 +580,7 @@ int ExecuteSparql(
     }
   }
 
+  check_global_state();
   return 0;
 }
 

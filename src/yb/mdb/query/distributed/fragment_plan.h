@@ -33,6 +33,11 @@ struct FragmentPlan {
   FragmentOpenPB physical;
   std::vector<TabletInfo> tasks;
   bool empty = false;
+  bool coordinator_finalize = false;
+  uint64_t global_row_reservation = 0;
+
+  // Called only after Build has accepted the complete coordinator envelope.
+  static std::unique_ptr<SPARQL::Op>* InputSlot(SPARQL::Op& root);
 
   static Result<FragmentPlan> Build(const SPARQL::Op& root, RdfYBModel& model,
                                     const WorkerOptions& options);

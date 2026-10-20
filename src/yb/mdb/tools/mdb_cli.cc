@@ -52,6 +52,7 @@ DEFINE_uint32(mdb_worker_max_processes, 3, "Maximum concurrently active MDB frag
 DEFINE_uint32(mdb_worker_batch_rows, 128, "Maximum rows per worker pull response");
 DEFINE_uint32(mdb_worker_page_rows, 16, "Maximum storage rows per worker page");
 DEFINE_uint32(mdb_worker_memory_bytes, 8388608, "Per-worker buffered-state budget; excludes shared YB client infrastructure");
+DEFINE_uint32(mdb_global_memory_bytes, 67108864, "Global Gather input reservation budget; excludes shared infrastructure");
 DEFINE_uint64(mdb_worker_output_spool_bytes, 268435456,
               "Maximum temporary CLI result bytes before publication; failure discards staged rows");
 
@@ -120,6 +121,7 @@ static int RunQuery(int argc, char* argv[]) {
     workers.batch_rows = FLAGS_mdb_worker_batch_rows;
     workers.page_rows = FLAGS_mdb_worker_page_rows;
     workers.memory_bytes = FLAGS_mdb_worker_memory_bytes;
+    workers.coordinator_memory_bytes = FLAGS_mdb_global_memory_bytes;
   }
   yb::mdb::RdfYBModel::Instance().SetWorkerOptions(std::move(workers));
   yb::mdb::RdfYBModel::Instance().SetUseTransactions(FLAGS_mdb_use_transactions);
