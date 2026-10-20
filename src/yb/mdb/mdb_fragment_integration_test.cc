@@ -88,6 +88,16 @@ class MdbFragmentIntegrationTest : public MiniClusterTestWithClient<MiniCluster>
     ASSERT_OK(RdfYBModel::Instance().Flush());
   }
 
+  void SeedOrderedGroups() {
+    const std::vector<size_t> sizes = {32, 8, 2, 8};
+    uint64_t subject = 101;
+    for (size_t i = 0; i < sizes.size(); ++i) {
+      for (size_t j = 0; j < sizes[i]; ++j) Write(subject++, 9000, i + 1);
+      Write(i + 1, 9001, 1001 + i);
+    }
+    ASSERT_OK(RdfYBModel::Instance().Flush());
+  }
+
   struct Output {
     int status = -1;
     std::multiset<std::string> values;
@@ -236,6 +246,121 @@ TEST_F(MdbFragmentIntegrationTest, GlobalCountAndGroups) {
   ASSERT_EQ(groups, (std::map<std::string, std::string>{{Iri(1001), "33"}, {Iri(1002), "32"}}));
 }
 
+TEST_F(MdbFragmentIntegrationTest, GlobalOrderedCountGroupsAndSlice) {
+  SeedOrderedGroups();
+  // Each input subject belongs to exactly one physical anchor partition. The
+  // largest group spans multiple tablets, so sorting partial counts is wrong.
+  TabletRouter router;
+  ASSERT_OK(router.Init(client_.get(), "mdb_p6_test"));
+  auto session = client_->NewSession(MonoDelta::FromSeconds(10));
+  std::set<std::string> owners;
+  for (uint64_t s = 101; s < 133; ++s) {
+    auto read = NewMdbReadOp(*RdfYBModel::Instance().GetTable(0), session);
+    QLAddInt64HashValue(read->mutable_request(), static_cast<int64_t>(s));
+    std::string encoded;
+    ASSERT_OK(read->GetPartitionKey(&encoded));
+    const auto* tablet = router.LocateTablet(0, encoded);
+    ASSERT_NE(tablet, nullptr);
+    owners.insert(tablet->tablet_id);
+  }
+  ASSERT_EQ(owners.size(), 4);
+  const std::string body = " WHERE { ?s <urn:p6:9000> ?k . ?k <urn:p6:9001> ?o }";
+  const std::string grouped = body + " GROUP BY ?o";
+  const std::string counts = "SELECT ?o (COUNT(*) AS ?n)" + grouped;
+  const std::vector<std::pair<std::string, std::vector<std::string>>> cases = {
+    {counts + " ORDER BY DESC(?n) ?o",
+      {Iri(1001), "32", Iri(1002), "8", Iri(1004), "8", Iri(1003), "2"}},
+    {counts + " ORDER BY ?n DESC(?o)",
+      {Iri(1003), "2", Iri(1004), "8", Iri(1002), "8", Iri(1001), "32"}},
+    {counts + " ORDER BY DESC(?n) ?o LIMIT 2 OFFSET 1",
+      {Iri(1002), "8", Iri(1004), "8"}},
+    {"SELECT (COUNT(?s) AS ?n)" + grouped + " ORDER BY DESC(?n) ?o",
+      {"32", "8", "8", "2"}},
+    {"SELECT (COUNT(DISTINCT ?s) AS ?n)" + grouped + " ORDER BY ?n DESC(?o)",
+      {"2", "8", "8", "32"}},
+    {"SELECT (COUNT(DISTINCT *) AS ?n)" + grouped + " ORDER BY ?n ?o",
+      {"2", "8", "8", "32"}},
+    {"SELECT DISTINCT (COUNT(*) AS ?n)" + grouped + " ORDER BY ?n LIMIT 1 OFFSET 1", {"8"}},
+    {"SELECT ?o" + grouped + " ORDER BY DESC(?o)",
+      {Iri(1004), Iri(1003), Iri(1002), Iri(1001)}},
+    {"SELECT ?o (COUNT(?missing) AS ?n)" + grouped + " ORDER BY ?n DESC(?o) LIMIT 2",
+      {Iri(1004), "0", Iri(1003), "0"}},
+    {"SELECT (COUNT(*) AS ?n)" + body + " ORDER BY DESC(?n)", {"50"}},
+    {"SELECT (COUNT(*) AS ?n)" + body + " GROUP BY ?missing ORDER BY ?n", {"50"}},
+    {counts + " ORDER BY DESC(?n) DESC(?n) ?o LIMIT 1", {Iri(1001), "32"}},
+    {counts + " ORDER BY ?n LIMIT 0", {}},
+    {counts + " ORDER BY ?n OFFSET 9", {}}
+  };
+  for (const auto& item : cases) {
+    SCOPED_TRACE(item.first);
+    const auto local = Query(item.first, {});
+    const auto remote = Query(item.first, workers_);
+    ASSERT_EQ(local.status, 0);
+    ASSERT_EQ(remote.status, 0) << remote.profile;
+    // All projected cells are bound. Comparing this sequence checks complete
+    // rows, tie-breaks and bag multiplicity, not just a multiset of cells.
+    ASSERT_EQ(local.ordered, item.second);
+    ASSERT_EQ(remote.ordered, item.second);
+    ASSERT_EQ(Field(remote.profile, "remote_fragments"), 4);
+    ASSERT_EQ(Field(remote.profile, "remote_coordinator_fallbacks"), 0);
+    ASSERT_EQ(Field(remote.profile, "remote_rows"), 50);
+    ASSERT_EQ(Field(remote.profile, "global_input_rows"), 50);
+    ASSERT_EQ(Field(remote.profile, "global_finalize_operators"), 1);
+  }
+  for (bool group : {false, true}) {
+    const std::string query = "SELECT (COUNT(*) AS ?n) WHERE { ?s <urn:p6:missing> ?o }" +
+        std::string(group ? " GROUP BY ?o" : "") + " ORDER BY ?n LIMIT 1";
+    const auto remote = Query(query, workers_);
+    const auto local = Query(query, {});
+    ASSERT_EQ(remote.status, 0);
+    ASSERT_EQ(local.status, 0);
+    ASSERT_EQ(remote.ordered, (group ? std::vector<std::string>{} : std::vector<std::string>{"0"}));
+    ASSERT_EQ(remote.ordered, local.ordered);
+    ASSERT_EQ(Field(remote.profile, "remote_coordinator_fallbacks"), 0);
+    ASSERT_EQ(Field(remote.profile, "global_finalize_operators"), 1);
+  }
+}
+
+TEST_F(MdbFragmentIntegrationTest, GlobalOrderedGroupBudgetFailureAndRecovery) {
+  SeedOrderedGroups();
+  const std::string query = "SELECT ?o (COUNT(*) AS ?n) WHERE { ?s <urn:p6:9000> ?k . "
+      "?k <urn:p6:9001> ?o } GROUP BY ?o ORDER BY DESC(?n) ?o LIMIT 1";
+  const auto success = Query(query, workers_);
+  ASSERT_EQ(success.status, 0);
+  ASSERT_EQ(success.ordered, (std::vector<std::string>{Iri(1001), "32"}));
+  // Four variables, two sort keys. LIMIT does not reduce Gather's admission.
+  ASSERT_EQ(Field(success.profile, "global_reserved_bytes"), 50 * (1024 + 128 * 4 + 16 * 2));
+  auto limited = workers_;
+  limited.coordinator_memory_bytes = 50 * (1024 + 128 * 4);
+  const auto exhausted = Query(query, limited);
+  ASSERT_NE(exhausted.status, 0);
+  ASSERT_TRUE(exhausted.ordered.empty());
+  ASSERT_EQ(Field(exhausted.profile, "remote_coordinator_fallbacks"), 0);
+  auto broken = workers_;
+  broken.binary = "/bin/false";
+  const auto failed = Query(query, broken);
+  ASSERT_NE(failed.status, 0);
+  ASSERT_TRUE(failed.ordered.empty());
+  ASSERT_EQ(Field(failed.profile, "remote_coordinator_fallbacks"), 0);
+  for (bool expire : {false, true}) {
+    struct Stop { bool expire; size_t cells = 0; } stop{expire};
+    auto sink = [](const char*, const char*, void* arg) {
+      auto& state = *static_cast<Stop*>(arg);
+      ++state.cells;
+      auto* context = DocDBReadContextScope::Current();
+      if (state.expire) context->deadline = CoarseMonoClock::Now();
+      else context->cancelled.store(true);
+    };
+    RdfYBModel::Instance().SetWorkerOptions(workers_);
+    ASSERT_NE(YBCMdbExecuteSparql(query.c_str(), sink, &stop), 0);
+    ASSERT_EQ(stop.cells, 2);
+    ASSERT_EQ(Field(YBCMdbGetLastQueryProfile(), "remote_coordinator_fallbacks"), 0);
+  }
+  const auto recovered = Query(query, workers_);
+  ASSERT_EQ(recovered.status, 0);
+  ASSERT_EQ(recovered.ordered, success.ordered);
+}
+
 TEST_F(MdbFragmentIntegrationTest, GlobalTypedIdentityAndValueOrdering) {
   RegisterRdfIdentity(500, RdfIdentity(TripleTermType::URI, Iri(500)));
   RegisterRdfIdentity(9003, RdfIdentity(TripleTermType::URI, Iri(9003)));
@@ -328,6 +453,8 @@ TEST_F(MdbFragmentIntegrationTest, GlobalUnsupportedEnvelopeFallsBackBeforeLaunc
       "SELECT ?o WHERE { { ?s <urn:p6:9000> ?o } UNION { ?s <urn:p6:9001> ?o } }",
       "SELECT ?s WHERE { ?s <urn:p6:9000> ?k OPTIONAL { ?k <urn:p6:9001> ?o } }",
       "SELECT (SUM(?s) AS ?n) WHERE { ?s <urn:p6:9000> ?k }",
+      "SELECT (COUNT(*) AS ?n) WHERE { ?s <urn:p6:9000> ?k } GROUP BY ?k ORDER BY ?s",
+      "SELECT (COUNT(*) AS ?n) WHERE { ?s <urn:p6:9000> ?k } GROUP BY ?k HAVING (COUNT(*) > 1)",
       "SELECT ?s WHERE { ?s <urn:p6:9000> ?k } ORDER BY STR(?s)"}) {
     const auto remote = Query(query, unreachable);
     const auto local = Query(query, {});
@@ -336,6 +463,13 @@ TEST_F(MdbFragmentIntegrationTest, GlobalUnsupportedEnvelopeFallsBackBeforeLaunc
     ASSERT_EQ(Field(remote.profile, "remote_fragments"), 0);
     ASSERT_EQ(Field(remote.profile, "remote_coordinator_fallbacks"), 1);
   }
+  std::string excessive_keys = "SELECT (COUNT(*) AS ?n) WHERE { ?s <urn:p6:9000> ?k } ORDER BY";
+  for (size_t i = 0; i < 129; ++i) excessive_keys += " ?n";
+  const auto excessive = Query(excessive_keys, unreachable);
+  ASSERT_EQ(excessive.status, 0);
+  ASSERT_EQ(excessive.ordered, (std::vector<std::string>{"32"}));
+  ASSERT_EQ(Field(excessive.profile, "remote_fragments"), 0);
+  ASSERT_EQ(Field(excessive.profile, "remote_coordinator_fallbacks"), 1);
 }
 
 TEST_F(MdbFragmentIntegrationTest, SharedChildSnapshotAndSlowConsumer) {

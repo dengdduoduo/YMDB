@@ -114,11 +114,19 @@ Result<FragmentPlan> FragmentPlan::Build(
   }
   const SPARQL::Op* input = select->op.get();
   bool ordered = false, grouped = false;
+  uint64_t order_keys = 0;
+  std::set<VarId> final_variables, order_variables;
+  for (size_t i = 0; i < select->vars_exprs.size(); ++i)
+    if (select->vars_exprs[i]) final_variables.insert(select->vars[i]);
   while (true) {
     if (auto* order = dynamic_cast<const SPARQL::OpOrderBy*>(input)) {
       if (ordered) return STATUS(NotSupported, "Nested global ordering is unsupported");
       for (const auto& item : order->items) if (!std::holds_alternative<VarId>(item))
         return STATUS(NotSupported, "ORDER BY expressions remain at coordinator");
+      order_keys = order->items.size();
+      if (order_keys > 128)
+        return STATUS(NotSupported, "Global ORDER BY key limit exceeded");
+      for (const auto& item : order->items) order_variables.insert(std::get<VarId>(item));
       ordered = true;
       input = order->op.get();
     } else if (auto* group = dynamic_cast<const SPARQL::OpGroupBy*>(input)) {
@@ -126,14 +134,16 @@ Result<FragmentPlan> FragmentPlan::Build(
       for (const auto& item : group->items)
         if (item.second || !dynamic_cast<const SPARQL::ExprVar*>(item.first.get()))
           return STATUS(NotSupported, "GROUP BY expressions remain at coordinator");
+      for (const auto& item : group->items)
+        final_variables.insert(static_cast<const SPARQL::ExprVar&>(*item.first).var);
       grouped = true;
       input = group->op.get();
     } else break;
   }
-  // The legacy constructor orders before aggregation; do not claim that it can
-  // order final aggregate values. Keep that whole query on its original path.
-  if (ordered && (aggregate || grouped))
-    return STATUS(NotSupported, "Ordered aggregation remains at coordinator");
+  if (aggregate || grouped) {
+    for (auto var : order_variables) if (!final_variables.count(var))
+      return STATUS(NotSupported, "Non-grouped ORDER BY variable remains at coordinator");
+  }
   std::vector<SPARQL::OpTriple> triples;
   RETURN_NOT_OK(Collect(*input, &triples));
   if (triples.empty() || triples.size() > 32 || select->vars.empty())
@@ -143,7 +153,11 @@ Result<FragmentPlan> FragmentPlan::Build(
   if (variables > 128) return STATUS(NotSupported, "Worker variable limit exceeded");
   // Each COUNT(DISTINCT *) retains a full binding tuple. Account for every
   // such set, not just the number of returned columns or aggregate outputs.
-  plan.global_row_reservation = 1024 + 128 * variables + 16 * distinct_tuple_sets * variables;
+  // Group sorting retains its input while final sorting materializes the group
+  // outputs (at most one per input row). Charge explicit keys as well, including
+  // repeated keys that do not increase the query's variable count.
+  plan.global_row_reservation = 1024 + 128 * variables +
+      16 * distinct_tuple_sets * variables + 16 * order_keys;
   plan.coordinator_finalize = aggregate || grouped || ordered || select->distinct ||
       select->limit != SPARQL::Op::DEFAULT_LIMIT || select->offset != 0;
   auto& physical = plan.physical;

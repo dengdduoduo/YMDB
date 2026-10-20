@@ -21,16 +21,22 @@ Supported envelopes:
 * COUNT(*), COUNT(?variable), COUNT(DISTINCT ?variable), COUNT(DISTINCT *),
   with optional simple-variable GROUP BY. Empty ungrouped input counts as zero;
   empty grouped input has no groups.
+* Grouped COUNT results can be ordered by aggregate aliases and grouping
+  variables (including hidden group keys), then DISTINCT and OFFSET/LIMIT.
+  Group-only SELECT ordering and ordered ungrouped COUNT are supported too.
+  The constructor defers grouped ordering until aggregate bindings exist.
 * Global term identity uses the existing typed RDF mapping, not printed text or
   raw numeric storage-ID ordering. ORDER BY uses compare_for_order.
 
 Fallback is decided before remote work: OPTIONAL, UNION, subqueries, paths,
 FILTER/HAVING/BIND envelopes, computed ORDER BY/GROUP BY/SELECT expressions,
-other aggregates, constant-only BGPs and ordered aggregation retain the existing
-coordinator path. This capability fallback does not certify unimplemented legacy
-operator semantics. In particular the legacy constructor orders before aggregate
-finalization, and several numeric/distinct aggregates remain incomplete. P7 does
-not silently advertise these as distributed capabilities. Hash/auto join policies
+other aggregates and constant-only BGPs retain the existing coordinator path.
+Grouped ordering keys must be group variables or projected COUNT aliases;
+computed ordering and non-grouped keys remain outside this capability.
+This capability fallback does not certify unimplemented legacy operator
+semantics. HAVING, projection expressions and several numeric/distinct aggregates
+remain incomplete. P7 does not silently advertise these as distributed
+capabilities. Hash/auto join policies
 also retain the P5 coordinator implementation.
 
 Global Gather budget exhaustion, dictionary failure, worker failure, deadline or
@@ -40,11 +46,16 @@ cancellation fails the query; there is no runtime retry or coordinator fallback.
 
 WorkerOptions::coordinator_memory_bytes (CLI --mdb_global_memory_bytes) defaults
 to 64 MiB. Each gathered row reserves
-1024 + 128 * query_variable_count + 16 * count_distinct_star_sets * query_variable_count bytes,
+1024 + 128 * query_variable_count + 16 * count_distinct_star_sets * query_variable_count
++ 16 * order_key_count bytes,
 covering input vector growth and conservative per-row slack for retained binding
 arrays, sort keys/indices, DISTINCT trees and COUNT DISTINCT sets. This is a bounded
 input admission reservation. Each COUNT(DISTINCT *) is charged for its own full
-binding tuple set, including when several appear in one projection. This is
+binding tuple set, including when several appear in one projection. The budget
+also charges every explicit ordering key, including repeated variables;
+at most 128 keys are admitted. The group-input sort and final-output sort can
+coexist, with no more grouped output rows than input rows (except the single
+empty-input ungrouped aggregate row). This is
 not measured process RSS or a universal allocator
 limit. Shared dictionaries, YB client infrastructure and output decoding are
 excluded. Unsupported unbounded expression/concatenation aggregates are not
@@ -72,3 +83,11 @@ fallback. This environment is a single VM and cannot establish real multi-host
 scaling. P6 multi-host acceptance and the independent 2.31 Linux baseline build
 remain separate pending requirements. A test/source archive records actual
 build/test results; this document alone is not evidence of a passing run.
+
+The ordered-group extension adds explicit complete-row expectations for unequal
+counts spanning four tablets, mixed directions and tie-breaks, hidden group
+keys, grouped COUNT DISTINCT variants, DISTINCT before slicing, empty inputs,
+LIMIT 0 and out-of-range offsets. Budget accounting, failure without fallback,
+callback cancellation/deadline and subsequent recovery have dedicated coverage.
+Semantics follow SPARQL 1.1 sections 18.2.4 and 18.2.5:
+https://www.w3.org/TR/sparql11-query/#convertSolMod

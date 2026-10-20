@@ -485,6 +485,18 @@ void BindingIterConstructor::visit(OpOrderBy& op_order_by) {
 
     this->op_order_by = &op_order_by;
 
+    // SELECT registers its aggregates in handle_select, after visiting its
+    // child. Defer ordering until those aggregates have produced their values.
+    // Non-grouped query forms retain their existing ordering location.
+    if (!grouping && !op_group_by) {
+        make_order_by_operator();
+    }
+}
+
+void BindingIterConstructor::make_order_by_operator() {
+    if (!op_order_by) return;
+    auto& op_order_by = *this->op_order_by;
+
     std::vector<VarId> order_vars;
     std::vector<bool> ascending;
 
@@ -514,6 +526,7 @@ void BindingIterConstructor::visit(OpOrderBy& op_order_by) {
         std::move(order_vars),
         std::move(ascending),
         Comparisons::compare_for_order);
+    this->op_order_by = nullptr;
 }
 
 void BindingIterConstructor::visit(OpHaving& op_having) {
@@ -658,6 +671,10 @@ void BindingIterConstructor::make_solution_modifier_operators(
             std::move(aggregations),
             std::move(group_vars));
     }
+
+    // ORDER BY sees the complete groups and COUNT aliases. DISTINCT must then
+    // retain their order, and slicing applies to that final solution sequence.
+    make_order_by_operator();
 
     if (distinct && !projection_vars.empty()) {
         tmp = std::make_unique<DistinctHash>(std::move(tmp), std::move(projection_vars));

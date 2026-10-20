@@ -95,6 +95,9 @@ public:
     // if they are present in the query. Used for SELECT, DESCRIBE, CONSTRUCT and SUB-SELECT.
     void make_solution_modifier_operators(bool is_root_query, bool distinct, uint64_t offset, uint64_t limit);
 
+    // Final aggregate bindings must exist before sorting grouped SELECT results.
+    void make_order_by_operator();
+
     // Used to handle common functionality of SELECTs and SUB-SELECTs
     void handle_select(OpSelect& op_select);
 
