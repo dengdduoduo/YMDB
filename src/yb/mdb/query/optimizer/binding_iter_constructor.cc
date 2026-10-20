@@ -100,6 +100,8 @@ bool BindingIterConstructor::is_aggregation_or_group_var(VarId var_id) const {
 }
 
 void BindingIterConstructor::visit(OpSelect& op_select) {
+    const bool previous_defer_having = defer_having;
+    defer_having = true;
     for (auto& expr : op_select.vars_exprs) {
         if (expr != nullptr && expr->has_aggregation()) {
             grouping = true;
@@ -108,6 +110,7 @@ void BindingIterConstructor::visit(OpSelect& op_select) {
     }
     op_select.op->accept_visitor(*this);
     handle_select(op_select);
+    defer_having = previous_defer_having;
 }
 
 void BindingIterConstructor::visit(OpAsk& op_ask) {
@@ -534,13 +537,23 @@ void BindingIterConstructor::visit(OpHaving& op_having) {
 
     this->op_having = &op_having;
 
-    for (auto& having_expr : op_having.exprs) {
-        ExprToBindingExpr visitor;
-        having_expr->accept_visitor(visitor);
-        std::vector<std::unique_ptr<BindingExpr>> filters_vec;
-        filters_vec.push_back(std::move(visitor.tmp));
-        tmp = std::make_unique<Filter>(to_boolean, std::move(tmp), std::move(filters_vec));
+    if (!defer_having) {
+        // Non-SELECT query forms keep their existing constructor path.
+        for (auto& expr : op_having.exprs) {
+            ExprToBindingExpr visitor;
+            expr->accept_visitor(visitor);
+            std::vector<std::unique_ptr<BindingExpr>> filters;
+            filters.push_back(std::move(visitor.tmp));
+            tmp = std::make_unique<Filter>(to_boolean, std::move(tmp), std::move(filters));
+        }
+        return;
     }
+
+    // Register the conditions at SELECT finalization, before SELECT aliases
+    // enter scope. Their aggregates run with the group's other aggregates;
+    // the filter itself must run after those aggregates, never on BGP rows.
+    for (const auto& expr : op_having.exprs)
+        if (expr->has_aggregation()) grouping = true;
 }
 
 static void get_non_redundant_exprs(
@@ -672,6 +685,12 @@ void BindingIterConstructor::make_solution_modifier_operators(
             std::move(group_vars));
     }
 
+    if (!having_filters.empty()) {
+        tmp = std::make_unique<Filter>(
+            Conversions::to_boolean, std::move(tmp), std::move(having_filters));
+    }
+    op_having = nullptr;
+
     // ORDER BY sees the complete groups and COUNT aliases. DISTINCT must then
     // retain their order, and slicing applies to that final solution sequence.
     make_order_by_operator();
@@ -715,6 +734,20 @@ void BindingIterConstructor::handle_select(OpSelect& op_select) {
                 break;
             }
         }
+    }
+
+    if (op_having) {
+        for (const auto& expr : op_having->exprs)
+            has_group_by = has_group_by || expr->has_aggregation();
+        // Conditions do not see SELECT expression aliases. Using the grouping
+        // visitor also rejects non-group variables outside aggregate arguments.
+        for (auto& expr : op_having->exprs) {
+            grouping = has_group_by;
+            ExprToBindingExpr visitor(this, std::nullopt);
+            expr->accept_visitor(visitor);
+            having_filters.push_back(std::move(visitor.tmp));
+        }
+        grouping = false;
     }
 
     std::vector<std::pair<VarId, std::unique_ptr<BindingExpr>>> select_exprs;

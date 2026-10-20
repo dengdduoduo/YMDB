@@ -74,6 +74,10 @@ public:
 
     OpHaving* op_having = nullptr;
 
+    std::vector<std::unique_ptr<BindingExpr>> having_filters;
+
+    bool defer_having = false;
+
     OpGroupBy* op_group_by = nullptr;
 
     std::map<VarId, std::unique_ptr<Agg>> aggregations;

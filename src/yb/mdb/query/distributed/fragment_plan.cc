@@ -12,7 +12,18 @@
 #include "query/parser/op/sparql/op_select.h"
 #include "query/parser/op/sparql/op_order_by.h"
 #include "query/parser/op/sparql/op_group_by.h"
+#include "query/parser/op/sparql/op_having.h"
+#include "query/parser/expr/sparql/atom/expr_term.h"
 #include "query/parser/expr/sparql/atom/expr_var.h"
+#include "query/parser/expr/sparql/binary/expr_and.h"
+#include "query/parser/expr/sparql/binary/expr_or.h"
+#include "query/parser/expr/sparql/binary/expr_equal.h"
+#include "query/parser/expr/sparql/binary/expr_not_equal.h"
+#include "query/parser/expr/sparql/binary/expr_greater.h"
+#include "query/parser/expr/sparql/binary/expr_greater_or_equal.h"
+#include "query/parser/expr/sparql/binary/expr_less.h"
+#include "query/parser/expr/sparql/binary/expr_less_or_equal.h"
+#include "query/parser/expr/sparql/unary/expr_not.h"
 #include "query/parser/expr/sparql/builtin_call/aggregate/expr_agg_count.h"
 #include "query/parser/expr/sparql/builtin_call/aggregate/expr_agg_count_all.h"
 #include "yb/mdb/model/rdf_yb_model.h"
@@ -20,6 +31,89 @@
 
 namespace yb::mdb {
 namespace {
+struct HavingBudget {
+  uint64_t nodes = 0;
+  uint64_t aggregates = 0;
+  uint64_t distinct_tuple_sets = 0;
+};
+
+bool HavingInteger(::ObjectId value) {
+  if (value.get_type() == ::ObjectId::MASK_POSITIVE_INT) return true;
+  if (value.get_type() != ::ObjectId::MASK_INT64_EXTERN) return false;
+  // Typed RDF integers use dictionary identities even for small constants.
+  // Their mask is assigned only after signed-64-bit parsing succeeds. Bound
+  // lexical storage as well; arbitrarily zero-padded terms stay on fallback.
+  const auto term = SPARQL::RdfTermRegistry::Find(value.id);
+  return term && term->kind == 'L' && term->lexical.size() <= 21 &&
+      term->qualifier == std::string(SPARQL::RdfTermIdentity::kXsd) + "integer";
+}
+
+template<class T>
+bool HavingOperands(const SPARQL::Expr& expr, const SPARQL::Expr** lhs, const SPARQL::Expr** rhs) {
+  auto* binary = dynamic_cast<const T*>(&expr);
+  if (!binary) return false;
+  *lhs = binary->lhs.get();
+  *rhs = binary->rhs.get();
+  return true;
+}
+
+// Deliberately bounded COUNT predicates, not a general expression whitelist.
+// SELECT aliases are excluded: HAVING is evaluated before SELECT extensions.
+Status ValidateHaving(const SPARQL::Expr& expr, const std::set<VarId>& group_vars,
+                      HavingBudget* budget, bool condition = true, size_t depth = 0) {
+  if (++budget->nodes > 128 || depth > 16)
+    return STATUS(NotSupported, "Global HAVING expression limit exceeded");
+  if (auto* count = dynamic_cast<const SPARQL::ExprAggCount*>(&expr)) {
+    if (!dynamic_cast<const SPARQL::ExprVar*>(count->expr.get()))
+      return STATUS(NotSupported, "HAVING COUNT requires a variable argument");
+    ++budget->aggregates;
+    return Status::OK();
+  }
+  if (auto* all = dynamic_cast<const SPARQL::ExprAggCountAll*>(&expr)) {
+    ++budget->aggregates;
+    budget->distinct_tuple_sets += all->distinct;
+    return Status::OK();
+  }
+  if (auto* var = dynamic_cast<const SPARQL::ExprVar*>(&expr)) {
+    if (!condition && group_vars.count(var->var)) return Status::OK();
+    return STATUS(NotSupported, "HAVING requires a grouped comparison operand");
+  }
+  if (auto* term = dynamic_cast<const SPARQL::ExprTerm*>(&expr)) {
+    if (HavingInteger(term->term) ||
+        term->term.id == ::ObjectId::BOOL_TRUE || term->term.id == ::ObjectId::BOOL_FALSE)
+      return Status::OK();
+    return STATUS(NotSupported, "HAVING literal remains at coordinator");
+  }
+  if (auto* negation = dynamic_cast<const SPARQL::ExprNot*>(&expr))
+    return ValidateHaving(*negation->expr, group_vars, budget, true, depth + 1);
+  const SPARQL::Expr *lhs = nullptr, *rhs = nullptr;
+  const bool logical = HavingOperands<SPARQL::ExprAnd>(expr, &lhs, &rhs) ||
+      HavingOperands<SPARQL::ExprOr>(expr, &lhs, &rhs);
+  const bool equality = !logical && (HavingOperands<SPARQL::ExprEqual>(expr, &lhs, &rhs) ||
+      HavingOperands<SPARQL::ExprNotEqual>(expr, &lhs, &rhs));
+  const bool relational = !logical && !equality && (
+      HavingOperands<SPARQL::ExprGreater>(expr, &lhs, &rhs) ||
+      HavingOperands<SPARQL::ExprGreaterOrEqual>(expr, &lhs, &rhs) ||
+      HavingOperands<SPARQL::ExprLess>(expr, &lhs, &rhs) ||
+      HavingOperands<SPARQL::ExprLessOrEqual>(expr, &lhs, &rhs));
+  if (relational) {
+    // General RDF relational comparison (including NaN/boolean operands) is a
+    // separate capability. This extension orders only COUNTs/int64 constants.
+    for (auto* operand : {lhs, rhs}) {
+      auto* term = dynamic_cast<const SPARQL::ExprTerm*>(operand);
+      if (!dynamic_cast<const SPARQL::ExprAggCount*>(operand) &&
+          !dynamic_cast<const SPARQL::ExprAggCountAll*>(operand) &&
+          (!term || !HavingInteger(term->term)))
+        return STATUS(NotSupported, "HAVING relational operands require COUNT or int64 constants");
+    }
+  }
+  if (logical || equality || relational) {
+    RETURN_NOT_OK(ValidateHaving(*lhs, group_vars, budget, logical, depth + 1));
+    return ValidateHaving(*rhs, group_vars, budget, logical, depth + 1);
+  }
+  return STATUS(NotSupported, "HAVING expression remains at coordinator");
+}
+
 Status Collect(const SPARQL::Op& op, std::vector<SPARQL::OpTriple>* triples) {
   if (auto* bgp = dynamic_cast<const SPARQL::OpBasicGraphPattern*>(&op)) {
     if (!bgp->paths.empty()) return STATUS(NotSupported, "Worker property paths are not supported");
@@ -115,7 +209,8 @@ Result<FragmentPlan> FragmentPlan::Build(
   const SPARQL::Op* input = select->op.get();
   bool ordered = false, grouped = false;
   uint64_t order_keys = 0;
-  std::set<VarId> final_variables, order_variables;
+  std::set<VarId> final_variables, order_variables, group_variables;
+  const SPARQL::OpHaving* having = nullptr;
   for (size_t i = 0; i < select->vars_exprs.size(); ++i)
     if (select->vars_exprs[i]) final_variables.insert(select->vars[i]);
   while (true) {
@@ -129,16 +224,35 @@ Result<FragmentPlan> FragmentPlan::Build(
       for (const auto& item : order->items) order_variables.insert(std::get<VarId>(item));
       ordered = true;
       input = order->op.get();
+    } else if (auto* filter = dynamic_cast<const SPARQL::OpHaving*>(input)) {
+      if (having) return STATUS(NotSupported, "Nested HAVING is unsupported");
+      having = filter;
+      input = filter->op.get();
     } else if (auto* group = dynamic_cast<const SPARQL::OpGroupBy*>(input)) {
       if (grouped) return STATUS(NotSupported, "Nested grouping is unsupported");
       for (const auto& item : group->items)
         if (item.second || !dynamic_cast<const SPARQL::ExprVar*>(item.first.get()))
           return STATUS(NotSupported, "GROUP BY expressions remain at coordinator");
-      for (const auto& item : group->items)
-        final_variables.insert(static_cast<const SPARQL::ExprVar&>(*item.first).var);
+      for (const auto& item : group->items) {
+        const auto var = static_cast<const SPARQL::ExprVar&>(*item.first).var;
+        final_variables.insert(var);
+        group_variables.insert(var);
+      }
       grouped = true;
       input = group->op.get();
     } else break;
+  }
+  HavingBudget having_budget;
+  if (having) {
+    for (const auto& expr : having->exprs)
+      RETURN_NOT_OK(ValidateHaving(*expr, group_variables, &having_budget));
+    if (having_budget.aggregates > 16)
+      return STATUS(NotSupported, "Global HAVING aggregate limit exceeded");
+    aggregate = aggregate || having_budget.aggregates != 0;
+    if (!grouped && !aggregate)
+      return STATUS(NotSupported, "Ungrouped non-aggregate HAVING remains at coordinator");
+    for (auto var : select->vars) if (!final_variables.count(var))
+      return STATUS(NotSupported, "HAVING projection requires grouped or aggregate variables");
   }
   if (aggregate || grouped) {
     for (auto var : order_variables) if (!final_variables.count(var))
@@ -149,7 +263,9 @@ Result<FragmentPlan> FragmentPlan::Build(
   if (triples.empty() || triples.size() > 32 || select->vars.empty())
     return STATUS(NotSupported, "Unsupported MDB BGP size");
   FragmentPlan plan;
-  const uint64_t variables = get_query_ctx().get_var_size();
+  // The constructor creates one private binding slot for each HAVING COUNT.
+  // Account for them before starting workers, without mutating the parser tree.
+  const uint64_t variables = get_query_ctx().get_var_size() + having_budget.aggregates;
   if (variables > 128) return STATUS(NotSupported, "Worker variable limit exceeded");
   // Each COUNT(DISTINCT *) retains a full binding tuple. Account for every
   // such set, not just the number of returned columns or aggregate outputs.
@@ -157,7 +273,8 @@ Result<FragmentPlan> FragmentPlan::Build(
   // outputs (at most one per input row). Charge explicit keys as well, including
   // repeated keys that do not increase the query's variable count.
   plan.global_row_reservation = 1024 + 128 * variables +
-      16 * distinct_tuple_sets * variables + 16 * order_keys;
+      16 * (distinct_tuple_sets + having_budget.distinct_tuple_sets) * variables +
+      16 * order_keys + 64 * having_budget.nodes;
   plan.coordinator_finalize = aggregate || grouped || ordered || select->distinct ||
       select->limit != SPARQL::Op::DEFAULT_LIMIT || select->offset != 0;
   auto& physical = plan.physical;
@@ -215,6 +332,7 @@ std::unique_ptr<SPARQL::Op>* FragmentPlan::InputSlot(SPARQL::Op& root) {
   auto* slot = &dynamic_cast<SPARQL::OpSelect&>(root).op;
   while (true) {
     if (auto* order = dynamic_cast<SPARQL::OpOrderBy*>(slot->get())) slot = &order->op;
+    else if (auto* having = dynamic_cast<SPARQL::OpHaving*>(slot->get())) slot = &having->op;
     else if (auto* group = dynamic_cast<SPARQL::OpGroupBy*>(slot->get())) slot = &group->op;
     else return slot;
   }

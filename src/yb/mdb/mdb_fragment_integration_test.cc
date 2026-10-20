@@ -361,6 +361,138 @@ TEST_F(MdbFragmentIntegrationTest, GlobalOrderedGroupBudgetFailureAndRecovery) {
   ASSERT_EQ(recovered.ordered, success.ordered);
 }
 
+TEST_F(MdbFragmentIntegrationTest, GlobalHavingCountGroupsAndSlice) {
+  SeedOrderedGroups();
+  const std::string body = " WHERE { ?s <urn:p6:9000> ?k . ?k <urn:p6:9001> ?o }";
+  const std::string grouped = body + " GROUP BY ?o";
+  const std::string counts = "SELECT ?o (COUNT(*) AS ?n)" + grouped;
+  const std::vector<std::pair<std::string, std::vector<std::string>>> cases = {
+    {counts + " HAVING (COUNT(*) > 8) ORDER BY DESC(?n) ?o", {Iri(1001), "32"}},
+    {counts + " HAVING (COUNT(*) >= 8) ORDER BY DESC(?n) ?o LIMIT 2 OFFSET 1",
+      {Iri(1002), "8", Iri(1004), "8"}},
+    {counts + " HAVING (COUNT(*) <= 2) ORDER BY ?o", {Iri(1003), "2"}},
+    {counts + " HAVING (COUNT(*) < 8) ORDER BY ?o", {Iri(1003), "2"}},
+    {counts + " HAVING (COUNT(*) != 8) ORDER BY ?o", {Iri(1001), "32", Iri(1003), "2"}},
+    {counts + " HAVING (COUNT(*) >= 2) (COUNT(*) <= 8) ORDER BY DESC(?n) ?o",
+      {Iri(1002), "8", Iri(1004), "8", Iri(1003), "2"}},
+    {counts + " HAVING (COUNT(DISTINCT ?s) > 8) ORDER BY ?o", {Iri(1001), "32"}},
+    {counts + " HAVING (COUNT(DISTINCT *) > 8) ORDER BY ?o", {Iri(1001), "32"}},
+    {counts + " HAVING (COUNT(*) = COUNT(?s)) (COUNT(DISTINCT ?o) = 1) "
+      "ORDER BY ?n ?o LIMIT 1", {Iri(1003), "2"}},
+    {counts + " HAVING (COUNT(?missing) = 0) ORDER BY ?n ?o LIMIT 1", {Iri(1003), "2"}},
+    {counts + " HAVING (COUNT(*)) ORDER BY ?n ?o LIMIT 1", {Iri(1003), "2"}},
+    {"SELECT ?o" + grouped + " HAVING (COUNT(*) >= 8) ORDER BY ?o",
+      {Iri(1001), Iri(1002), Iri(1004)}},
+    {"SELECT DISTINCT (COUNT(*) AS ?n)" + grouped +
+      " HAVING (COUNT(*) >= 8) ORDER BY ?n LIMIT 1 OFFSET 1", {"32"}},
+    {counts + " HAVING (?o = ?o) ORDER BY ?n ?o LIMIT 1", {Iri(1003), "2"}},
+    {counts + " HAVING (COUNT(*) > 0) ORDER BY ?n LIMIT 0", {}},
+    {counts + " HAVING (COUNT(*) > 0) ORDER BY ?n OFFSET 9", {}},
+    {"SELECT (COUNT(*) AS ?n)" + body + " HAVING (COUNT(*) = 50) ORDER BY ?n", {"50"}},
+    {"SELECT (COUNT(*) AS ?n)" + body + " HAVING (COUNT(*) = 0) ORDER BY ?n", {}}
+  };
+  for (const auto& item : cases) {
+    SCOPED_TRACE(item.first);
+    const auto local = Query(item.first, {});
+    const auto remote = Query(item.first, workers_);
+    ASSERT_EQ(local.status, 0);
+    ASSERT_EQ(remote.status, 0) << remote.profile;
+    ASSERT_EQ(local.ordered, item.second);
+    ASSERT_EQ(remote.ordered, item.second);
+    ASSERT_EQ(Field(remote.profile, "remote_fragments"), 4);
+    ASSERT_EQ(Field(remote.profile, "remote_coordinator_fallbacks"), 0);
+    ASSERT_EQ(Field(remote.profile, "global_input_rows"), 50);
+    ASSERT_EQ(Field(remote.profile, "global_finalize_operators"), 1);
+  }
+}
+
+TEST_F(MdbFragmentIntegrationTest, GlobalHavingErrorsBooleanAndEmptyInput) {
+  SeedOrderedGroups();
+  const std::string counts = "SELECT ?o (COUNT(*) AS ?n) WHERE { ?s <urn:p6:9000> ?k . "
+      "?k <urn:p6:9001> ?o } GROUP BY ?o ?missing HAVING ";
+  const std::vector<std::pair<std::string, std::vector<std::string>>> cases = {
+    {"(!(?missing = ?missing))", {}},
+    {"((?missing = ?missing) || (COUNT(*) > 8))", {Iri(1001), "32"}},
+    {"((COUNT(*) > 8) || (?missing = ?missing))", {Iri(1001), "32"}},
+    {"((?missing = ?missing) && false)", {}},
+    {"((?missing = ?missing) && true)", {}},
+    {"(!((?missing = ?missing) && false))", {Iri(1001), "32"}},
+    {"(!(COUNT(?missing)))", {Iri(1001), "32"}},
+    {"((COUNT(*) > 8) && !(COUNT(*) < 8))", {Iri(1001), "32"}},
+    {"((COUNT(*) = 8) || (COUNT(*) = 2))", {Iri(1002), "8"}}
+  };
+  for (const auto& item : cases) {
+    const auto query = counts + item.first + " ORDER BY ?o LIMIT 1";
+    SCOPED_TRACE(query);
+    const auto local = Query(query, {});
+    const auto remote = Query(query, workers_);
+    ASSERT_EQ(local.status, 0);
+    ASSERT_EQ(remote.status, 0);
+    ASSERT_EQ(local.ordered, item.second);
+    ASSERT_EQ(remote.ordered, item.second);
+    ASSERT_EQ(Field(remote.profile, "remote_coordinator_fallbacks"), 0);
+    ASSERT_EQ(Field(remote.profile, "global_finalize_operators"), 1);
+  }
+  for (const auto& item : std::vector<std::pair<std::string, std::vector<std::string>>>{
+      {" HAVING (COUNT(*) = 0)", {"0"}},
+      {" HAVING (COUNT(*) > 0)", {}},
+      {" HAVING (COUNT(DISTINCT *) = 0)", {"0"}},
+      {" GROUP BY ?o HAVING (COUNT(*) = 0)", {}}}) {
+    const std::string query = "SELECT (COUNT(*) AS ?n) WHERE { ?s <urn:p6:missing> ?o }" +
+        item.first + " ORDER BY ?n";
+    const auto local = Query(query, {});
+    const auto remote = Query(query, workers_);
+    ASSERT_EQ(local.status, 0) << query;
+    ASSERT_EQ(remote.status, 0) << query;
+    ASSERT_EQ(remote.ordered, item.second) << query;
+    ASSERT_EQ(local.ordered, item.second) << query;
+    ASSERT_EQ(Field(remote.profile, "remote_coordinator_fallbacks"), 0);
+  }
+}
+
+TEST_F(MdbFragmentIntegrationTest, GlobalHavingBudgetFailureAndRecovery) {
+  SeedOrderedGroups();
+  const std::string query = "SELECT ?o (COUNT(*) AS ?n) WHERE { ?s <urn:p6:9000> ?k . "
+      "?k <urn:p6:9001> ?o } GROUP BY ?o "
+      "HAVING (COUNT(DISTINCT *) >= 8) (COUNT(DISTINCT *) <= 32) ORDER BY DESC(?n) ?o LIMIT 1";
+  const auto success = Query(query, workers_);
+  ASSERT_EQ(success.status, 0);
+  ASSERT_EQ(success.ordered, (std::vector<std::string>{Iri(1001), "32"}));
+  // Four parsed variables, two private aggregate slots, two tuple sets,
+  // two ordering keys and six HAVING expression nodes.
+  const uint64_t per_row = 1024 + 128 * 6 + 16 * 2 * 6 + 16 * 2 + 64 * 6;
+  ASSERT_EQ(Field(success.profile, "global_reserved_bytes"), per_row * 50);
+  auto limited = workers_;
+  limited.coordinator_memory_bytes = per_row * 50 - 1;
+  const auto exhausted = Query(query, limited);
+  ASSERT_NE(exhausted.status, 0);
+  ASSERT_TRUE(exhausted.ordered.empty());
+  ASSERT_EQ(Field(exhausted.profile, "remote_coordinator_fallbacks"), 0);
+  auto broken = workers_;
+  broken.binary = "/bin/false";
+  const auto failed = Query(query, broken);
+  ASSERT_NE(failed.status, 0);
+  ASSERT_TRUE(failed.ordered.empty());
+  ASSERT_EQ(Field(failed.profile, "remote_coordinator_fallbacks"), 0);
+  for (bool expire : {false, true}) {
+    struct Stop { bool expire; size_t cells = 0; } stop{expire};
+    auto sink = [](const char*, const char*, void* arg) {
+      auto& state = *static_cast<Stop*>(arg);
+      ++state.cells;
+      auto* context = DocDBReadContextScope::Current();
+      if (state.expire) context->deadline = CoarseMonoClock::Now();
+      else context->cancelled.store(true);
+    };
+    RdfYBModel::Instance().SetWorkerOptions(workers_);
+    ASSERT_NE(YBCMdbExecuteSparql(query.c_str(), sink, &stop), 0);
+    ASSERT_EQ(stop.cells, 2);
+    ASSERT_EQ(Field(YBCMdbGetLastQueryProfile(), "remote_coordinator_fallbacks"), 0);
+  }
+  const auto recovered = Query(query, workers_);
+  ASSERT_EQ(recovered.status, 0);
+  ASSERT_EQ(recovered.ordered, success.ordered);
+}
+
 TEST_F(MdbFragmentIntegrationTest, GlobalTypedIdentityAndValueOrdering) {
   RegisterRdfIdentity(500, RdfIdentity(TripleTermType::URI, Iri(500)));
   RegisterRdfIdentity(9003, RdfIdentity(TripleTermType::URI, Iri(9003)));
@@ -454,7 +586,11 @@ TEST_F(MdbFragmentIntegrationTest, GlobalUnsupportedEnvelopeFallsBackBeforeLaunc
       "SELECT ?s WHERE { ?s <urn:p6:9000> ?k OPTIONAL { ?k <urn:p6:9001> ?o } }",
       "SELECT (SUM(?s) AS ?n) WHERE { ?s <urn:p6:9000> ?k }",
       "SELECT (COUNT(*) AS ?n) WHERE { ?s <urn:p6:9000> ?k } GROUP BY ?k ORDER BY ?s",
-      "SELECT (COUNT(*) AS ?n) WHERE { ?s <urn:p6:9000> ?k } GROUP BY ?k HAVING (COUNT(*) > 1)",
+      "SELECT (COUNT(*) AS ?n) WHERE { ?s <urn:p6:9000> ?k } GROUP BY ?k HAVING (SUM(?s) > 1)",
+      "SELECT (COUNT(*) AS ?n) WHERE { ?s <urn:p6:9000> ?k } GROUP BY ?k HAVING (?n > 1)",
+      "SELECT (COUNT(*) AS ?n) WHERE { ?s <urn:p6:9000> ?k } GROUP BY ?k HAVING (COUNT(*) + 1 > 1)",
+      "SELECT (COUNT(*) AS ?n) WHERE { ?s <urn:p6:9000> ?k } GROUP BY ?k HAVING (COUNT(STR(?s)) > 1)",
+      "SELECT (COUNT(*) AS ?n) WHERE { ?s <urn:p6:9000> ?k } GROUP BY ?k HAVING (COUNT(*) > ?k)",
       "SELECT ?s WHERE { ?s <urn:p6:9000> ?k } ORDER BY STR(?s)"}) {
     const auto remote = Query(query, unreachable);
     const auto local = Query(query, {});
@@ -464,12 +600,32 @@ TEST_F(MdbFragmentIntegrationTest, GlobalUnsupportedEnvelopeFallsBackBeforeLaunc
     ASSERT_EQ(Field(remote.profile, "remote_coordinator_fallbacks"), 1);
   }
   std::string excessive_keys = "SELECT (COUNT(*) AS ?n) WHERE { ?s <urn:p6:9000> ?k } ORDER BY";
+  const auto alias_scope = Query("SELECT (COUNT(*) AS ?n) WHERE { ?s <urn:p6:9000> ?k } "
+      "GROUP BY ?k HAVING (?n > 1)", unreachable);
+  ASSERT_NE(alias_scope.status, 0);
+  ASSERT_TRUE(alias_scope.ordered.empty());
+  ASSERT_EQ(Field(alias_scope.profile, "remote_fragments"), 0);
+  ASSERT_EQ(Field(alias_scope.profile, "remote_coordinator_fallbacks"), 1);
   for (size_t i = 0; i < 129; ++i) excessive_keys += " ?n";
   const auto excessive = Query(excessive_keys, unreachable);
   ASSERT_EQ(excessive.status, 0);
   ASSERT_EQ(excessive.ordered, (std::vector<std::string>{"32"}));
   ASSERT_EQ(Field(excessive.profile, "remote_fragments"), 0);
   ASSERT_EQ(Field(excessive.profile, "remote_coordinator_fallbacks"), 1);
+  const std::string prefix = "SELECT (COUNT(*) AS ?n) WHERE { ?s <urn:p6:9000> ?k } ";
+  std::string many_aggregates = prefix + "HAVING ";
+  for (size_t i = 0; i < 17; ++i) many_aggregates += "(COUNT(*) > 0) ";
+  std::string deep = "COUNT(*) > 0";
+  for (size_t i = 0; i < 18; ++i) deep = "!(" + deep + ")";
+  std::string many_nodes = prefix + "HAVING ";
+  for (size_t i = 0; i < 130; ++i) many_nodes += "(true) ";
+  for (const auto& query : {many_aggregates, prefix + "HAVING (" + deep + ")", many_nodes}) {
+    const auto fallback = Query(query, unreachable);
+    ASSERT_EQ(fallback.status, 0) << query;
+    ASSERT_EQ(fallback.ordered, (std::vector<std::string>{"32"})) << query;
+    ASSERT_EQ(Field(fallback.profile, "remote_fragments"), 0);
+    ASSERT_EQ(Field(fallback.profile, "remote_coordinator_fallbacks"), 1);
+  }
 }
 
 TEST_F(MdbFragmentIntegrationTest, SharedChildSnapshotAndSlowConsumer) {

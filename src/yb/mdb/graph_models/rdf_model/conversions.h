@@ -399,6 +399,9 @@ public:
     }
 
     static ObjectId to_boolean(ObjectId oid) {
+        // Keep expression errors through logical NOT/AND/OR. Treating an
+        // unbound/error value as false incorrectly makes NOT(error) true.
+        if (oid.is_null()) return oid;
         if (RDF_OID::get_generic_type(oid) == RDF_OID::GenericType::NUMERIC) {
             const auto number = to_double(oid);
             return pack_bool(number != 0 && !std::isnan(number));
