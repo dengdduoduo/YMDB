@@ -62,6 +62,7 @@ set(MDB_DISTRIBUTED_SRCS
     query/distributed/fragment_transport.cc
     query/distributed/fragment_worker.cc
     query/distributed/fragment_gather.cc
+    query/distributed/exchange.cc
     query/distributed/tablet_router.cc
     query/distributed/distributed_plan.cc
     query/distributed/scatter_executor.cc

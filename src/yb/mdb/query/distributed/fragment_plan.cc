@@ -34,6 +34,7 @@
 #include "query/parser/expr/sparql/builtin_call/aggregate/expr_agg_max.h"
 #include "yb/mdb/model/rdf_yb_model.h"
 #include "yb/mdb/query/distributed/fragment_transport.h"
+#include "yb/mdb/query/distributed/exchange.h"
 
 namespace yb::mdb {
 namespace {
@@ -412,6 +413,7 @@ Result<FragmentPlan> FragmentPlan::Build(
   }
   for (auto var : physical.projection()) if (!bound.count(var))
     return STATUS(NotSupported, "Unbound projection remains at MDB coordinator");
+  if (options.exchange != ExchangeMode::None) RETURN_NOT_OK(ValidateExchange(physical, options));
   plan.properties.partitioning = PhysicalProperties::Partitioning::YcqlSubjectHash;
   const auto& anchor_subject = physical.triples(0).terms(0);
   if (anchor_subject.has_variable()) plan.properties.partition_variable = anchor_subject.variable();

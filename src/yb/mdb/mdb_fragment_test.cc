@@ -3,6 +3,10 @@
 #include <unistd.h>
 #include <gtest/gtest.h>
 #include <limits>
+#include <filesystem>
+#include <array>
+#include <fcntl.h>
+#include "yb/mdb/query/distributed/exchange.h"
 
 #include "graph_models/rdf_model/conversions.h"
 #include "query/executor/binding.h"
@@ -23,6 +27,139 @@
 
 namespace yb::mdb {
 namespace {
+
+struct ExchangeRoot {
+  ExchangeRoot() {
+    char name[] = "/tmp/mdb-p8-unit-XXXXXX";
+    if (mkdtemp(name)) path = name;
+  }
+  ~ExchangeRoot() { if (!path.empty()) rmdir(path.c_str()); }
+  std::string path;
+};
+
+FragmentOpenPB ExchangeTestPlan(bool composite = false) {
+  FragmentOpenPB plan;
+  plan.set_variable_count(composite ? 4 : 3);
+  for (size_t side = 0; side < 2; ++side) {
+    auto* triple = plan.add_triples();
+    if (composite) {
+      triple->add_terms()->set_variable(0);
+      triple->add_terms()->set_variable(1);
+      triple->add_terms()->set_variable(side ? 3 : 2);
+    } else {
+      triple->add_terms()->set_variable(side ? 1 : 0);
+      triple->add_terms()->set_constant(9000 + side);
+      triple->add_terms()->set_variable(side ? 2 : 1);
+    }
+  }
+  for (uint32_t var = 0; var < plan.variable_count(); ++var) plan.add_projection(var);
+  return plan;
+}
+
+TEST(MdbFragmentTest, P8HashBroadcastPreserveCompositeBag) {
+  ExchangeRoot root; ASSERT_FALSE(root.path.empty());
+  const std::array<std::vector<std::vector<uint64_t>>, 2> rows = {{
+    {{1, 2, 10}, {1, 2, 10}, {1, 3, 11}},
+    {{1, 2, 20}, {1, 2, 20}, {1, 3, 21}, {2, 2, 99}}}};
+  for (auto mode : {ExchangeMode::Hash, ExchangeMode::Broadcast}) {
+    WorkerOptions options; options.exchange = mode; options.exchange_spill_directory = root.path;
+    options.exchange_memory_bytes = 65536;
+    BatchQueryStats stats; ExchangeControl control{nullptr, CoarseMonoClock::Now() + MonoDelta::FromSeconds(10), &stats};
+    std::multiset<std::vector<uint64_t>> output;
+    ASSERT_OK(ExchangeRows(ExchangeTestPlan(true), options, control,
+        [&](size_t side, const FragmentRowSink& sink) -> Status {
+          for (const auto& row : rows[side]) RETURN_NOT_OK(sink(row));
+          return Status::OK();
+        }, [&](const std::vector<uint64_t>& row) { output.insert(row); return Status::OK(); }));
+    ASSERT_EQ(output, (std::multiset<std::vector<uint64_t>>{
+        {1, 2, 10, 20}, {1, 2, 10, 20}, {1, 2, 10, 20}, {1, 2, 10, 20}, {1, 3, 11, 21}}));
+    ASSERT_EQ(stats.exchange_left_rows, 3); ASSERT_EQ(stats.exchange_right_rows, 4);
+    ASSERT_EQ(stats.exchange_broadcast_rows, mode == ExchangeMode::Broadcast ? 16 : 0);
+    ASSERT_LE(stats.exchange_peak_reserved_bytes, options.exchange_memory_bytes);
+    ASSERT_EQ(stats.exchange_live_files, 0); ASSERT_EQ(stats.exchange_cleanup_failures, 0);
+    ASSERT_TRUE(std::filesystem::is_empty(root.path));
+  }
+}
+
+TEST(MdbFragmentTest, P8HotKeyChunkingBoundsState) {
+  ExchangeRoot root; ASSERT_FALSE(root.path.empty());
+  WorkerOptions options; options.exchange = ExchangeMode::Hash;
+  options.exchange_memory_bytes = 65536; options.exchange_spill_directory = root.path;
+  BatchQueryStats stats; ExchangeControl control{nullptr, CoarseMonoClock::Now() + MonoDelta::FromSeconds(10), &stats};
+  std::set<std::pair<uint64_t, uint64_t>> pairs;
+  ASSERT_OK(ExchangeRows(ExchangeTestPlan(), options, control,
+      [&](size_t side, const FragmentRowSink& sink) -> Status {
+        for (uint64_t i = 0; i < (side ? 1500 : 3); ++i)
+          RETURN_NOT_OK(sink(side ? std::vector<uint64_t>{7, 100 + i} : std::vector<uint64_t>{1 + i, 7}));
+        return Status::OK();
+      }, [&](const std::vector<uint64_t>& row) { pairs.emplace(row[0], row[2]); return Status::OK(); }));
+  ASSERT_EQ(pairs.size(), 4500); ASSERT_EQ(stats.exchange_output_rows, 4500);
+  ASSERT_GT(stats.exchange_chunked_passes, 1); ASSERT_EQ(stats.exchange_skew_partitions, 1);
+  ASSERT_GT(stats.exchange_spill_read_rows, 1503);
+  ASSERT_LE(stats.exchange_peak_reserved_bytes, options.exchange_memory_bytes);
+  ASSERT_TRUE(std::filesystem::is_empty(root.path));
+}
+
+TEST(MdbFragmentTest, P8BudgetInputFailureCancelAndCleanup) {
+  ExchangeRoot root; ASSERT_FALSE(root.path.empty());
+  for (int scenario = 0; scenario < 6; ++scenario) {
+    WorkerOptions options; options.exchange = ExchangeMode::Hash; options.exchange_spill_directory = root.path;
+    if (scenario == 0) options.exchange_spill_bytes = 160;
+    BatchQueryStats stats; std::atomic<bool> cancelled{false};
+    auto deadline = CoarseMonoClock::Now() + MonoDelta::FromSeconds(10);
+    if (scenario == 5) deadline = CoarseMonoClock::Now();
+    ExchangeControl control{&cancelled, deadline, &stats, &deadline};
+    size_t output = 0;
+    const auto result = ExchangeRows(ExchangeTestPlan(), options, control,
+        [&](size_t side, const FragmentRowSink& sink) -> Status {
+          if (scenario == 1 && side == 1) return STATUS(Corruption, "injected source failure");
+          // Swallow append failures deliberately: the exchange must stay failed.
+          for (size_t i = 0; i < 3; ++i) (void)sink(side ? std::vector<uint64_t>{7, 8} : std::vector<uint64_t>{1, 7});
+          return Status::OK();
+        }, [&](const std::vector<uint64_t>&) -> Status {
+          ++output;
+          if (scenario == 2) return STATUS(Aborted, "consumer rejected output");
+          if (scenario == 3) cancelled.store(true);
+          if (scenario == 4) deadline = CoarseMonoClock::Now();
+          return Status::OK();
+        });
+    ASSERT_NOK(result) << scenario;
+    ASSERT_EQ(output, scenario >= 2 && scenario <= 4 ? 1 : 0);
+    ASSERT_LE(stats.exchange_spill_bytes, options.exchange_spill_bytes);
+    ASSERT_EQ(stats.exchange_live_files, 0); ASSERT_EQ(stats.exchange_cleanup_failures, 0);
+    ASSERT_TRUE(std::filesystem::is_empty(root.path));
+  }
+}
+
+TEST(MdbFragmentTest, P8CorruptionAndPreflightFailClosed) {
+  ExchangeRoot root; ASSERT_FALSE(root.path.empty());
+  for (bool truncate : {false, true}) {
+    WorkerOptions options; options.exchange = ExchangeMode::Hash; options.exchange_spill_directory = root.path;
+    BatchQueryStats stats; ExchangeControl control{nullptr, CoarseMonoClock::Now() + MonoDelta::FromSeconds(10), &stats};
+    size_t output = 0;
+    const auto status = ExchangeRows(ExchangeTestPlan(), options, control,
+        [&](size_t side, const FragmentRowSink& sink) -> Status {
+          RETURN_NOT_OK(sink(side ? std::vector<uint64_t>{7, 8} : std::vector<uint64_t>{1, 7}));
+          if (side) for (const auto& entry : std::filesystem::recursive_directory_iterator(root.path)) {
+            if (!entry.is_regular_file() || entry.file_size() <= 16) continue;
+            if (truncate) std::filesystem::resize_file(entry.path(), 17);
+            else {
+              int fd = open(entry.path().c_str(), O_WRONLY | O_CLOEXEC);
+              if (fd < 0) return STATUS(IOError, "Cannot inject corruption");
+              uint8_t bad = 255; const auto count = pwrite(fd, &bad, 1, 16); close(fd);
+              if (count != 1) return STATUS(IOError, "Cannot inject corrupt byte");
+            }
+            break;
+          }
+          return Status::OK();
+        }, [&](const std::vector<uint64_t>&) { ++output; return Status::OK(); });
+    ASSERT_NOK(status); ASSERT_EQ(output, 0); ASSERT_TRUE(std::filesystem::is_empty(root.path));
+  }
+  WorkerOptions options; options.exchange = ExchangeMode::Hash; options.exchange_spill_directory = root.path + "/absent";
+  ASSERT_NOK(ValidateExchange(ExchangeTestPlan(), options));
+  options.exchange_spill_directory = root.path; options.exchange_memory_bytes = 1;
+  ASSERT_NOK(ValidateExchange(ExchangeTestPlan(), options));
+}
 
 TEST(MdbFragmentTest, NumericAggregateTypePromotionAndBoundaries) {
   using SPARQL::Conversions;

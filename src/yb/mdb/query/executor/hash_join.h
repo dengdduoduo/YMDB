@@ -17,6 +17,8 @@ class HashJoin : public BatchOperator {
   Status Open(const Binding& input) override;
   Result<BindingBatch> NextBatch() override;
   void Close() override;
+  size_t build_capacity() const { return capacity_; }
+  size_t reserved_bytes() const { return reservation_; }
  private:
   Status Check() const;
   Status Build();

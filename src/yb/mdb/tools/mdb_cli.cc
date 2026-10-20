@@ -53,6 +53,12 @@ DEFINE_uint32(mdb_worker_batch_rows, 128, "Maximum rows per worker pull response
 DEFINE_uint32(mdb_worker_page_rows, 16, "Maximum storage rows per worker page");
 DEFINE_uint32(mdb_worker_memory_bytes, 8388608, "Per-worker buffered-state budget; excludes shared YB client infrastructure");
 DEFINE_uint32(mdb_global_memory_bytes, 67108864, "Global Gather input reservation budget; excludes shared infrastructure");
+DEFINE_string(mdb_exchange, "none", "Opt-in two-triple exchange: none, hash, broadcast");
+DEFINE_uint32(mdb_exchange_partitions, 4, "Number of local exchange partitions (2..64)");
+DEFINE_uint32(mdb_exchange_memory_bytes, 8388608, "Exchange consumer and metadata reservation budget");
+DEFINE_uint64(mdb_exchange_spill_bytes, 1073741824, "Per-query exchange disk budget including broadcast copies");
+DEFINE_string(mdb_exchange_spill_directory, "/tmp", "Existing root for private query spill directories");
+DEFINE_uint32(mdb_exchange_skew_factor, 2, "Partition skew threshold relative to average build partition rows");
 DEFINE_uint64(mdb_worker_output_spool_bytes, 268435456,
               "Maximum temporary CLI result bytes before publication; failure discards staged rows");
 
@@ -106,6 +112,19 @@ static int RunQuery(int argc, char* argv[]) {
   options.negative_cache_entries = FLAGS_mdb_join_negative_cache_entries;
   yb::mdb::RdfYBModel::Instance().SetBatchJoinOptions(options);
   yb::mdb::WorkerOptions workers;
+  if (FLAGS_mdb_exchange == "hash") workers.exchange = yb::mdb::ExchangeMode::Hash;
+  else if (FLAGS_mdb_exchange == "broadcast") workers.exchange = yb::mdb::ExchangeMode::Broadcast;
+  else if (FLAGS_mdb_exchange != "none") {
+    std::cerr << "Invalid --mdb_exchange" << std::endl; return 1;
+  }
+  if (workers.exchange != yb::mdb::ExchangeMode::None && FLAGS_mdb_worker_targets.empty()) {
+    std::cerr << "MDB exchange requires worker targets" << std::endl; return 1;
+  }
+  workers.exchange_partitions = FLAGS_mdb_exchange_partitions;
+  workers.exchange_memory_bytes = FLAGS_mdb_exchange_memory_bytes;
+  workers.exchange_spill_bytes = FLAGS_mdb_exchange_spill_bytes;
+  workers.exchange_spill_directory = FLAGS_mdb_exchange_spill_directory;
+  workers.exchange_skew_factor = FLAGS_mdb_exchange_skew_factor;
   if (!FLAGS_mdb_worker_targets.empty()) {
     if (!FLAGS_mdb_streaming_reads) {
       std::cerr << "MDB workers require streaming reads" << std::endl;

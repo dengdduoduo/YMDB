@@ -67,6 +67,7 @@
 #include "yb/mdb/storage/rdf_table_schema.h"
 #include "yb/mdb/storage/docdb_read_context.h"
 #include "yb/mdb/query/distributed/fragment_gather.h"
+#include "yb/mdb/query/distributed/exchange.h"
 #include "yb/server/hybrid_clock.h"
 #include "yb/util/logging.h"
 #include "yb/util/status.h"
@@ -414,6 +415,10 @@ int ExecuteSparql(
   });
 
   const auto worker_options = model.GetWorkerOptions();
+  if (worker_options.exchange != yb::mdb::ExchangeMode::None && worker_options.targets.empty()) {
+    LOG(WARNING) << "MDB exchange requires worker targets";
+    return 1;
+  }
   if (!worker_options.targets.empty()) {
     if (!use_stream) {
       LOG(WARNING) << "MDB workers require query-owned streaming reads";
@@ -438,7 +443,9 @@ int ExecuteSparql(
       if (physical->coordinator_finalize) {
         for (auto var : physical->physical.projection()) gathered_vars.emplace_back(var);
       }
-      auto status = yb::mdb::GatherFragments(*physical, worker_options, *read_context,
+      const auto gather = worker_options.exchange == yb::mdb::ExchangeMode::None
+          ? yb::mdb::GatherFragments : yb::mdb::GatherExchangeFragments;
+      auto status = gather(*physical, worker_options, *read_context,
           [&](const std::vector<uint64_t>& row) -> Status {
             if (physical->coordinator_finalize) {
               // Bound input plus conservative space for Values, sorting full

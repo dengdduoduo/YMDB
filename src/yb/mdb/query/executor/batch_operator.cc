@@ -111,6 +111,12 @@ std::string BatchQueryStats::ToJson() const {
   MDB_STAT(global_input_rows);
   MDB_STAT(global_reserved_bytes);
   MDB_STAT(global_finalize_operators);
+  MDB_STAT(exchange_operators); MDB_STAT(exchange_left_rows); MDB_STAT(exchange_right_rows);
+  MDB_STAT(exchange_output_rows); MDB_STAT(exchange_broadcast_rows); MDB_STAT(exchange_spill_files);
+  MDB_STAT(exchange_live_files); MDB_STAT(exchange_spill_bytes); MDB_STAT(exchange_spill_read_rows);
+  MDB_STAT(exchange_peak_reserved_bytes); MDB_STAT(exchange_max_partition_rows);
+  MDB_STAT(exchange_join_passes); MDB_STAT(exchange_chunked_passes);
+  MDB_STAT(exchange_skew_partitions); MDB_STAT(exchange_cleanup_failures);
 #undef MDB_STAT
   result += "\"remote_worker_pids\":\"" + remote_worker_pids + "\",";
   result += "\"join_decisions\":\"" + join_decisions + "\"}";

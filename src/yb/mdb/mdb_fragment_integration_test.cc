@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <csignal>
 #include <fstream>
+#include <filesystem>
 #include <pwd.h>
 #include <map>
 #include <set>
@@ -11,6 +12,7 @@
 #include <unistd.h>
 
 #include "yb/client/schema.h"
+#include "yb/client/table.h"
 #include "yb/common/ql_protocol_util.h"
 #include "yb/client/table_handle.h"
 #include "yb/client/yb_table_name.h"
@@ -23,6 +25,7 @@
 #include "yb/mdb/storage/rdf_table_schema.h"
 #include "yb/mdb/storage/yb_client_compat.h"
 #include "yb/mdb/query/distributed/tablet_router.h"
+#include "yb/mdb/query/distributed/exchange.h"
 #include "yb/util/flags.h"
 #include "yb/util/mem_tracker.h"
 #include "yb/util/subprocess.h"
@@ -798,6 +801,148 @@ TEST_F(MdbFragmentIntegrationTest, GlobalNumericBudgetFailureAndRecovery) {
   ASSERT_EQ(recovered.status, 0); ASSERT_EQ(recovered.ordered, success.ordered);
 }
 
+TEST_F(MdbFragmentIntegrationTest, P8HashBroadcastAndCompositeJoin) {
+  Seed();
+  const auto root = GetTestPath("p8-spill"); std::filesystem::create_directory(root);
+  const auto local = Query(kQuery, {});
+  ASSERT_EQ(local.status, 0);
+  for (auto mode : {ExchangeMode::Hash, ExchangeMode::Broadcast}) {
+    auto options = workers_; options.exchange = mode;
+    options.exchange_memory_bytes = 65536; options.exchange_spill_directory = root;
+    const auto remote = Query(kQuery, options);
+    ASSERT_EQ(remote.status, 0) << remote.profile;
+    ASSERT_EQ(remote.values, local.values); ASSERT_EQ(remote.ordered.size(), 64);
+    ASSERT_EQ(Field(remote.profile, "remote_fragments"), 8);
+    ASSERT_EQ(Field(remote.profile, "remote_coordinator_fallbacks"), 0);
+    ASSERT_EQ(Field(remote.profile, "exchange_operators"), 1);
+    ASSERT_EQ(Field(remote.profile, "exchange_left_rows"), 32);
+    ASSERT_EQ(Field(remote.profile, "exchange_right_rows"), 2);
+    ASSERT_EQ(Field(remote.profile, "exchange_output_rows"), 64);
+    ASSERT_LE(Field(remote.profile, "exchange_peak_reserved_bytes"), options.exchange_memory_bytes);
+    ASSERT_GT(Field(remote.profile, "exchange_spill_bytes"), 0);
+    ASSERT_EQ(Field(remote.profile, "exchange_live_files"), 0);
+    ASSERT_TRUE(std::filesystem::is_empty(root));
+    const auto ordered = Query(std::string(kQuery) + " ORDER BY DESC(?o) LIMIT 3 OFFSET 1", options);
+    ASSERT_EQ(ordered.status, 0);
+    ASSERT_EQ(ordered.ordered, (std::vector<std::string>{Iri(1002), Iri(1002), Iri(1002)}));
+    const auto empty = Query("SELECT ?o WHERE { ?s <urn:p6:missing> ?k . ?k <urn:p6:9001> ?o }", options);
+    ASSERT_EQ(empty.status, 0); ASSERT_TRUE(empty.ordered.empty());
+    // Two shared keys (?s, ?k), with hidden predicate columns on both sides.
+    const std::string composite = "SELECT ?s ?k WHERE { ?s ?p ?k . ?s ?q ?k } ORDER BY ?s ?k";
+    const auto expected = Query(composite, {}); const auto joined = Query(composite, options);
+    ASSERT_EQ(expected.status, 0); ASSERT_EQ(joined.status, 0);
+    ASSERT_EQ(joined.ordered, expected.ordered);
+    ASSERT_EQ(Field(joined.profile, "remote_coordinator_fallbacks"), 0);
+    auto unreachable = options; unreachable.binary = "/bin/false";
+    const auto fallback = Query("SELECT ?s WHERE { ?s <urn:p6:9000> ?k }", unreachable);
+    ASSERT_EQ(fallback.status, 0);
+    ASSERT_EQ(Field(fallback.profile, "remote_fragments"), 0);
+    ASSERT_EQ(Field(fallback.profile, "remote_coordinator_fallbacks"), 1);
+    ASSERT_TRUE(std::filesystem::is_empty(root));
+  }
+}
+
+TEST_F(MdbFragmentIntegrationTest, P8HotKeySpillsAndKeepsBag) {
+  for (uint64_t s = 101; s < 109; ++s) Write(s, 9000, 1);
+  for (uint64_t o = 10000; o < 11500; ++o) Write(1, 9001, o);
+  ASSERT_OK(RdfYBModel::Instance().Flush());
+  const auto root = GetTestPath("p8-hot"); std::filesystem::create_directory(root);
+  for (auto mode : {ExchangeMode::Hash, ExchangeMode::Broadcast}) {
+    auto options = workers_; options.exchange = mode; options.exchange_memory_bytes = 65536;
+    options.exchange_spill_directory = root; options.batch_rows = 64;
+    const auto count = Query("SELECT (COUNT(*) AS ?n) WHERE { ?s <urn:p6:9000> ?k . ?k <urn:p6:9001> ?o }", options);
+    ASSERT_EQ(count.status, 0) << count.profile;
+    ASSERT_EQ(count.ordered, (std::vector<std::string>{"12000"}));
+    ASSERT_GT(Field(count.profile, "exchange_chunked_passes"), 1);
+    if (mode == ExchangeMode::Hash) ASSERT_EQ(Field(count.profile, "exchange_skew_partitions"), 1);
+    ASSERT_EQ(Field(count.profile, "exchange_output_rows"), 12000);
+    ASSERT_EQ(Field(count.profile, "remote_rows"), 1508);
+    ASSERT_EQ(Field(count.profile, "global_input_rows"), 12000);
+    ASSERT_LE(Field(count.profile, "exchange_peak_reserved_bytes"), options.exchange_memory_bytes);
+    ASSERT_EQ(Field(count.profile, "exchange_cleanup_failures"), 0);
+    ASSERT_TRUE(std::filesystem::is_empty(root));
+  }
+}
+
+TEST_F(MdbFragmentIntegrationTest, P8QuotaWorkerCancellationAndRecovery) {
+  Seed(8);
+  const auto root = GetTestPath("p8-failure"); std::filesystem::create_directory(root);
+  auto options = workers_; options.exchange = ExchangeMode::Hash; options.exchange_spill_directory = root;
+  auto limited = options; limited.exchange_spill_bytes = 140;
+  const auto exhausted = Query(kQuery, limited);
+  ASSERT_NE(exhausted.status, 0); ASSERT_TRUE(exhausted.ordered.empty());
+  ASSERT_EQ(Field(exhausted.profile, "remote_coordinator_fallbacks"), 0);
+  ASSERT_TRUE(std::filesystem::is_empty(root));
+  auto broken = options; broken.binary = "/bin/false";
+  const auto failed = Query(kQuery, broken);
+  ASSERT_NE(failed.status, 0); ASSERT_TRUE(failed.ordered.empty());
+  ASSERT_EQ(Field(failed.profile, "remote_coordinator_fallbacks"), 0);
+  ASSERT_TRUE(std::filesystem::is_empty(root));
+  for (bool expire : {false, true}) {
+    struct Stop { bool expire; size_t cells = 0; } stop{expire};
+    auto sink = [](const char*, const char*, void* arg) {
+      auto& state = *static_cast<Stop*>(arg); ++state.cells;
+      auto* context = DocDBReadContextScope::Current();
+      if (state.expire) context->deadline = CoarseMonoClock::Now(); else context->cancelled.store(true);
+    };
+    RdfYBModel::Instance().SetWorkerOptions(options);
+    ASSERT_NE(YBCMdbExecuteSparql(kQuery, sink, &stop), 0); ASSERT_EQ(stop.cells, 1);
+    ASSERT_EQ(Field(YBCMdbGetLastQueryProfile(), "exchange_live_files"), 0);
+    ASSERT_TRUE(std::filesystem::is_empty(root));
+  }
+  auto invalid = options; invalid.exchange_memory_bytes = 1;
+  const auto rejected = Query(kQuery, invalid);
+  ASSERT_NE(rejected.status, 0); ASSERT_EQ(Field(rejected.profile, "remote_fragments"), 0);
+  const auto recovered = Query(kQuery, options);
+  ASSERT_EQ(recovered.status, 0); ASSERT_EQ(recovered.ordered.size(), 16);
+  ASSERT_EQ(Field(recovered.profile, "exchange_live_files"), 0);
+  ASSERT_TRUE(std::filesystem::is_empty(root));
+}
+
+TEST_F(MdbFragmentIntegrationTest, P8InputsShareOneReadView) {
+  Seed(8);
+  RegisterRdfIdentity(1003, RdfIdentity(TripleTermType::URI, Iri(1003)));
+  const auto root = GetTestPath("p8-snapshot"); std::filesystem::create_directory(root);
+  auto options = workers_; options.exchange = ExchangeMode::Hash; options.exchange_spill_directory = root;
+  auto& model = RdfYBModel::Instance();
+  auto result = model.NewQueryReadContext(); ASSERT_OK(result);
+  auto context = std::move(*result);
+  FragmentPlan plan;
+  plan.physical.set_master_addresses(client_->GetMasterLeaderAddress().ToString());
+  plan.physical.set_keyspace("mdb_p6_test"); plan.physical.set_variable_count(3);
+  plan.physical.set_batch_rows(options.batch_rows); plan.physical.set_page_rows(options.page_rows);
+  plan.physical.set_memory_bytes(options.memory_bytes);
+  for (int perm = 0; perm < 6; ++perm) plan.physical.add_table_ids(model.GetTable(perm)->table()->id());
+  for (uint32_t side = 0; side < 2; ++side) {
+    auto* triple = plan.physical.add_triples();
+    triple->add_terms()->set_variable(side); triple->add_terms()->set_constant(9000 + side);
+    triple->add_terms()->set_variable(side + 1);
+  }
+  plan.physical.add_projection(0); plan.physical.add_projection(2);
+  TabletRouter router; ASSERT_OK(router.Init(client_.get(), "mdb_p6_test")); plan.tasks = router.GetTablets(0);
+  std::sort(plan.tasks.begin(), plan.tasks.end(), [](const auto& a, const auto& b) { return a.partition_start < b.partition_start; });
+  size_t outputs = 0;
+  ExchangeControl control{&context->cancelled, context->deadline, &context->stats, &context->deadline};
+  ASSERT_OK(ExchangeRows(plan.physical, options, control,
+      [&](size_t side, const FragmentRowSink& sink) -> Status {
+        FragmentPlan child = plan;
+        child.physical.clear_triples(); *child.physical.add_triples() = plan.physical.triples(side);
+        child.physical.clear_projection(); child.physical.add_projection(side); child.physical.add_projection(side + 1);
+        RETURN_NOT_OK(GatherFragments(child, options, *context, sink));
+        if (!side) {
+          RETURN_NOT_OK(model.WriteTripleToDocDB(1, 9001, 1003));
+          RETURN_NOT_OK(model.Flush());
+        }
+        return Status::OK();
+      }, [&](const std::vector<uint64_t>& row) -> Status {
+        if (row[1] == 1003) return STATUS(Corruption, "Exchange mixed read views");
+        ++outputs; return Status::OK();
+      }));
+  ASSERT_EQ(outputs, 16); ASSERT_EQ(context->stats.exchange_right_rows, 2);
+  ASSERT_TRUE(std::filesystem::is_empty(root));
+  ASSERT_EQ(Query(kQuery, {}).ordered.size(), 24);
+}
+
 TEST_F(MdbFragmentIntegrationTest, GlobalTypedIdentityAndValueOrdering) {
   RegisterRdfIdentity(500, RdfIdentity(TripleTermType::URI, Iri(500)));
   RegisterRdfIdentity(9003, RdfIdentity(TripleTermType::URI, Iri(9003)));
@@ -1090,6 +1235,16 @@ TEST_F(MdbFragmentIntegrationTest, CliStagesCompleteRowsAndDiscardsFailedOutput)
       {"urn:cli:a", "urn:cli:o1"}, {"urn:cli:a", "urn:cli:o2"},
       {"urn:cli:b", "urn:cli:o1"}, {"urn:cli:b", "urn:cli:o2"}})) << output << error;
   ASSERT_NE(error.find("\"remote_fragments\":4"), std::string::npos) << error;
+  auto exchanged = args;
+  exchanged.insert(exchanged.begin() + 1, {"--mdb_exchange=hash", "--mdb_exchange_memory_bytes=65536"});
+  output.clear(); error.clear();
+  ASSERT_OK(Subprocess::Call(exchanged, &output, &error));
+  ASSERT_EQ(std::count(output.begin(), output.end(), '\t'), 8);
+  ASSERT_NE(error.find("\"remote_fragments\":8"), std::string::npos) << error;
+  ASSERT_NE(error.find("\"exchange_operators\":1"), std::string::npos) << error;
+  exchanged.insert(exchanged.begin() + 1, "--mdb_exchange_spill_bytes=140");
+  output.clear(); error.clear();
+  ASSERT_NOK(Subprocess::Call(exchanged, &output, &error)); ASSERT_TRUE(output.empty());
   auto forced_hash = args;
   forced_hash.insert(forced_hash.begin() + 1, "--mdb_join_policy=hash");
   output.clear(); error.clear();

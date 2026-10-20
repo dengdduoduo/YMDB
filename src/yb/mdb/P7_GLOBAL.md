@@ -123,8 +123,9 @@ the error instead of turning NOT(error) into true.
 Statistics include global_input_rows, global_reserved_bytes and
 global_finalize_operators. remote_rows describes pre-finalization input, not the
 number of final output rows. P7 drains every accepted fragment, including LIMIT
-queries, before applying global operations. There is no early Top-K pushdown,
-external sorting or spill; large inputs require P8 or a larger explicit budget.
+queries, before applying global operations. There is no early Top-K pushdown
+or external global finalization. The opt-in P8 two-input join exchange has its
+own spill path (P8_EXCHANGE.md); P7 global state retains its admission limit.
 Existing CLI output staging still discards staged output on failure.
 
 The public adapter's existing cell callback has no row-boundary/unbound event.

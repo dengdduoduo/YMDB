@@ -2,10 +2,13 @@
 #pragma once
 
 #include <cstddef>
+#include <cstdint>
 #include <string>
 #include <vector>
 
 namespace yb::mdb {
+
+enum class ExchangeMode { None, Hash, Broadcast };
 
 struct WorkerOptions {
   // "local" runs an isolated process for single-host deployments and tests.
@@ -22,6 +25,13 @@ struct WorkerOptions {
   // Limits retained Gather input, including conservative per-row operator slack.
   // This is not a total process RSS limit. P8 will add external-memory execution.
   size_t coordinator_memory_bytes = 64 * 1024 * 1024;
+  // Opt-in P8 two-input exchange. Join consumers are local to the coordinator.
+  ExchangeMode exchange = ExchangeMode::None;
+  size_t exchange_partitions = 4;
+  size_t exchange_memory_bytes = 8 * 1024 * 1024;
+  uint64_t exchange_spill_bytes = 1024 * 1024 * 1024;
+  std::string exchange_spill_directory = "/tmp";
+  size_t exchange_skew_factor = 2;
 };
 
 }  // namespace yb::mdb
