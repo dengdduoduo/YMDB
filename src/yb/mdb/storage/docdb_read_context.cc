@@ -7,6 +7,7 @@
 #include "yb/client/transaction.h"
 #include "yb/client/transaction_manager.h"
 #include "yb/common/transaction.h"
+#include <chrono>
 
 namespace yb::mdb {
 namespace {
@@ -31,6 +32,22 @@ Result<std::unique_ptr<DocDBReadContext>> DocDBReadContext::Create(
 DocDBReadContext::~DocDBReadContext() {
   if (session) session->SetTransaction(nullptr);
   if (transaction_) transaction_->Abort();
+}
+
+Result<ChildTransactionDataPB> DocDBReadContext::ExportChild() {
+  if (cancelled.load()) return STATUS(Aborted, "MDB query cancelled before worker start");
+  if (CoarseMonoClock::Now() >= deadline) return STATUS(TimedOut, "MDB worker snapshot expired");
+  auto future = transaction_->PrepareChildFuture(client::ForceConsistentRead::kTrue, deadline);
+  if (future.wait_until(ToSteady(deadline)) != std::future_status::ready)
+    return STATUS(TimedOut, "MDB child snapshot preparation timed out");
+  return future.get();
+}
+
+Status DocDBReadContext::ApplyChild(const ChildTransactionResultPB& result) {
+  RETURN_NOT_OK(transaction_->ApplyChildResult(result));
+  if (transaction_->IsRestartRequired())
+    return STATUS(TryAgain, "MDB worker snapshot requires whole-query restart");
+  return Status::OK();
 }
 
 DocDBReadContextScope::DocDBReadContextScope(DocDBReadContext& context)

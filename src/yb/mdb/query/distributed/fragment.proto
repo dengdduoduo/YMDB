@@ -1,0 +1,59 @@
+// Copyright (c) YugabyteDB, Inc.
+syntax = "proto2";
+package yb.mdb;
+
+import "yb/common/common.proto";
+
+// Values are persistent rdf_idmap IDs, never process-local packed ObjectIds.
+message FragmentTermPB {
+  optional uint32 variable = 1;
+  optional fixed64 constant = 2;
+}
+
+message FragmentTriplePB {
+  repeated FragmentTermPB terms = 1; // subject, predicate, object
+}
+
+message FragmentOpenPB {
+  optional string master_addresses = 1;
+  optional string keyspace = 2;
+  repeated string table_ids = 3;
+  repeated FragmentTriplePB triples = 4;
+  repeated uint32 projection = 5;
+  optional uint32 variable_count = 6;
+  optional bytes partition_start = 7;
+  optional bytes partition_end = 8;
+  optional ChildTransactionDataPB transaction = 9;
+  optional uint32 timeout_ms = 10;
+  optional uint32 batch_rows = 11;
+  optional uint32 page_rows = 12;
+  optional uint64 memory_bytes = 13;
+  optional string id_namespace = 14 [default = "rdf_idmap-v1"];
+}
+
+message FragmentRequestPB {
+  optional uint32 version = 1;
+  optional string query_id = 2;
+  optional uint32 fragment_id = 3;
+  optional uint32 attempt_id = 4;
+  optional uint32 stream_id = 5;
+  optional uint64 batch_seq = 6;
+  // Present only in sequence zero; subsequent requests grant one batch credit.
+  optional FragmentOpenPB open = 7;
+}
+
+message FragmentResponsePB {
+  optional uint32 version = 1;
+  optional string query_id = 2;
+  optional uint32 fragment_id = 3;
+  optional uint32 attempt_id = 4;
+  optional uint32 stream_id = 5;
+  optional uint64 batch_seq = 6;
+  repeated fixed64 values = 7 [packed = true]; // row-major projection schema
+  optional uint32 rows = 8;
+  optional bool eof = 9;
+  optional string error = 10;
+  optional ChildTransactionResultPB transaction_result = 11;
+  optional uint64 worker_pid = 12;
+  optional uint64 read_operations = 13;
+}

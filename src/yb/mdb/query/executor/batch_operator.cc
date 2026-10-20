@@ -105,7 +105,11 @@ std::string BatchQueryStats::ToJson() const {
   MDB_STAT(optimizer_missing_stats);
   MDB_STAT(hash_build_right_operators); MDB_STAT(estimated_hash_build_rows);
   MDB_STAT(estimated_hash_build_bytes);
+  MDB_STAT(remote_fragments); MDB_STAT(remote_max_workers); MDB_STAT(remote_batches);
+  MDB_STAT(remote_rows); MDB_STAT(remote_response_bytes); MDB_STAT(remote_peak_frame_bytes);
+  MDB_STAT(remote_coordinator_fallbacks);
 #undef MDB_STAT
+  result += "\"remote_worker_pids\":\"" + remote_worker_pids + "\",";
   result += "\"join_decisions\":\"" + join_decisions + "\"}";
   return result;
 }

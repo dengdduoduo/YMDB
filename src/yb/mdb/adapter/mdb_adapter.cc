@@ -66,6 +66,7 @@
 #include "yb/mdb/storage/yb_client_compat.h"
 #include "yb/mdb/storage/rdf_table_schema.h"
 #include "yb/mdb/storage/docdb_read_context.h"
+#include "yb/mdb/query/distributed/fragment_gather.h"
 #include "yb/server/hybrid_clock.h"
 #include "yb/util/logging.h"
 #include "yb/util/status.h"
@@ -411,6 +412,41 @@ int ExecuteSparql(
     if (read_context) last_query_profile = read_context->stats.ToJson();
     if (use_snapshot) model.EndReadSnapshot();
   });
+
+  const auto worker_options = model.GetWorkerOptions();
+  if (!worker_options.targets.empty()) {
+    if (!use_stream) {
+      LOG(WARNING) << "MDB workers require query-owned streaming reads";
+      return 1;
+    }
+    auto physical = read_context->batch_options.policy == yb::mdb::JoinPolicy::Index
+        ? yb::mdb::FragmentPlan::Build(*op, model, worker_options)
+        : yb::Result<yb::mdb::FragmentPlan>(STATUS(NotSupported,
+            "Worker hash/auto join policies remain at MDB coordinator"));
+    if (!physical.ok()) {
+      if (!physical.status().IsNotSupported()) {
+        LOG(WARNING) << "MDB fragment planning failed: " << physical.status();
+        return 1;
+      }
+      // Capability fallback happens only before remote work or output starts.
+      ++read_context->stats.remote_coordinator_fallbacks;
+    } else {
+      const auto* select = dynamic_cast<const OpSelect*>(op.get());
+      auto status = yb::mdb::GatherFragments(*physical, worker_options, *read_context,
+          [&](const std::vector<uint64_t>& row) -> Status {
+            for (size_t col = 0; col < row.size(); ++col) {
+              if (g_gmap_to_pack.find(row[col]) == g_gmap_to_pack.end())
+                return STATUS(Corruption, "Missing typed dictionary identity for worker output");
+              const auto name = get_query_ctx().get_var_name(select->vars[col]);
+              const auto value = IdToString(row[col]);
+              row_callback(name.c_str(), value.c_str(), ctx);
+            }
+            return Status::OK();
+          });
+      if (!status.ok()) LOG(WARNING) << "MDB fragment query failed: " << status;
+      return status.ok() ? 0 : 1;
+    }
+  }
 
   BindingIterConstructor optimizer;
   op->accept_visitor(optimizer);

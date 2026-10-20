@@ -46,6 +46,14 @@ struct BatchQueryStats {
   uint64_t estimated_hash_build_rows = 0;
   uint64_t estimated_hash_build_bytes = 0;
   std::string join_decisions;
+  uint64_t remote_fragments = 0;
+  uint64_t remote_max_workers = 0;
+  uint64_t remote_batches = 0;
+  uint64_t remote_rows = 0;
+  uint64_t remote_response_bytes = 0;
+  uint64_t remote_peak_frame_bytes = 0;
+  uint64_t remote_coordinator_fallbacks = 0;
+  std::string remote_worker_pids;
   std::string ToJson() const;
 };
 

@@ -8,6 +8,7 @@
 #include "yb/client/client_fwd.h"
 #include "yb/util/monotime.h"
 #include "yb/util/result.h"
+#include "yb/common/common.pb.h"
 #include "query/executor/batch_options.h"
 #include "yb/mdb/model/query_statistics.h"
 
@@ -22,6 +23,8 @@ class DocDBReadContext {
   static Result<std::unique_ptr<DocDBReadContext>> Create(
       client::YBClient* client, client::TransactionManager* manager);
   ~DocDBReadContext();
+  Result<ChildTransactionDataPB> ExportChild();
+  Status ApplyChild(const ChildTransactionResultPB& result);
 
   client::YBSessionPtr session;
   std::atomic<bool> cancelled{false};

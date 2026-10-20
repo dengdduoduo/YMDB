@@ -58,6 +58,7 @@ Status RdfYBModel::Init(yb::client::YBClient* client, const std::string& namespa
   }
 
   client_ = client;
+  namespace_name_ = namespace_name;
 
   for (int i = 0; i < 6; i++) {
     YBTableName table_name(YQL_DATABASE_CQL, namespace_name, kTableNames[i]);
@@ -332,6 +333,8 @@ void RdfYBModel::EndReadSnapshot() {
 }
 
 void RdfYBModel::ClearAll() {
+  worker_options_ = WorkerOptions();
+  namespace_name_.clear();
   statistics_.reset();
   if (current_txn_) {
     (void)AbortTransaction();

@@ -29,6 +29,7 @@
 #include "yb/common/read_hybrid_time.h"
 #include "query/executor/batch_options.h"
 #include "yb/mdb/model/query_statistics.h"
+#include "yb/mdb/query/distributed/worker_options.h"
 
 namespace yb::client {
 class TransactionManager;
@@ -52,6 +53,10 @@ class RdfYBModel {
   bool IsInitialized() const { return initialized_; }
 
   bool IsConnected() const { return connected_; }
+  client::YBClient* Client() const { return client_; }
+  const std::string& Namespace() const { return namespace_name_; }
+  void SetWorkerOptions(WorkerOptions options) { worker_options_ = std::move(options); }
+  const WorkerOptions& GetWorkerOptions() const { return worker_options_; }
 
   Result<uint64_t> ResolveTerm(IdMap& local_map, std::string_view term);
   Result<uint64_t> ResolveRdfTerm(
@@ -125,6 +130,8 @@ class RdfYBModel {
   std::shared_ptr<const QueryStatistics> statistics_;
   uint64_t statistics_version_ = 0;
   yb::client::YBClient* client_ = nullptr;
+  std::string namespace_name_;
+  WorkerOptions worker_options_;
   yb::client::TableHandle tables_[6];
   yb::client::YBSessionPtr write_session_;
   PersistentIdMap term_dictionary_;

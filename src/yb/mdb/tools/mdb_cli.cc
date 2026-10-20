@@ -12,13 +12,18 @@
 //
 
 #include <iostream>
+#include <algorithm>
+#include <cstdio>
+#include <cstring>
 #include <set>
+#include <sstream>
 #include <string>
 #include <utility>
 #include <vector>
 
 #include "yb/mdb/adapter/mdb_adapter.h"
 #include "yb/mdb/model/rdf_yb_model.h"
+#include "yb/mdb/storage/docdb_read_context.h"
 #include "yb/util/flags.h"
 #include "yb/util/scope_exit.h"
 
@@ -39,6 +44,16 @@ DEFINE_uint32(mdb_join_memory_bytes, 4194304, "Per-join buffered-state budget, e
 DEFINE_uint32(mdb_join_max_in_flight, 8, "Maximum index probe page operations per flush");
 DEFINE_uint32(mdb_join_negative_cache_entries, 256, "Maximum cached empty index probes per join");
 DEFINE_bool(mdb_query_profile, false, "Print streaming query operation/payload/buffer counts to stderr");
+DEFINE_string(mdb_worker_targets, "", "Comma-separated SSH destinations, or local for isolated local processes");
+DEFINE_string(mdb_worker_binary, "", "Absolute mdb_fragment_worker path on every destination");
+DEFINE_string(mdb_worker_flagfile, "", "Optional absolute worker-local flagfile for YB client TLS configuration");
+DEFINE_string(mdb_worker_ssh_config, "", "Optional absolute coordinator-local SSH configuration path");
+DEFINE_uint32(mdb_worker_max_processes, 3, "Maximum concurrently active MDB fragment processes");
+DEFINE_uint32(mdb_worker_batch_rows, 128, "Maximum rows per worker pull response");
+DEFINE_uint32(mdb_worker_page_rows, 16, "Maximum storage rows per worker page");
+DEFINE_uint32(mdb_worker_memory_bytes, 8388608, "Per-worker buffered-state budget; excludes shared YB client infrastructure");
+DEFINE_uint64(mdb_worker_output_spool_bytes, 268435456,
+              "Maximum temporary CLI result bytes before publication; failure discards staged rows");
 
 static int RunInit(int argc, char* argv[]) {
   if (argc < 2) {
@@ -89,6 +104,24 @@ static int RunQuery(int argc, char* argv[]) {
   options.max_in_flight = FLAGS_mdb_join_max_in_flight;
   options.negative_cache_entries = FLAGS_mdb_join_negative_cache_entries;
   yb::mdb::RdfYBModel::Instance().SetBatchJoinOptions(options);
+  yb::mdb::WorkerOptions workers;
+  if (!FLAGS_mdb_worker_targets.empty()) {
+    if (!FLAGS_mdb_streaming_reads) {
+      std::cerr << "MDB workers require streaming reads" << std::endl;
+      return 1;
+    }
+    std::istringstream destinations(FLAGS_mdb_worker_targets);
+    std::string target;
+    while (std::getline(destinations, target, ',')) workers.targets.push_back(target);
+    workers.binary = FLAGS_mdb_worker_binary;
+    workers.flagfile = FLAGS_mdb_worker_flagfile;
+    workers.ssh_config = FLAGS_mdb_worker_ssh_config;
+    workers.max_workers = FLAGS_mdb_worker_max_processes;
+    workers.batch_rows = FLAGS_mdb_worker_batch_rows;
+    workers.page_rows = FLAGS_mdb_worker_page_rows;
+    workers.memory_bytes = FLAGS_mdb_worker_memory_bytes;
+  }
+  yb::mdb::RdfYBModel::Instance().SetWorkerOptions(std::move(workers));
   yb::mdb::RdfYBModel::Instance().SetUseTransactions(FLAGS_mdb_use_transactions);
 
   int init_ret = YBCMdbInitCluster(
@@ -111,12 +144,46 @@ static int RunQuery(int argc, char* argv[]) {
 
   struct Ctx {
     std::vector<std::pair<std::string, std::string>> bindings;
+    FILE* spool = nullptr;
+    uint64_t bytes = 0;
+    uint64_t records = 0;
+    bool failed = false;
+    bool first_row_complete = false;
+    std::set<std::string> first_row_vars;
   };
 
   Ctx ctx;
+  auto spool_cleanup = yb::ScopeExit([&] { if (ctx.spool) std::fclose(ctx.spool); });
+  if (!FLAGS_mdb_worker_targets.empty()) {
+    ctx.spool = std::tmpfile();
+    if (!ctx.spool) { std::cerr << "Cannot create MDB result staging file" << std::endl; return 1; }
+  }
 
   auto callback = [](const char* name, const char* value, void* ctx_ptr) {
     auto* c = static_cast<Ctx*>(ctx_ptr);
+    if (c->spool) {
+      if (c->failed) return;
+      const auto name_size = std::strlen(name), value_size = std::strlen(value);
+      const uint64_t size = name_size + value_size + 2;
+      auto write = [&](const void* bytes, size_t length) {
+        if (std::fwrite(bytes, 1, length, c->spool) != length) c->failed = true;
+      };
+      if (size > FLAGS_mdb_worker_output_spool_bytes ||
+          c->bytes > FLAGS_mdb_worker_output_spool_bytes - size ||
+          FLAGS_mdb_worker_output_spool_bytes - size - c->bytes < sizeof(size)) c->failed = true;
+      if (!c->failed) {
+        write(&size, sizeof(size)); write(name, name_size); write("\t", 1);
+        write(value, value_size); write("\n", 1);
+        c->bytes += size + sizeof(size);
+        ++c->records;
+        if (!c->first_row_complete && !c->first_row_vars.insert(name).second)
+          c->first_row_complete = true;
+      }
+      if (c->failed) {
+        if (auto* context = yb::mdb::DocDBReadContextScope::Current()) context->cancelled = true;
+      }
+      return;
+    }
     c->bindings.emplace_back(name, value);
   };
 
@@ -126,7 +193,32 @@ static int RunQuery(int argc, char* argv[]) {
   }
   // A later page can fail after callbacks have delivered earlier rows.
   // Do not print that incomplete result as a successful query answer.
+  if (ctx.failed) {
+    std::cerr << "MDB result staging failed or exceeded its byte limit" << std::endl;
+    return 1;
+  }
   if (ret != 0) return ret;
+
+  if (ctx.spool) {
+    if (ctx.failed || std::fflush(ctx.spool) || std::fseek(ctx.spool, 0, SEEK_SET)) {
+      std::cerr << "MDB result staging failed or exceeded its byte limit" << std::endl;
+      return 1;
+    }
+    const auto width = ctx.first_row_vars.size();
+    char buffer[8192];
+    for (uint64_t record = 0; record < ctx.records; ++record) {
+      if (record && width && record % width == 0) std::cout << "---\n";
+      uint64_t size;
+      if (std::fread(&size, sizeof(size), 1, ctx.spool) != 1) return 1;
+      while (size) {
+        const auto part = static_cast<size_t>(std::min<uint64_t>(size, sizeof(buffer)));
+        if (std::fread(buffer, 1, part, ctx.spool) != part) return 1;
+        std::cout.write(buffer, part);
+        size -= part;
+      }
+    }
+    return std::cout.good() ? 0 : 1;
+  }
 
   if (ctx.bindings.empty()) {
     return ret;
