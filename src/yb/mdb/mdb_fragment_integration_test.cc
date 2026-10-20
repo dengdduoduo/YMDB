@@ -493,6 +493,158 @@ TEST_F(MdbFragmentIntegrationTest, GlobalHavingBudgetFailureAndRecovery) {
   ASSERT_EQ(recovered.ordered, success.ordered);
 }
 
+TEST_F(MdbFragmentIntegrationTest, GlobalProjectionCountExpressionsAndAliases) {
+  SeedOrderedGroups();
+  const std::string body = " WHERE { ?s <urn:p6:9000> ?k . ?k <urn:p6:9001> ?o }";
+  const std::string grouped = body + " GROUP BY ?o";
+  const std::string counts = "SELECT ?o ((COUNT(*) + 1) AS ?n)" + grouped;
+  const std::vector<std::pair<std::string, std::vector<std::string>>> cases = {
+    {counts + " ORDER BY DESC(?n) ?o",
+      {Iri(1001), "33", Iri(1002), "9", Iri(1004), "9", Iri(1003), "3"}},
+    {counts + " HAVING (COUNT(*) >= 8) ORDER BY DESC(?n) ?o LIMIT 2 OFFSET 1",
+      {Iri(1002), "9", Iri(1004), "9"}},
+    {"SELECT (COUNT(*) AS ?raw) ((?raw + 1) AS ?n) ((?n - 1) AS ?again)" + grouped +
+      " ORDER BY DESC(?n) ?o", {"32", "33", "32", "8", "9", "8", "8", "9", "8", "2", "3", "2"}},
+    {"SELECT ?o ((COUNT(DISTINCT ?s) + 1) AS ?n)" + grouped + " ORDER BY ?n ?o LIMIT 1",
+      {Iri(1003), "3"}},
+    {"SELECT ?o ((COUNT(DISTINCT *) + 1) AS ?n)" + grouped + " ORDER BY ?n ?o LIMIT 1",
+      {Iri(1003), "3"}},
+    {"SELECT ?o ((COUNT(?missing) + 1) AS ?n)" + grouped + " ORDER BY DESC(?o) LIMIT 1",
+      {Iri(1004), "1"}},
+    {"SELECT DISTINCT ((COUNT(*) + 1) AS ?n)" + grouped + " ORDER BY ?n LIMIT 1 OFFSET 1", {"9"}},
+    {"SELECT (?o AS ?group) ((COUNT(*) + 1) AS ?n)" + grouped + " ORDER BY DESC(?group) LIMIT 1",
+      {Iri(1004), "9"}},
+    {"SELECT ?o (7 AS ?n)" + grouped + " ORDER BY ?o LIMIT 1", {Iri(1001), "7"}},
+    {"SELECT ?o ((COUNT(*) + COUNT(?s) - 1) AS ?n)" + grouped + " ORDER BY ?o LIMIT 1",
+      {Iri(1001), "63"}},
+    {"SELECT ?o ((9223372036854775807 - COUNT(*)) AS ?n)" + grouped + " ORDER BY ?o LIMIT 1",
+      {Iri(1001), "9223372036854775775"}},
+    {"SELECT ((COUNT(*) + 1) AS ?n)" + body + " ORDER BY ?n", {"51"}},
+    {counts + " ORDER BY ?n LIMIT 0", {}},
+    {counts + " ORDER BY ?n OFFSET 9", {}}
+  };
+  for (const auto& item : cases) {
+    SCOPED_TRACE(item.first);
+    const auto local = Query(item.first, {});
+    const auto remote = Query(item.first, workers_);
+    ASSERT_EQ(local.status, 0);
+    ASSERT_EQ(remote.status, 0) << remote.profile;
+    ASSERT_EQ(local.ordered, item.second);
+    ASSERT_EQ(remote.ordered, item.second);
+    ASSERT_EQ(Field(remote.profile, "remote_fragments"), 4);
+    ASSERT_EQ(Field(remote.profile, "remote_coordinator_fallbacks"), 0);
+    ASSERT_EQ(Field(remote.profile, "global_input_rows"), 50);
+  }
+  for (const auto& item : std::vector<std::pair<std::string, std::vector<std::string>>>{
+      {"", {"1"}}, {" HAVING (COUNT(*) = 0)", {"1"}},
+      {" HAVING (COUNT(*) > 0)", {}}, {" GROUP BY ?o", {}}}) {
+    const std::string query = "SELECT ((COUNT(*) + 1) AS ?n) WHERE { ?s <urn:p6:missing> ?o }" +
+        item.first + " ORDER BY ?n";
+    const auto local = Query(query, {});
+    const auto remote = Query(query, workers_);
+    ASSERT_EQ(local.status, 0) << query;
+    ASSERT_EQ(remote.status, 0) << query;
+    ASSERT_EQ(local.ordered, item.second);
+    ASSERT_EQ(remote.ordered, item.second);
+    ASSERT_EQ(Field(remote.profile, "remote_coordinator_fallbacks"), 0);
+  }
+}
+
+TEST_F(MdbFragmentIntegrationTest, GlobalProjectionErrorsBudgetAndRecovery) {
+  SeedOrderedGroups();
+  const std::string body = " WHERE { ?s <urn:p6:9000> ?k . ?k <urn:p6:9001> ?o } GROUP BY ?o";
+  // The cell callback omits unbound cells. Keep the group key bound and test
+  // its complete ordered bag, so errors must retain all four solution rows.
+  for (const auto& expr : {"COUNT(*) + 9223372036854775807",
+                          "0 - 9223372036854775807 - COUNT(*)"}) {
+    const std::string query = "SELECT ?o ((" + std::string(expr) +
+        ") AS ?bad) ((?bad + 1) AS ?next)" + body + " ORDER BY ?o";
+    const auto local = Query(query, {});
+    const auto remote = Query(query, workers_);
+    ASSERT_EQ(local.status, 0) << query;
+    ASSERT_EQ(remote.status, 0) << query;
+    ASSERT_EQ(remote.ordered, (std::vector<std::string>{Iri(1001), Iri(1002), Iri(1003), Iri(1004)}));
+    ASSERT_EQ(remote.ordered, local.ordered);
+    ASSERT_EQ(Field(remote.profile, "remote_coordinator_fallbacks"), 0);
+  }
+  const std::string query = "SELECT ?o ((COUNT(DISTINCT *) + 1) AS ?n)" + body +
+      " HAVING (COUNT(DISTINCT *) >= 2) ORDER BY DESC(?n) ?o LIMIT 1";
+  const auto success = Query(query, workers_);
+  ASSERT_EQ(success.status, 0);
+  ASSERT_EQ(success.ordered, (std::vector<std::string>{Iri(1001), "33"}));
+  // Four parsed variables, one private COUNT in SELECT and one in HAVING;
+  // two tuple sets, two sort keys, three HAVING and three SELECT nodes.
+  const uint64_t per_row = 1024 + 128 * 6 + 16 * 2 * 6 + 16 * 2 + 64 * 3 + 512 * 3;
+  ASSERT_EQ(Field(success.profile, "global_reserved_bytes"), per_row * 50);
+  auto limited = workers_;
+  limited.coordinator_memory_bytes = per_row * 50 - 1;
+  const auto exhausted = Query(query, limited);
+  ASSERT_NE(exhausted.status, 0);
+  ASSERT_TRUE(exhausted.ordered.empty());
+  ASSERT_EQ(Field(exhausted.profile, "remote_coordinator_fallbacks"), 0);
+  auto broken = workers_;
+  broken.binary = "/bin/false";
+  const auto failed = Query(query, broken);
+  ASSERT_NE(failed.status, 0);
+  ASSERT_TRUE(failed.ordered.empty());
+  ASSERT_EQ(Field(failed.profile, "remote_coordinator_fallbacks"), 0);
+  for (bool expire : {false, true}) {
+    struct Stop { bool expire; size_t cells = 0; } stop{expire};
+    auto sink = [](const char*, const char*, void* arg) {
+      auto& state = *static_cast<Stop*>(arg);
+      ++state.cells;
+      auto* context = DocDBReadContextScope::Current();
+      if (state.expire) context->deadline = CoarseMonoClock::Now();
+      else context->cancelled.store(true);
+    };
+    RdfYBModel::Instance().SetWorkerOptions(workers_);
+    ASSERT_NE(YBCMdbExecuteSparql(query.c_str(), sink, &stop), 0);
+    ASSERT_EQ(stop.cells, 2);
+    ASSERT_EQ(Field(YBCMdbGetLastQueryProfile(), "remote_coordinator_fallbacks"), 0);
+  }
+  const auto recovered = Query(query, workers_);
+  ASSERT_EQ(recovered.status, 0);
+  ASSERT_EQ(recovered.ordered, success.ordered);
+}
+
+TEST_F(MdbFragmentIntegrationTest, GlobalProjectionScopeAndCapabilityFallback) {
+  SeedOrderedGroups();
+  auto unreachable = workers_;
+  unreachable.binary = "/bin/false";
+  const std::string body = " WHERE { ?s <urn:p6:9000> ?k . ?k <urn:p6:9001> ?o } GROUP BY ?o";
+  for (const auto& query : {
+      "SELECT ((?later + 1) AS ?n) (COUNT(*) AS ?later)" + body,
+      "SELECT ((COUNT(*) + 1) AS ?n)" + body + " HAVING (?n > 1)"}) {
+    const auto remote = Query(query, unreachable);
+    ASSERT_NE(remote.status, 0);
+    ASSERT_TRUE(remote.ordered.empty());
+    ASSERT_EQ(Field(remote.profile, "remote_fragments"), 0);
+    ASSERT_EQ(Field(remote.profile, "remote_coordinator_fallbacks"), 1);
+  }
+  std::string deep = "COUNT(*)";
+  for (size_t i = 0; i < 18; ++i) deep = "(" + deep + " + 1)";
+  std::string many = "COUNT(*)";
+  for (size_t i = 0; i < 16; ++i) many += " + COUNT(*)";
+  std::vector<std::string> nodes(65, "1");
+  nodes[0] = "COUNT(*)";
+  while (nodes.size() > 1) {
+    std::vector<std::string> next;
+    for (size_t i = 0; i < nodes.size(); i += 2)
+      next.push_back(i + 1 < nodes.size() ? "(" + nodes[i] + " + " + nodes[i + 1] + ")" : nodes[i]);
+    nodes = std::move(next);
+  }
+  for (const auto& expr : {std::string("COUNT(*) * 2"), std::string("SUM(?s) + 1"),
+                          std::string("?o + 1"), deep, many, nodes.front()}) {
+    const std::string query = "SELECT ((" + expr + ") AS ?n)" + body + " ORDER BY ?o LIMIT 1";
+    const auto local = Query(query, {});
+    const auto fallback = Query(query, unreachable);
+    ASSERT_EQ(fallback.status, local.status) << query;
+    ASSERT_EQ(fallback.ordered, local.ordered) << query;
+    ASSERT_EQ(Field(fallback.profile, "remote_fragments"), 0);
+    ASSERT_EQ(Field(fallback.profile, "remote_coordinator_fallbacks"), 1);
+  }
+}
+
 TEST_F(MdbFragmentIntegrationTest, GlobalTypedIdentityAndValueOrdering) {
   RegisterRdfIdentity(500, RdfIdentity(TripleTermType::URI, Iri(500)));
   RegisterRdfIdentity(9003, RdfIdentity(TripleTermType::URI, Iri(9003)));

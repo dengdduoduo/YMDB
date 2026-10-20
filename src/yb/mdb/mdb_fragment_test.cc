@@ -2,6 +2,13 @@
 #include <arpa/inet.h>
 #include <unistd.h>
 #include <gtest/gtest.h>
+#include <limits>
+
+#include "graph_models/rdf_model/conversions.h"
+#include "query/executor/binding.h"
+#include "query/executor/binding_iter/binding_expr/binding_expr_term.h"
+#include "query/executor/binding_iter/binding_expr/sparql/binding_expr_addition.h"
+#include "query/executor/binding_iter/binding_expr/sparql/binding_expr_subtraction.h"
 
 #include "yb/mdb/query/distributed/fragment_plan.h"
 #include "yb/mdb/query/distributed/fragment_transport.h"
@@ -13,6 +20,38 @@
 
 namespace yb::mdb {
 namespace {
+
+TEST(MdbFragmentTest, ProjectionIntegerBoundariesAndErrorPropagation) {
+  const int64_t high = std::numeric_limits<int64_t>::max();
+  const int64_t low = std::numeric_limits<int64_t>::min();
+  Binding binding(0);
+  auto evaluate = [&](bool subtract, int64_t lhs, int64_t rhs) -> ::ObjectId {
+    auto left = std::make_unique<BindingExprTerm>(SPARQL::Conversions::pack_int(lhs));
+    auto right = std::make_unique<BindingExprTerm>(SPARQL::Conversions::pack_int(rhs));
+    if (subtract) {
+      SPARQL::BindingExprSubtraction expr(std::move(left), std::move(right));
+      return expr.eval(binding);
+    }
+    SPARQL::BindingExprAddition expr(std::move(left), std::move(right));
+    return expr.eval(binding);
+  };
+  ASSERT_TRUE(evaluate(false, high, 1).is_null());
+  ASSERT_TRUE(evaluate(false, low, -1).is_null());
+  ASSERT_TRUE(evaluate(true, low, 1).is_null());
+  ASSERT_TRUE(evaluate(true, high, -1).is_null());
+  ASSERT_EQ(SPARQL::Conversions::to_integer(evaluate(false, high, low)), -1);
+  ASSERT_EQ(SPARQL::Conversions::to_integer(evaluate(false, high, -1)), high - 1);
+  ASSERT_EQ(SPARQL::Conversions::to_integer(evaluate(true, low, -1)), low + 1);
+  ASSERT_EQ(SPARQL::Conversions::to_integer(evaluate(true, high, high)), 0);
+  SPARQL::BindingExprAddition unbound(
+      std::make_unique<BindingExprTerm>(::ObjectId::get_null()),
+      std::make_unique<BindingExprTerm>(SPARQL::Conversions::pack_int(1)));
+  ASSERT_TRUE(unbound.eval(binding).is_null());
+  SPARQL::BindingExprSubtraction invalid(
+      std::make_unique<BindingExprTerm>(SPARQL::Conversions::pack_iri("urn:projection:invalid")),
+      std::make_unique<BindingExprTerm>(SPARQL::Conversions::pack_int(1)));
+  ASSERT_TRUE(invalid.eval(binding).is_null());
+}
 
 TEST(MdbFragmentTest, OwnershipRejectsGapsOverlapAndDuplicateTasks) {
   TabletInfo first, second;

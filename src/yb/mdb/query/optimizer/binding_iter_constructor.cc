@@ -491,7 +491,7 @@ void BindingIterConstructor::visit(OpOrderBy& op_order_by) {
     // SELECT registers its aggregates in handle_select, after visiting its
     // child. Defer ordering until those aggregates have produced their values.
     // Non-grouped query forms retain their existing ordering location.
-    if (!grouping && !op_group_by) {
+    if (!defer_having && !grouping && !op_group_by) {
         make_order_by_operator();
     }
 }
@@ -691,6 +691,12 @@ void BindingIterConstructor::make_solution_modifier_operators(
     }
     op_having = nullptr;
 
+    // SELECT extensions see aggregate bindings and previously extended aliases,
+    // but HAVING must not see them. Evaluate left-to-right before global order.
+    if (!projection_order_exprs.empty()) {
+        tmp = std::make_unique<ExprEvaluator>(std::move(tmp), std::move(projection_order_exprs));
+    }
+
     // ORDER BY sees the complete groups and COUNT aliases. DISTINCT must then
     // retain their order, and slicing applies to that final solution sequence.
     make_order_by_operator();
@@ -750,19 +756,18 @@ void BindingIterConstructor::handle_select(OpSelect& op_select) {
         grouping = false;
     }
 
-    std::vector<std::pair<VarId, std::unique_ptr<BindingExpr>>> select_exprs;
     for (std::size_t i = 0; i < op_select.vars_exprs.size(); i++) {
         if (op_select.vars_exprs[i] != nullptr) {
-            if (has_group_by && op_select.vars_exprs[i]->has_aggregation()) {
+            if (has_group_by) {
                 ExprToBindingExpr visitor(this, op_select.vars[i]);
                 grouping = true;
                 op_select.vars_exprs[i]->accept_visitor(visitor);
                 grouping = false;
-                select_exprs.emplace_back(op_select.vars[i], std::move(visitor.tmp));
+                projection_order_exprs.emplace_back(op_select.vars[i], std::move(visitor.tmp));
             } else {
                 ExprToBindingExpr visitor;
                 op_select.vars_exprs[i]->accept_visitor(visitor);
-                select_exprs.emplace_back(op_select.vars[i], std::move(visitor.tmp));
+                projection_order_exprs.emplace_back(op_select.vars[i], std::move(visitor.tmp));
             }
         }
     }
@@ -774,7 +779,6 @@ void BindingIterConstructor::handle_select(OpSelect& op_select) {
                 split_vars.insert(var);
             }
         }
-        projection_order_exprs = std::move(select_exprs);
         if (op_group_by) {
             get_non_redundant_exprs(*this, projection_order_exprs, split_vars);
         }

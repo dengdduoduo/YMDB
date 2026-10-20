@@ -16,6 +16,8 @@
 #include "query/parser/expr/sparql/atom/expr_term.h"
 #include "query/parser/expr/sparql/atom/expr_var.h"
 #include "query/parser/expr/sparql/binary/expr_and.h"
+#include "query/parser/expr/sparql/binary/expr_addition.h"
+#include "query/parser/expr/sparql/binary/expr_subtraction.h"
 #include "query/parser/expr/sparql/binary/expr_or.h"
 #include "query/parser/expr/sparql/binary/expr_equal.h"
 #include "query/parser/expr/sparql/binary/expr_not_equal.h"
@@ -114,6 +116,54 @@ Status ValidateHaving(const SPARQL::Expr& expr, const std::set<VarId>& group_var
   return STATUS(NotSupported, "HAVING expression remains at coordinator");
 }
 
+struct ProjectionBudget {
+  uint64_t nodes = 0;
+  uint64_t hidden_aggregates = 0;
+  uint64_t distinct_tuple_sets = 0;
+};
+
+Status ValidateProjection(const SPARQL::Expr& expr, const std::set<VarId>& available,
+                          const std::set<VarId>& numeric_vars, ProjectionBudget* budget,
+                          bool* numeric, bool root = true, bool charge = true, size_t depth = 0) {
+  if ((charge && ++budget->nodes > 128) || depth > 16)
+    return STATUS(NotSupported, "Global SELECT expression limit exceeded");
+  *numeric = true;
+  if (auto* count = dynamic_cast<const SPARQL::ExprAggCount*>(&expr)) {
+    if (!dynamic_cast<const SPARQL::ExprVar*>(count->expr.get()))
+      return STATUS(NotSupported, "SELECT COUNT requires a variable argument");
+    budget->hidden_aggregates += !root;
+    return Status::OK();
+  }
+  if (auto* all = dynamic_cast<const SPARQL::ExprAggCountAll*>(&expr)) {
+    budget->hidden_aggregates += !root;
+    budget->distinct_tuple_sets += all->distinct;
+    return Status::OK();
+  }
+  if (auto* var = dynamic_cast<const SPARQL::ExprVar*>(&expr)) {
+    if (!available.count(var->var))
+      return STATUS(NotSupported, "SELECT expression references an unavailable alias or group variable");
+    *numeric = numeric_vars.count(var->var);
+    return Status::OK();
+  }
+  if (auto* term = dynamic_cast<const SPARQL::ExprTerm*>(&expr)) {
+    if (HavingInteger(term->term)) return Status::OK();
+    return STATUS(NotSupported, "SELECT literal remains at coordinator");
+  }
+  const SPARQL::Expr *lhs = nullptr, *rhs = nullptr;
+  if (HavingOperands<SPARQL::ExprAddition>(expr, &lhs, &rhs) ||
+      HavingOperands<SPARQL::ExprSubtraction>(expr, &lhs, &rhs)) {
+    bool left_numeric, right_numeric;
+    RETURN_NOT_OK(ValidateProjection(*lhs, available, numeric_vars, budget,
+                                    &left_numeric, false, charge, depth + 1));
+    RETURN_NOT_OK(ValidateProjection(*rhs, available, numeric_vars, budget,
+                                    &right_numeric, false, charge, depth + 1));
+    if (!left_numeric || !right_numeric)
+      return STATUS(NotSupported, "SELECT arithmetic requires COUNT/int64 operands");
+    return Status::OK();
+  }
+  return STATUS(NotSupported, "SELECT expression remains at coordinator");
+}
+
 Status Collect(const SPARQL::Op& op, std::vector<SPARQL::OpTriple>* triples) {
   if (auto* bgp = dynamic_cast<const SPARQL::OpBasicGraphPattern*>(&op)) {
     if (!bgp->paths.empty()) return STATUS(NotSupported, "Worker property paths are not supported");
@@ -195,17 +245,8 @@ Result<FragmentPlan> FragmentPlan::Build(
   if (!select || !select->op || select->is_sub_select)
     return STATUS(NotSupported, "Worker input requires a root SELECT");
   bool aggregate = false;
-  uint64_t distinct_tuple_sets = 0;
-  for (const auto& expression : select->vars_exprs) if (expression) {
-    // Other aggregates/expressions retain the existing coordinator path until
-    // their value, overflow and resource semantics have independent coverage.
-    auto* count = dynamic_cast<const SPARQL::ExprAggCount*>(expression.get());
-    auto* all = dynamic_cast<const SPARQL::ExprAggCountAll*>(expression.get());
-    if ((!count || !dynamic_cast<const SPARQL::ExprVar*>(count->expr.get())) && !all)
-      return STATUS(NotSupported, "SELECT expression is outside global fragment capabilities");
-    aggregate = true;
-    if (all && all->distinct) ++distinct_tuple_sets;
-  }
+  for (const auto& expression : select->vars_exprs)
+    if (expression) aggregate = aggregate || expression->has_aggregation();
   const SPARQL::Op* input = select->op.get();
   bool ordered = false, grouped = false;
   uint64_t order_keys = 0;
@@ -254,6 +295,29 @@ Result<FragmentPlan> FragmentPlan::Build(
     for (auto var : select->vars) if (!final_variables.count(var))
       return STATUS(NotSupported, "HAVING projection requires grouped or aggregate variables");
   }
+  ProjectionBudget projection_budget;
+  std::set<VarId> available = group_variables, numeric_vars;
+  for (size_t i = 0; i < select->vars_exprs.size(); ++i) {
+    const auto& expr = select->vars_exprs[i];
+    if (!expr) {
+      if ((aggregate || grouped) && !group_variables.count(select->vars[i]))
+        return STATUS(NotSupported, "Grouped SELECT projection requires a group variable");
+      continue;
+    }
+    const bool direct_count = dynamic_cast<const SPARQL::ExprAggCount*>(expr.get()) ||
+        dynamic_cast<const SPARQL::ExprAggCountAll*>(expr.get());
+    if (!direct_count && !aggregate && !grouped)
+      return STATUS(NotSupported, "Non-aggregate SELECT expression remains at coordinator");
+    if (available.count(select->vars[i]))
+      return STATUS(NotSupported, "SELECT expression alias is already in scope");
+    bool numeric;
+    RETURN_NOT_OK(ValidateProjection(*expr, available, numeric_vars, &projection_budget,
+                                    &numeric, true, !direct_count));
+    available.insert(select->vars[i]);
+    if (numeric) numeric_vars.insert(select->vars[i]);
+  }
+  if (having_budget.aggregates + projection_budget.hidden_aggregates > 16)
+    return STATUS(NotSupported, "Global private aggregate limit exceeded");
   if (aggregate || grouped) {
     for (auto var : order_variables) if (!final_variables.count(var))
       return STATUS(NotSupported, "Non-grouped ORDER BY variable remains at coordinator");
@@ -265,7 +329,8 @@ Result<FragmentPlan> FragmentPlan::Build(
   FragmentPlan plan;
   // The constructor creates one private binding slot for each HAVING COUNT.
   // Account for them before starting workers, without mutating the parser tree.
-  const uint64_t variables = get_query_ctx().get_var_size() + having_budget.aggregates;
+  const uint64_t variables = get_query_ctx().get_var_size() + having_budget.aggregates +
+      projection_budget.hidden_aggregates;
   if (variables > 128) return STATUS(NotSupported, "Worker variable limit exceeded");
   // Each COUNT(DISTINCT *) retains a full binding tuple. Account for every
   // such set, not just the number of returned columns or aggregate outputs.
@@ -273,8 +338,8 @@ Result<FragmentPlan> FragmentPlan::Build(
   // outputs (at most one per input row). Charge explicit keys as well, including
   // repeated keys that do not increase the query's variable count.
   plan.global_row_reservation = 1024 + 128 * variables +
-      16 * (distinct_tuple_sets + having_budget.distinct_tuple_sets) * variables +
-      16 * order_keys + 64 * having_budget.nodes;
+      16 * (projection_budget.distinct_tuple_sets + having_budget.distinct_tuple_sets) * variables +
+      16 * order_keys + 64 * having_budget.nodes + 512 * projection_budget.nodes;
   plan.coordinator_finalize = aggregate || grouped || ordered || select->distinct ||
       select->limit != SPARQL::Op::DEFAULT_LIMIT || select->offset != 0;
   auto& physical = plan.physical;
