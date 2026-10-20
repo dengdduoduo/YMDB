@@ -1,4 +1,5 @@
 #pragma once
+#include <algorithm>
 
 #include "graph_models/object_id.h"
 #include "graph_models/rdf_model/conversions.h"
@@ -69,7 +70,42 @@ private:
             const auto l = Conversions::unpack_int(lhs), r = Conversions::unpack_int(rhs);
             return l < r ? -1 : l > r ? 1 : 0;
         }
+        if (Conversions::calculate_optype(lhs) <= Conversions::OpType::DECIMAL &&
+            Conversions::calculate_optype(rhs) <= Conversions::OpType::DECIMAL) {
+            // Compare normalized decimal digits without losing integer precision
+            // through double, including mixed integer/decimal extrema.
+            struct Key { bool negative; int64_t exponent; std::string digits; };
+            auto key = [](ObjectId value) {
+                std::string text = Conversions::to_lexical_str(value);
+                bool negative = !text.empty() && text.front() == '-';
+                if (!text.empty() && (text.front() == '-' || text.front() == '+')) text.erase(0, 1);
+                auto point = text.find('.');
+                if (point == std::string::npos) point = text.size();
+                else text.erase(point, 1);
+                auto first = text.find_first_not_of('0');
+                if (first == std::string::npos) return Key{false, 0, ""};
+                auto exponent = int64_t(point) - int64_t(first);
+                text.erase(0, first);
+                while (text.back() == '0') text.pop_back();
+                return Key{negative, exponent, std::move(text)};
+            };
+            const auto l = key(lhs), r = key(rhs);
+            if (l.negative != r.negative) return l.negative ? -1 : 1;
+            int64_t order = 0;
+            if (l.digits.empty() || r.digits.empty())
+                order = l.digits.empty() ? (r.digits.empty() ? 0 : -1) : 1;
+            else if (l.exponent != r.exponent) order = l.exponent < r.exponent ? -1 : 1;
+            else for (size_t i = 0; i < std::max(l.digits.size(), r.digits.size()); ++i) {
+                const char a = i < l.digits.size() ? l.digits[i] : '0';
+                const char b = i < r.digits.size() ? r.digits[i] : '0';
+                if (a != b) { order = a < b ? -1 : 1; break; }
+            }
+            return l.negative ? -order : order;
+        }
         const auto l = Conversions::to_double(lhs), r = Conversions::to_double(rhs);
+        // A deterministic NaN position keeps sorting a strict weak order.
+        if (std::isnan(l) || std::isnan(r))
+            return std::isnan(l) ? (std::isnan(r) ? 0 : -1) : 1;
         return l < r ? -1 : l > r ? 1 : 0;
     }
     enum class Mode { Normal, Strict };

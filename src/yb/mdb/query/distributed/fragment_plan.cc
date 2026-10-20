@@ -28,6 +28,10 @@
 #include "query/parser/expr/sparql/unary/expr_not.h"
 #include "query/parser/expr/sparql/builtin_call/aggregate/expr_agg_count.h"
 #include "query/parser/expr/sparql/builtin_call/aggregate/expr_agg_count_all.h"
+#include "query/parser/expr/sparql/builtin_call/aggregate/expr_agg_sum.h"
+#include "query/parser/expr/sparql/builtin_call/aggregate/expr_agg_avg.h"
+#include "query/parser/expr/sparql/builtin_call/aggregate/expr_agg_min.h"
+#include "query/parser/expr/sparql/builtin_call/aggregate/expr_agg_max.h"
 #include "yb/mdb/model/rdf_yb_model.h"
 #include "yb/mdb/query/distributed/fragment_transport.h"
 
@@ -37,7 +41,22 @@ struct HavingBudget {
   uint64_t nodes = 0;
   uint64_t aggregates = 0;
   uint64_t distinct_tuple_sets = 0;
+  uint64_t numeric_aggregates = 0;
 };
+
+// Only variable arguments have bounded per-row state in this capability.
+const SPARQL::Expr* ValueAggregate(const SPARQL::Expr& expr, bool* numeric) {
+  *numeric = true;
+  if (auto* agg = dynamic_cast<const SPARQL::ExprAggSum*>(&expr)) return agg->expr.get();
+  if (auto* agg = dynamic_cast<const SPARQL::ExprAggAvg*>(&expr)) return agg->expr.get();
+  if (auto* agg = dynamic_cast<const SPARQL::ExprAggMin*>(&expr)) {
+    *numeric = false; return agg->expr.get();
+  }
+  if (auto* agg = dynamic_cast<const SPARQL::ExprAggMax*>(&expr)) {
+    *numeric = false; return agg->expr.get();
+  }
+  return nullptr;
+}
 
 bool HavingInteger(::ObjectId value) {
   if (value.get_type() == ::ObjectId::MASK_POSITIVE_INT) return true;
@@ -65,6 +84,14 @@ Status ValidateHaving(const SPARQL::Expr& expr, const std::set<VarId>& group_var
                       HavingBudget* budget, bool condition = true, size_t depth = 0) {
   if (++budget->nodes > 128 || depth > 16)
     return STATUS(NotSupported, "Global HAVING expression limit exceeded");
+  bool numeric;
+  if (const auto* argument = ValueAggregate(expr, &numeric)) {
+    if (!dynamic_cast<const SPARQL::ExprVar*>(argument))
+      return STATUS(NotSupported, "Global value aggregate requires a variable argument");
+    ++budget->aggregates;
+    ++budget->numeric_aggregates;
+    return Status::OK();
+  }
   if (auto* count = dynamic_cast<const SPARQL::ExprAggCount*>(&expr)) {
     if (!dynamic_cast<const SPARQL::ExprVar*>(count->expr.get()))
       return STATUS(NotSupported, "HAVING COUNT requires a variable argument");
@@ -103,7 +130,9 @@ Status ValidateHaving(const SPARQL::Expr& expr, const std::set<VarId>& group_var
     // separate capability. This extension orders only COUNTs/int64 constants.
     for (auto* operand : {lhs, rhs}) {
       auto* term = dynamic_cast<const SPARQL::ExprTerm*>(operand);
-      if (!dynamic_cast<const SPARQL::ExprAggCount*>(operand) &&
+      bool numeric_operand;
+      const bool value_aggregate = ValueAggregate(*operand, &numeric_operand) != nullptr;
+      if (!value_aggregate && !dynamic_cast<const SPARQL::ExprAggCount*>(operand) &&
           !dynamic_cast<const SPARQL::ExprAggCountAll*>(operand) &&
           (!term || !HavingInteger(term->term)))
         return STATUS(NotSupported, "HAVING relational operands require COUNT or int64 constants");
@@ -128,6 +157,12 @@ Status ValidateProjection(const SPARQL::Expr& expr, const std::set<VarId>& avail
   if ((charge && ++budget->nodes > 128) || depth > 16)
     return STATUS(NotSupported, "Global SELECT expression limit exceeded");
   *numeric = true;
+  if (const auto* argument = ValueAggregate(expr, numeric)) {
+    if (!dynamic_cast<const SPARQL::ExprVar*>(argument))
+      return STATUS(NotSupported, "Global value aggregate requires a variable argument");
+    budget->hidden_aggregates += !root;
+    return Status::OK();
+  }
   if (auto* count = dynamic_cast<const SPARQL::ExprAggCount*>(&expr)) {
     if (!dynamic_cast<const SPARQL::ExprVar*>(count->expr.get()))
       return STATUS(NotSupported, "SELECT COUNT requires a variable argument");
@@ -339,7 +374,7 @@ Result<FragmentPlan> FragmentPlan::Build(
   // repeated keys that do not increase the query's variable count.
   plan.global_row_reservation = 1024 + 128 * variables +
       16 * (projection_budget.distinct_tuple_sets + having_budget.distinct_tuple_sets) * variables +
-      16 * order_keys + 64 * having_budget.nodes + 512 * projection_budget.nodes;
+      16 * order_keys + 64 * having_budget.nodes + 512 * projection_budget.nodes + 512 * having_budget.numeric_aggregates;
   plan.coordinator_finalize = aggregate || grouped || ordered || select->distinct ||
       select->limit != SPARQL::Op::DEFAULT_LIMIT || select->offset != 0;
   auto& physical = plan.physical;

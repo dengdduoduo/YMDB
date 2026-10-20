@@ -22,6 +22,9 @@ public:
         auto lhs_oid = lhs->eval(binding);
         auto rhs_oid = rhs->eval(binding);
 
+        // IEEE NaN is unordered: every ordered comparison is false.
+        if (Conversions::numeric_is_nan(lhs_oid) || Conversions::numeric_is_nan(rhs_oid))
+            return Conversions::pack_bool(false);
         bool error;
         bool res = Comparisons::strict_compare(lhs_oid, rhs_oid, &error) > 0;
         if (error) {

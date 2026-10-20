@@ -98,6 +98,19 @@ class MdbFragmentIntegrationTest : public MiniClusterTestWithClient<MiniCluster>
     ASSERT_OK(RdfYBModel::Instance().Flush());
   }
 
+  void SeedNumericGroups() {
+    SeedOrderedGroups();
+    RegisterRdfIdentity(9002, RdfIdentity(TripleTermType::URI, Iri(9002)));
+    for (const auto& item : std::vector<std::pair<uint64_t, std::string>>{
+        {50001, "2"}, {50002, "10"}, {50003, "-4"}})
+      RegisterRdfIdentity(item.first, RdfIdentity(TripleTermType::LITERAL, item.second,
+          "http://www.w3.org/2001/XMLSchema#integer"));
+    const std::vector<uint64_t> values = {50001, 50001, 50002, 50003};
+    for (uint64_t i = 0; i < 50; ++i)
+      ASSERT_OK(RdfYBModel::Instance().WriteTripleToDocDB(101 + i, 9002, values[i % 4]));
+    ASSERT_OK(RdfYBModel::Instance().Flush());
+  }
+
   struct Output {
     int status = -1;
     std::multiset<std::string> values;
@@ -633,7 +646,7 @@ TEST_F(MdbFragmentIntegrationTest, GlobalProjectionScopeAndCapabilityFallback) {
       next.push_back(i + 1 < nodes.size() ? "(" + nodes[i] + " + " + nodes[i + 1] + ")" : nodes[i]);
     nodes = std::move(next);
   }
-  for (const auto& expr : {std::string("COUNT(*) * 2"), std::string("SUM(?s) + 1"),
+  for (const auto& expr : {std::string("COUNT(*) * 2"), std::string("GROUP_CONCAT(?s) + 1"),
                           std::string("?o + 1"), deep, many, nodes.front()}) {
     const std::string query = "SELECT ((" + expr + ") AS ?n)" + body + " ORDER BY ?o LIMIT 1";
     const auto local = Query(query, {});
@@ -643,6 +656,146 @@ TEST_F(MdbFragmentIntegrationTest, GlobalProjectionScopeAndCapabilityFallback) {
     ASSERT_EQ(Field(fallback.profile, "remote_fragments"), 0);
     ASSERT_EQ(Field(fallback.profile, "remote_coordinator_fallbacks"), 1);
   }
+}
+
+TEST_F(MdbFragmentIntegrationTest, GlobalNumericAggregatesAndDistinct) {
+  SeedNumericGroups();
+  const std::string body = " WHERE { ?s <urn:p6:9000> ?k . ?k <urn:p6:9001> ?g . "
+      "?s <urn:p6:9002> ?v }";
+  const std::string grouped = body + " GROUP BY ?g";
+  const std::vector<std::pair<std::string, std::vector<std::string>>> cases = {
+    {"SELECT ?g (SUM(?v) AS ?t) (AVG(?v) AS ?a) (MIN(?v) AS ?lo) (MAX(?v) AS ?hi)" +
+      grouped + " ORDER BY DESC(?t) ?g",
+      {Iri(1001), "80", "2.5", "-4", "10", Iri(1002), "20", "2.5", "-4", "10",
+       Iri(1004), "20", "2.5", "-4", "10", Iri(1003), "4", "2.0", "2", "2"}},
+    {"SELECT ?g (SUM(DISTINCT ?v) AS ?t) (AVG(DISTINCT ?v) AS ?a) "
+      "(MIN(DISTINCT ?v) AS ?lo) (MAX(DISTINCT ?v) AS ?hi)" + grouped + " ORDER BY ?g LIMIT 1",
+      {Iri(1001), "8", "2.66666666666666667", "-4", "10"}},
+    {"SELECT ?g (SUM(?v) AS ?t)" + grouped + " HAVING (SUM(?v) > 4) (AVG(?v) >= 2) "
+      "ORDER BY DESC(?t) ?g LIMIT 2 OFFSET 1", {Iri(1002), "20", Iri(1004), "20"}},
+    {"SELECT ((SUM(?v) + 1) AS ?t) ((?t - 1) AS ?again) (AVG(?v) AS ?a)" + grouped +
+      " ORDER BY DESC(?t) ?g LIMIT 1", {"81", "80", "2.5"}},
+    {"SELECT DISTINCT (SUM(DISTINCT ?v) AS ?t)" + grouped + " ORDER BY ?t LIMIT 1 OFFSET 1", {"8"}},
+    {"SELECT (SUM(?v) AS ?t) (AVG(?v) AS ?a) (MIN(?v) AS ?lo) (MAX(?v) AS ?hi)" + body,
+      {"124", "2.48", "-4", "10"}},
+    {"SELECT ?g (MIN(?v) AS ?lo)" + grouped + " HAVING (MIN(?v) < 0) (MAX(?v) = 10) "
+      "ORDER BY ?g LIMIT 1", {Iri(1001), "-4"}},
+    {"SELECT (SUM(?v) AS ?t)" + grouped + " ORDER BY ?t LIMIT 0", {}},
+    {"SELECT (AVG(?v) AS ?a)" + grouped + " ORDER BY ?a OFFSET 9", {}}
+  };
+  for (const auto& item : cases) {
+    SCOPED_TRACE(item.first);
+    const auto local = Query(item.first, {});
+    const auto remote = Query(item.first, workers_);
+    ASSERT_EQ(local.status, 0); ASSERT_EQ(remote.status, 0) << remote.profile;
+    ASSERT_EQ(local.ordered, item.second); ASSERT_EQ(remote.ordered, item.second);
+    ASSERT_EQ(Field(remote.profile, "remote_fragments"), 4);
+    ASSERT_EQ(Field(remote.profile, "remote_coordinator_fallbacks"), 0);
+    ASSERT_EQ(Field(remote.profile, "global_input_rows"), 50);
+  }
+  const std::string empty = "SELECT (COUNT(*) AS ?n) (SUM(?v) AS ?t) (AVG(?v) AS ?a) "
+      "(MIN(?v) AS ?lo) (MAX(?v) AS ?hi) WHERE { ?s <urn:p6:missing> ?v }";
+  for (const auto& suffix : {"", " GROUP BY ?s"}) {
+    const auto local = Query(empty + suffix, {});
+    const auto remote = Query(empty + suffix, workers_);
+    ASSERT_EQ(remote.status, 0); ASSERT_EQ(local.status, 0);
+    ASSERT_EQ(remote.ordered, suffix[0] ? std::vector<std::string>{} :
+        (std::vector<std::string>{"0", "0", "0"}));
+    ASSERT_EQ(remote.ordered, local.ordered);
+    ASSERT_EQ(Field(remote.profile, "remote_coordinator_fallbacks"), 0);
+  }
+}
+
+TEST_F(MdbFragmentIntegrationTest, GlobalNumericTypesErrorsAndExtrema) {
+  const std::string xsd = "http://www.w3.org/2001/XMLSchema#";
+  RegisterRdfIdentity(9004, RdfIdentity(TripleTermType::URI, Iri(9004)));
+  const std::vector<std::pair<std::string, std::string>> inputs = {
+    {"1", "integer"}, {"2.5", "decimal"}, {"3.5", "float"}, {"1", "double"}};
+  for (size_t i = 0; i < inputs.size(); ++i) {
+    RegisterRdfIdentity(101 + i, RdfIdentity(TripleTermType::URI, Iri(101 + i)));
+    RegisterRdfIdentity(60000 + i, RdfIdentity(TripleTermType::LITERAL, inputs[i].first, xsd + inputs[i].second));
+    ASSERT_OK(RdfYBModel::Instance().WriteTripleToDocDB(101 + i, 9004, 60000 + i));
+  }
+  ASSERT_OK(RdfYBModel::Instance().Flush());
+  for (const auto& item : std::vector<std::pair<std::string, std::vector<std::string>>>{
+      {"SELECT (SUM(?v) AS ?t) (AVG(?v) AS ?a) (MIN(?v) AS ?lo) (MAX(?v) AS ?hi) "
+       "WHERE { ?s <urn:p6:9004> ?v }", {"8", "2", "1", "3.5"}},
+      {"SELECT (COUNT(*) AS ?n) (SUM(?s) AS ?t) (AVG(?s) AS ?a) (MIN(?s) AS ?lo) (MAX(?s) AS ?hi) "
+       "WHERE { ?s <urn:p6:9004> ?v }", {"4", Iri(101), Iri(104)}},
+      {"SELECT (COUNT(*) AS ?n) (SUM(?missing) AS ?t) (AVG(?missing) AS ?a) "
+       "(MIN(?missing) AS ?lo) (MAX(?missing) AS ?hi) WHERE { ?s <urn:p6:9004> ?v }", {"4", "0"}},
+      {"SELECT (COUNT(*) AS ?n) (SUM(?s) AS ?t) WHERE { ?s <urn:p6:9004> ?v } HAVING (SUM(?s) > 0)", {}}}) {
+    SCOPED_TRACE(item.first);
+    const auto local = Query(item.first, {});
+    const auto remote = Query(item.first, workers_);
+    ASSERT_EQ(local.status, 0); ASSERT_EQ(remote.status, 0);
+    ASSERT_EQ(local.ordered, item.second); ASSERT_EQ(remote.ordered, item.second);
+    ASSERT_EQ(Field(remote.profile, "remote_coordinator_fallbacks"), 0);
+  }
+  RegisterRdfIdentity(9005, RdfIdentity(TripleTermType::URI, Iri(9005)));
+  for (const auto& item : std::vector<std::pair<uint64_t, std::string>>{{61000, "INF"}, {61001, "-INF"}}) {
+    RegisterRdfIdentity(item.first, RdfIdentity(TripleTermType::LITERAL, item.second, xsd + "double"));
+    ASSERT_OK(RdfYBModel::Instance().WriteTripleToDocDB(101, 9005, item.first));
+  }
+  ASSERT_OK(RdfYBModel::Instance().Flush());
+  for (bool negate : {false, true}) {
+    const std::string query = "SELECT (COUNT(*) AS ?n) (SUM(?v) AS ?t) "
+        "WHERE { ?s <urn:p6:9005> ?v } HAVING (" +
+        std::string(negate ? "!(SUM(?v) >= 0)" : "SUM(?v) >= 0") + ")";
+    const auto local = Query(query, {}); const auto remote = Query(query, workers_);
+    ASSERT_EQ(local.status, 0); ASSERT_EQ(remote.status, 0);
+    ASSERT_EQ(remote.ordered, negate ? (std::vector<std::string>{"2", "NaN"}) : std::vector<std::string>{});
+    ASSERT_EQ(remote.ordered, local.ordered);
+    ASSERT_EQ(Field(remote.profile, "remote_coordinator_fallbacks"), 0);
+  }
+  auto fallback = workers_; fallback.binary = "/bin/false";
+  for (const auto& expr : {"SUM(?v + 1)", "AVG(COUNT(?v))", "GROUP_CONCAT(?v)"}) {
+    const std::string query = "SELECT (" + std::string(expr) + " AS ?t) WHERE { ?s <urn:p6:9004> ?v }";
+    const auto local = Query(query, {});
+    const auto remote = Query(query, fallback);
+    ASSERT_EQ(remote.status, local.status); ASSERT_EQ(remote.ordered, local.ordered);
+    ASSERT_EQ(Field(remote.profile, "remote_fragments"), 0);
+    ASSERT_EQ(Field(remote.profile, "remote_coordinator_fallbacks"), 1);
+  }
+}
+
+TEST_F(MdbFragmentIntegrationTest, GlobalNumericBudgetFailureAndRecovery) {
+  SeedNumericGroups();
+  const std::string query = "SELECT ?g (SUM(DISTINCT ?v) AS ?t) (AVG(DISTINCT ?v) AS ?a) "
+      "(MIN(?v) AS ?lo) (MAX(?v) AS ?hi) WHERE { ?s <urn:p6:9000> ?k . "
+      "?k <urn:p6:9001> ?g . ?s <urn:p6:9002> ?v } GROUP BY ?g "
+      "HAVING (SUM(DISTINCT ?v) >= 8) ORDER BY DESC(?t) ?g LIMIT 1";
+  const auto success = Query(query, workers_);
+  ASSERT_EQ(success.status, 0);
+  ASSERT_EQ(success.ordered, (std::vector<std::string>{Iri(1001), "8", "2.66666666666666667", "-4", "10"}));
+  // Eight parsed variables, one private aggregate, two sort keys, three
+  // HAVING nodes, four SELECT nodes, one extra value-aggregate reservation.
+  const uint64_t per_row = 1024 + 128 * 9 + 16 * 2 + 64 * 3 + 512 * 4 + 512;
+  ASSERT_EQ(Field(success.profile, "global_reserved_bytes"), per_row * 50);
+  auto limited = workers_; limited.coordinator_memory_bytes = per_row * 50;
+  ASSERT_EQ(Query(query, limited).ordered, success.ordered);
+  --limited.coordinator_memory_bytes;
+  const auto exhausted = Query(query, limited);
+  ASSERT_NE(exhausted.status, 0); ASSERT_TRUE(exhausted.ordered.empty());
+  ASSERT_EQ(Field(exhausted.profile, "remote_coordinator_fallbacks"), 0);
+  auto broken = workers_; broken.binary = "/bin/false";
+  const auto failed = Query(query, broken);
+  ASSERT_NE(failed.status, 0); ASSERT_TRUE(failed.ordered.empty());
+  ASSERT_EQ(Field(failed.profile, "remote_coordinator_fallbacks"), 0);
+  for (bool expire : {false, true}) {
+    struct Stop { bool expire; size_t cells = 0; } stop{expire};
+    auto sink = [](const char*, const char*, void* arg) {
+      auto& state = *static_cast<Stop*>(arg); ++state.cells;
+      auto* context = DocDBReadContextScope::Current();
+      if (state.expire) context->deadline = CoarseMonoClock::Now();
+      else context->cancelled.store(true);
+    };
+    RdfYBModel::Instance().SetWorkerOptions(workers_);
+    ASSERT_NE(YBCMdbExecuteSparql(query.c_str(), sink, &stop), 0);
+    ASSERT_EQ(stop.cells, 5);
+  }
+  const auto recovered = Query(query, workers_);
+  ASSERT_EQ(recovered.status, 0); ASSERT_EQ(recovered.ordered, success.ordered);
 }
 
 TEST_F(MdbFragmentIntegrationTest, GlobalTypedIdentityAndValueOrdering) {
@@ -736,9 +889,9 @@ TEST_F(MdbFragmentIntegrationTest, GlobalUnsupportedEnvelopeFallsBackBeforeLaunc
   for (const std::string query : {
       "SELECT ?o WHERE { { ?s <urn:p6:9000> ?o } UNION { ?s <urn:p6:9001> ?o } }",
       "SELECT ?s WHERE { ?s <urn:p6:9000> ?k OPTIONAL { ?k <urn:p6:9001> ?o } }",
-      "SELECT (SUM(?s) AS ?n) WHERE { ?s <urn:p6:9000> ?k }",
+      "SELECT (SUM(STR(?s)) AS ?n) WHERE { ?s <urn:p6:9000> ?k }",
       "SELECT (COUNT(*) AS ?n) WHERE { ?s <urn:p6:9000> ?k } GROUP BY ?k ORDER BY ?s",
-      "SELECT (COUNT(*) AS ?n) WHERE { ?s <urn:p6:9000> ?k } GROUP BY ?k HAVING (SUM(?s) > 1)",
+      "SELECT (COUNT(*) AS ?n) WHERE { ?s <urn:p6:9000> ?k } GROUP BY ?k HAVING (SUM(STR(?s)) > 1)",
       "SELECT (COUNT(*) AS ?n) WHERE { ?s <urn:p6:9000> ?k } GROUP BY ?k HAVING (?n > 1)",
       "SELECT (COUNT(*) AS ?n) WHERE { ?s <urn:p6:9000> ?k } GROUP BY ?k HAVING (COUNT(*) + 1 > 1)",
       "SELECT (COUNT(*) AS ?n) WHERE { ?s <urn:p6:9000> ?k } GROUP BY ?k HAVING (COUNT(STR(?s)) > 1)",

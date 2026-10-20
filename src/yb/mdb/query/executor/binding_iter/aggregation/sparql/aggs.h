@@ -3,6 +3,10 @@
 #include <string>
 #include <set>
 #include <vector>
+#include <limits>
+#include <iomanip>
+#include <sstream>
+#include <boost/multiprecision/cpp_dec_float.hpp>
 
 #include "graph_models/rdf_model/comparisons.h"
 #include "graph_models/rdf_model/conversions.h"
@@ -12,120 +16,112 @@
 
 namespace SPARQL {
 
-class AggAvg : public Agg {
+// Bounded RDF numeric accumulator. Integer totals are exact while admitted
+// row counts fit uint64_t (at most 38 decimal digits). Decimal results use the
+// model's finite precision: 18 significant digits, exponent -100..100.
+struct NumericAggregateState {
+    // 256 digits cover the full admitted decimal exponent span plus all
+    // uint64_t input multiplicities, including cancellation across that span.
+    using Wide = boost::multiprecision::number<boost::multiprecision::cpp_dec_float<256>>;
+    Conversions::OpType type = Conversions::OpType::INTEGER;
+    Wide exact = 0;
+    float single = 0;
+    double real = 0;
+    uint64_t count = 0;
+    bool error = false;
+
+    void add(ObjectId value) {
+        if (!value.is_null()) ++count;
+        if (error) return;
+        const auto next = Conversions::calculate_optype(value);
+        if (value.is_null() || next > Conversions::OpType::DOUBLE) {
+            error = true;
+            return;
+        }
+        if (next > type) {
+            if (next == Conversions::OpType::FLOAT) single = exact.convert_to<float>();
+            if (next == Conversions::OpType::DOUBLE)
+                real = type == Conversions::OpType::FLOAT ? single : exact.convert_to<double>();
+            type = next;
+        }
+        if (type == Conversions::OpType::DOUBLE) real += Conversions::to_double(value);
+        else if (type == Conversions::OpType::FLOAT) single += Conversions::to_float(value);
+        else if (next == Conversions::OpType::INTEGER) exact += Conversions::unpack_int(value);
+        else {
+            auto term = RdfTermRegistry::Find(value.id);
+            if (!term || term->lexical.size() > 256) { error = true; return; }
+            std::string digits;
+            for (char c : term->lexical) if (c >= '0' && c <= '9') digits += c;
+            auto first = digits.find_first_not_of('0');
+            auto last = digits.find_last_not_of('0');
+            if (first != std::string::npos && last - first + 1 > 18) { error = true; return; }
+            Wide number(term->lexical);
+            const auto magnitude = boost::multiprecision::abs(number);
+            if (magnitude != 0 && (magnitude < Wide("1e-100") || magnitude > Wide("1e100"))) {
+                error = true; return;
+            }
+            exact += number;
+        }
+    }
+
+    static ObjectId decimal(const Wide& number) {
+        std::ostringstream out;
+        out << std::scientific << std::setprecision(17) << number;
+        std::string text = out.str();
+        const auto e = text.find('e');
+        if (e == std::string::npos) return ObjectId::get_null();
+        int exponent = std::stoi(text.substr(e + 1));
+        if (exponent < -100 || exponent > 100) return ObjectId::get_null();
+        bool negative = text.front() == '-';
+        std::string digits = text.substr(negative ? 1 : 0, e - (negative ? 1 : 0));
+        digits.erase(digits.find('.'), 1);
+        const int point = exponent + 1;
+        if (point <= 0) text = "0." + std::string(-point, '0') + digits;
+        else if (point >= int(digits.size())) text = digits + std::string(point - digits.size(), '0') + ".0";
+        else text = digits.substr(0, point) + "." + digits.substr(point);
+        while (text.back() == '0' && text[text.size() - 2] != '.') text.pop_back();
+        if (negative && number != 0) text = "-" + text;
+        return Conversions::try_pack_string_datatype(std::string(RdfTermIdentity::kXsd) + "decimal", text);
+    }
+
+    ObjectId get(bool average) const {
+        if (average && count == 0) return Conversions::pack_int(0);
+        if (error) return ObjectId::get_null();
+        if (type == Conversions::OpType::FLOAT)
+            return Conversions::pack_float(average ? single / count : single);
+        if (type == Conversions::OpType::DOUBLE)
+            return Conversions::pack_double(average ? real / count : real);
+        if (average) return decimal(exact / Wide(count));
+        if (type == Conversions::OpType::DECIMAL) return decimal(exact);
+        if (exact < Wide(std::numeric_limits<int64_t>::min()) ||
+            exact > Wide(std::numeric_limits<int64_t>::max())) return ObjectId::get_null();
+        return Conversions::pack_int(exact.convert_to<int64_t>());
+    }
+};
+
+template<bool Average, bool Distinct>
+class AggNumeric : public Agg {
 public:
     using Agg::Agg;
-    void begin() override
-    {
-        sum_integer = 0;
-        sum_decimal = Decimal();
-        sum_float = 0;
-        sum_double = 0;
-
-        type = Conversions::OpType::INTEGER;
-        count = 0;
+    void begin() override { state = NumericAggregateState(); seen.clear(); }
+    void process() override {
+        const auto value = expr->eval(*binding);
+        if (!Distinct || seen.insert(value).second) state.add(value);
     }
-
-    void process() override
-    {
-        if (type == Conversions::OpType::INVALID) {
-            return;
-        }
-
-        auto oid = expr->eval(*binding);
-        auto op_type = Conversions::calculate_optype(oid);
-
-        if (op_type > Conversions::OpType::DOUBLE) {
-            type = Conversions::OpType::INVALID;
-            return;
-        }
-
-        if (op_type > type) {
-            if (op_type == Conversions::OpType::DECIMAL) {
-                sum_decimal = Decimal(sum_integer);
-                type = Conversions::OpType::DECIMAL;
-            } else if (op_type == Conversions::OpType::FLOAT) {
-                if (type == Conversions::OpType::INTEGER) {
-                    sum_float = sum_integer;
-                } else {
-                    sum_float = sum_decimal.to_float();
-                }
-                type = Conversions::OpType::FLOAT;
-            } else {
-                if (type == Conversions::OpType::INTEGER) {
-                    sum_double = sum_integer;
-                } else if (type == Conversions::OpType::DECIMAL) {
-                    sum_double = sum_decimal.to_double();
-                } else {
-                    sum_double = sum_float;
-                }
-                type = Conversions::OpType::DOUBLE;
-            }
-        }
-
-        if (type == Conversions::OpType::INTEGER) {
-            sum_integer += Conversions::unpack_int(oid);
-        } else if (type == Conversions::OpType::DECIMAL) {
-            sum_decimal = sum_decimal + Conversions::to_decimal(oid);
-        } else if (type == Conversions::OpType::FLOAT) {
-            sum_float += Conversions::to_float(oid);
-        } else {
-            sum_double += Conversions::to_double(oid);
-        }
-        count++;
+    ObjectId get() override { return state.get(Average); }
+    std::ostream& print(std::ostream& os) const override {
+        os << (Average ? "AVG(" : "SUM(") << (Distinct ? "DISTINCT " : "");
+        BindingExprPrinter printer(os); printer.print(*expr);
+        return os << ")";
     }
-
-    ObjectId get() override
-    {
-        if (type == Conversions::OpType::INVALID) {
-            return ObjectId::get_null();
-        }
-
-        if (count == 0) {
-            return Conversions::pack_int(0);
-        }
-
-        if (type == Conversions::OpType::INTEGER) {
-            Decimal avg;
-            if (sum_integer % count == 0) {
-                avg = Decimal(int64_t(sum_integer / count));
-            } else {
-                avg = Decimal(sum_integer) / Decimal(count);
-            }
-            return Conversions::pack_decimal(avg);
-        } else if (type == Conversions::OpType::DECIMAL) {
-            auto avg = sum_decimal / Decimal(count);
-            return Conversions::pack_decimal(avg);
-        } else if (type == Conversions::OpType::FLOAT) {
-            auto avg = sum_float / count;
-            return Conversions::pack_float(avg);
-        } else if (type == Conversions::OpType::DOUBLE) {
-            auto avg = sum_double / count;
-            return Conversions::pack_double(avg);
-        } else {
-            return ObjectId::get_null();
-        }
-    }
-
-    std::ostream& print(std::ostream& os) const override
-    {
-        os << "AVG(";
-        BindingExprPrinter printer(os);
-        printer.print(*expr);
-        os << ")";
-        return os;
-    }
-
 private:
-    Conversions::OpType type;
-
-    int64_t sum_integer;
-    Decimal sum_decimal;
-    float sum_float;
-    double sum_double;
-
-    int64_t count = 0;
+    NumericAggregateState state;
+    std::set<ObjectId> seen;
 };
+using AggAvg = AggNumeric<true, false>;
+using AggSum = AggNumeric<false, false>;
+using AggAvgDistinct = AggNumeric<true, true>;
+using AggSumDistinct = AggNumeric<false, true>;
 
 class AggCount : public Agg {
 public:
@@ -300,7 +296,7 @@ public:
         if (max.is_null()) {
             max = oid;
         } else if (!oid.is_null()) {
-            auto cmp = SPARQL::Comparisons::compare(oid, max);
+            auto cmp = SPARQL::Comparisons::compare_for_order(oid, max);
             if (cmp > 0) {
                 max = oid;
             }
@@ -337,7 +333,7 @@ public:
         if (min.is_null()) {
             min = oid;
         } else if (!oid.is_null()) {
-            auto cmp = SPARQL::Comparisons::compare(oid, min);
+            auto cmp = SPARQL::Comparisons::compare_for_order(oid, min);
             if (cmp < 0) {
                 min = oid;
             }
@@ -396,104 +392,6 @@ private:
     ObjectId sample;
 };
 
-class AggSum : public Agg {
-public:
-    using Agg::Agg;
-    void begin() override
-    {
-        sum_integer = 0;
-        sum_decimal = Decimal();
-        sum_float = 0;
-        sum_double = 0;
-
-        type = Conversions::OpType::INTEGER;
-    }
-
-    void process() override
-    {
-        if (type == Conversions::OpType::INVALID) {
-            return;
-        }
-
-        auto oid = expr->eval(*binding);
-        auto op_type = Conversions::calculate_optype(oid);
-
-        if (op_type > Conversions::OpType::DOUBLE) {
-            type = Conversions::OpType::INVALID;
-            return;
-        }
-
-        if (op_type > type) {
-            if (op_type == Conversions::OpType::DECIMAL) {
-                sum_decimal = Decimal(sum_integer);
-                type = Conversions::OpType::DECIMAL;
-            } else if (op_type == Conversions::OpType::FLOAT) {
-                if (type == Conversions::OpType::INTEGER) {
-                    sum_float = sum_integer;
-                } else {
-                    sum_float = sum_decimal.to_float();
-                }
-                type = Conversions::OpType::FLOAT;
-            } else {
-                if (type == Conversions::OpType::INTEGER) {
-                    sum_double = sum_integer;
-                } else if (type == Conversions::OpType::DECIMAL) {
-                    sum_double = sum_decimal.to_double();
-                } else {
-                    sum_double = sum_float;
-                }
-                type = Conversions::OpType::DOUBLE;
-            }
-        }
-
-        if (type == Conversions::OpType::INTEGER) {
-            sum_integer += Conversions::unpack_int(oid);
-        } else if (type == Conversions::OpType::DECIMAL) {
-            sum_decimal = sum_decimal + Conversions::to_decimal(oid);
-        } else if (type == Conversions::OpType::FLOAT) {
-            sum_float += Conversions::to_float(oid);
-        } else {
-            sum_double += Conversions::to_double(oid);
-        }
-    }
-
-    ObjectId get() override
-    {
-        switch (type) {
-        case Conversions::OpType::INTEGER:
-            return Conversions::pack_int(sum_integer);
-        case Conversions::OpType::DECIMAL:
-            return Conversions::pack_decimal(sum_decimal);
-        case Conversions::OpType::FLOAT:
-            return Conversions::pack_float(sum_float);
-        case Conversions::OpType::DOUBLE:
-            return Conversions::pack_double(sum_double);
-        case Conversions::OpType::TENSOR_FLOAT:
-        case Conversions::OpType::TENSOR_DOUBLE:
-        case Conversions::OpType::INVALID:
-        default:
-            return ObjectId::get_null();
-        }
-    }
-
-    std::ostream& print(std::ostream& os) const override
-    {
-        os << "SUM(";
-        BindingExprPrinter printer(os);
-        printer.print(*expr);
-        os << ")";
-        return os;
-    }
-
-private:
-    Conversions::OpType type;
-
-    int64_t sum_integer;
-    Decimal sum_decimal;
-    float sum_float;
-    double sum_double;
-};
-
 class AggCountAllDistinct : public Agg {
 public:
     AggCountAllDistinct(VarId var_id, std::unique_ptr<BindingExpr> expr, std::vector<VarId> vars)
@@ -536,24 +434,6 @@ public:
     std::ostream& print(std::ostream& os) const override { return os << "AggGroupConcatDistinct"; }
 private:
     std::string separator;
-};
-
-class AggAvgDistinct : public Agg {
-public:
-    using Agg::Agg;
-    void begin() override { }
-    void process() override { }
-    ObjectId get() override { return ObjectId::get_null(); }
-    std::ostream& print(std::ostream& os) const override { return os << "AggAvgDistinct"; }
-};
-
-class AggSumDistinct : public Agg {
-public:
-    using Agg::Agg;
-    void begin() override { }
-    void process() override { }
-    ObjectId get() override { return ObjectId::get_null(); }
-    std::ostream& print(std::ostream& os) const override { return os << "AggSumDistinct"; }
 };
 
 } // namespace SPARQL

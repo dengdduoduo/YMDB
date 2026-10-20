@@ -209,14 +209,18 @@ public:
 
     static ObjectId pack_float(float f) {
         std::ostringstream text;
-        text << std::setprecision(std::numeric_limits<float>::max_digits10) << f;
+        if (std::isnan(f)) text << "NaN";
+        else if (std::isinf(f)) text << (f < 0 ? "-INF" : "INF");
+        else text << std::setprecision(std::numeric_limits<float>::max_digits10) << f;
         return ObjectId(RdfTermRegistry::Pack(ObjectId::MASK_FLOAT,
             {'L', text.str(), std::string(RdfTermIdentity::kXsd) + "float"}));
     }
 
     static ObjectId pack_double(double d) {
         std::ostringstream text;
-        text << std::setprecision(std::numeric_limits<double>::max_digits10) << d;
+        if (std::isnan(d)) text << "NaN";
+        else if (std::isinf(d)) text << (d < 0 ? "-INF" : "INF");
+        else text << std::setprecision(std::numeric_limits<double>::max_digits10) << d;
         return ObjectId(RdfTermRegistry::Pack(ObjectId::MASK_DOUBLE_EXTERN,
             {'L', text.str(), std::string(RdfTermIdentity::kXsd) + "double"}));
     }
@@ -483,6 +487,11 @@ public:
         default:
             return 0.0;
         }
+    }
+
+    static bool numeric_is_nan(ObjectId oid) {
+        const auto type = calculate_optype(oid);
+        return (type == OpType::FLOAT || type == OpType::DOUBLE) && std::isnan(to_double(oid));
     }
 
     static float to_float(ObjectId oid) {

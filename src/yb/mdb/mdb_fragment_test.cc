@@ -6,6 +6,9 @@
 
 #include "graph_models/rdf_model/conversions.h"
 #include "query/executor/binding.h"
+#include "query/executor/binding_iter/aggregation/sparql/aggs.h"
+#include "query/executor/binding_iter/binding_expr/binding_expr_var.h"
+#include "query/executor/binding_iter/binding_expr/sparql/binding_expr_greater_or_equal.h"
 #include "query/executor/binding_iter/binding_expr/binding_expr_term.h"
 #include "query/executor/binding_iter/binding_expr/sparql/binding_expr_addition.h"
 #include "query/executor/binding_iter/binding_expr/sparql/binding_expr_subtraction.h"
@@ -20,6 +23,98 @@
 
 namespace yb::mdb {
 namespace {
+
+TEST(MdbFragmentTest, NumericAggregateTypePromotionAndBoundaries) {
+  using SPARQL::Conversions;
+  using State = SPARQL::NumericAggregateState;
+  State empty;
+  ASSERT_EQ(Conversions::to_integer(empty.get(false)), 0);
+  ASSERT_EQ(Conversions::to_integer(empty.get(true)), 0);
+  State total;
+  total.add(Conversions::pack_int(std::numeric_limits<int64_t>::max()));
+  total.add(Conversions::pack_int(1));
+  ASSERT_TRUE(total.get(false).is_null());
+  total.add(Conversions::pack_int(-std::numeric_limits<int64_t>::max()));
+  ASSERT_EQ(Conversions::to_integer(total.get(false)), 1);
+  State low;
+  low.add(Conversions::pack_int(std::numeric_limits<int64_t>::min()));
+  ASSERT_EQ(Conversions::to_integer(low.get(false)), std::numeric_limits<int64_t>::min());
+  ASSERT_EQ(Conversions::calculate_optype(low.get(true)), Conversions::OpType::DECIMAL);
+  State mixed;
+  mixed.add(Conversions::pack_int(1));
+  mixed.add(Conversions::try_pack_string_datatype(std::string(SPARQL::RdfTermIdentity::kXsd) + "decimal", "2.5"));
+  mixed.add(Conversions::pack_float(3.5));
+  ASSERT_EQ(Conversions::calculate_optype(mixed.get(false)), Conversions::OpType::FLOAT);
+  mixed.add(Conversions::pack_double(1));
+  ASSERT_EQ(Conversions::calculate_optype(mixed.get(false)), Conversions::OpType::DOUBLE);
+  ASSERT_EQ(Conversions::to_double(mixed.get(false)), 8);
+  ASSERT_EQ(Conversions::to_double(mixed.get(true)), 2);
+  State missing;
+  missing.add(::ObjectId::get_null());
+  ASSERT_TRUE(missing.get(false).is_null());
+  ASSERT_EQ(Conversions::to_integer(missing.get(true)), 0);
+  missing.add(Conversions::pack_int(1));
+  ASSERT_TRUE(missing.get(true).is_null());
+  State invalid;
+  invalid.add(Conversions::pack_iri("urn:not:numeric"));
+  ASSERT_TRUE(invalid.get(false).is_null());
+  ASSERT_TRUE(invalid.get(true).is_null());
+  State special;
+  special.add(Conversions::pack_double(std::numeric_limits<double>::infinity()));
+  ASSERT_EQ(Conversions::to_lexical_str(special.get(false)), "INF");
+  special.add(Conversions::pack_double(-std::numeric_limits<double>::infinity()));
+  ASSERT_TRUE(std::isnan(Conversions::to_double(special.get(false))));
+  ASSERT_EQ(Conversions::to_lexical_str(special.get(true)), "NaN");
+  Binding comparison_binding(0);
+  SPARQL::BindingExprGreaterOrEqual unordered(
+      std::make_unique<BindingExprTerm>(special.get(false)),
+      std::make_unique<BindingExprTerm>(Conversions::pack_int(0)));
+  ASSERT_EQ(unordered.eval(comparison_binding).id, ::ObjectId::BOOL_FALSE);
+  ASSERT_LT(SPARQL::Comparisons::compare_for_order(special.get(false), Conversions::pack_int(0)), 0);
+  ASSERT_LT(SPARQL::Comparisons::compare_for_order(Conversions::pack_int(9007199254740992LL),
+      Conversions::try_pack_string_datatype(std::string(SPARQL::RdfTermIdentity::kXsd) + "decimal",
+          "9007199254740993.0")), 0);
+  State precise;
+  precise.add(Conversions::try_pack_string_datatype(std::string(SPARQL::RdfTermIdentity::kXsd) + "decimal", "1.234567890123456789"));
+  ASSERT_TRUE(precise.get(false).is_null());
+  State cancellation;
+  const std::string datatype = std::string(SPARQL::RdfTermIdentity::kXsd) + "decimal";
+  const std::string large = "1" + std::string(100, '0') + ".0";
+  const std::string small = "0." + std::string(99, '0') + "1";
+  for (const auto& text : {large, small, "-" + large})
+    cancellation.add(Conversions::try_pack_string_datatype(datatype, text));
+  ASSERT_FALSE(cancellation.get(false).is_null());
+  ASSERT_NEAR(Conversions::to_double(cancellation.get(false)), 1e-100, 1e-115);
+}
+
+TEST(MdbFragmentTest, AggregateDistinctResetAndValueExtrema) {
+  using SPARQL::Conversions;
+  Binding binding(1);
+  SPARQL::AggSumDistinct sum(VarId(0), std::make_unique<BindingExprVar>(VarId(0)));
+  SPARQL::AggAvgDistinct average(VarId(0), std::make_unique<BindingExprVar>(VarId(0)));
+  SPARQL::AggMin minimum(VarId(0), std::make_unique<BindingExprVar>(VarId(0)));
+  SPARQL::AggMax maximum(VarId(0), std::make_unique<BindingExprVar>(VarId(0)));
+  for (Agg* agg : std::vector<Agg*>{&sum, &average, &minimum, &maximum}) {
+    agg->set_binding(binding); agg->begin();
+    for (int64_t value : {2, 2, 10, -4}) {
+      binding.add(VarId(0), Conversions::pack_int(value)); agg->process();
+    }
+  }
+  ASSERT_EQ(Conversions::to_integer(sum.get()), 8);
+  ASSERT_NEAR(Conversions::to_double(average.get()), 8.0 / 3, 1e-15);
+  ASSERT_EQ(Conversions::to_integer(minimum.get()), -4);
+  ASSERT_EQ(Conversions::to_integer(maximum.get()), 10);
+  sum.begin(); average.begin(); minimum.begin(); maximum.begin();
+  ASSERT_EQ(Conversions::to_integer(sum.get()), 0);
+  ASSERT_EQ(Conversions::to_integer(average.get()), 0);
+  ASSERT_TRUE(minimum.get().is_null()); ASSERT_TRUE(maximum.get().is_null());
+  for (const auto& text : {"urn:z", "urn:a"}) {
+    binding.add(VarId(0), Conversions::pack_iri(text));
+    minimum.process(); maximum.process();
+  }
+  ASSERT_EQ(Conversions::to_lexical_str(minimum.get()), "urn:a");
+  ASSERT_EQ(Conversions::to_lexical_str(maximum.get()), "urn:z");
+}
 
 TEST(MdbFragmentTest, ProjectionIntegerBoundariesAndErrorPropagation) {
   const int64_t high = std::numeric_limits<int64_t>::max();

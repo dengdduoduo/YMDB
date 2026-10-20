@@ -26,7 +26,7 @@ Supported envelopes:
   Group-only SELECT ordering and ordered ungrouped COUNT are supported too.
   The constructor defers grouped ordering until aggregate bindings exist.
 * Bounded HAVING predicates: COUNT variants, int64/boolean
-  constants, six comparisons and AND/OR/NOT. Relational operands are COUNTs or
+  constants, six comparisons and AND/OR/NOT. Relational operands are aggregates or
   int64 constants; group-variable operands are supported in equality/inequality.
   HAVING-only aggregates are registered as private slots. Conditions run after
   aggregation and before ordering, DISTINCT and slicing. SELECT expression
@@ -35,6 +35,25 @@ Supported envelopes:
   bytes; they are not assumed to use the legacy inline representation.
 * Global term identity uses the existing typed RDF mapping, not printed text or
   raw numeric storage-ID ordering. ORDER BY uses compare_for_order.
+* SUM/AVG/MIN/MAX with variable arguments, including DISTINCT, finalize over
+  the complete gathered input. SUM/AVG support integer/decimal/float/double
+  promotion; DISTINCT uses typed RDF identities across all fragments. MIN/MAX
+  use the same value/term ordering as ORDER BY, ignoring unbound inputs.
+  HAVING accepts these aggregates and SELECT extensions accept numeric SUM/AVG.
+  MIN/MAX have unknown result types and are not advertised as arithmetic inputs.
+  Empty ungrouped SUM/AVG return integer zero, MIN/MAX remain unbound. SUM of
+  expression errors or non-numeric terms is unbound; AVG with zero bound values
+  returns zero, otherwise such errors make it unbound.
+  Integer SUM totals are exact up to signed int64 result range, with overflow
+  represented as an unbound result; prefixes do not prematurely overflow.
+  Decimal inputs/results are bounded to 18 significant digits, exponent
+  -100..100, with result rounding to that precision and at most 256 lexical
+  input bytes. Values outside these decimal bounds yield an expression error.
+  Floating arithmetic follows the existing IEEE float/double model, including
+  canonical INF/-INF/NaN output. This does not claim arbitrary precision.
+  Ordered comparisons with NaN are false; ORDER BY/MIN/MAX place NaN before
+  other numeric terms deterministically. Integer/decimal comparison uses exact
+  normalized digits instead of converting their values to double.
 * Post-aggregate SELECT expressions support COUNT variants, signed int64
   constants, addition/subtraction and preceding numeric SELECT aliases. They
   run after HAVING and before ORDER BY, DISTINCT and slicing. Forward aliases
@@ -44,11 +63,12 @@ Supported envelopes:
 
 Fallback is decided before remote work: OPTIONAL, UNION, subqueries, paths,
 FILTER/BIND envelopes, computed ORDER BY/GROUP BY expressions,
-other aggregates and constant-only BGPs retain the existing coordinator path.
-Grouped ordering keys must be group variables or projected COUNT aliases;
+other aggregates, computed aggregate arguments and constant-only BGPs retain
+the existing coordinator path.
+Grouped ordering keys must be group variables or projected expression aliases;
 computed ordering and non-grouped keys remain outside this capability.
 This capability fallback does not certify unimplemented legacy operator
-semantics. General HAVING expressions, other projection expressions and numeric/distinct aggregates
+semantics. General HAVING expressions and other projection expressions
 remain incomplete. P7 does not silently advertise these as distributed
 capabilities. Hash/auto join policies
 also retain the P5 coordinator implementation.
@@ -61,7 +81,8 @@ cancellation fails the query; there is no runtime retry or coordinator fallback.
 WorkerOptions::coordinator_memory_bytes (CLI --mdb_global_memory_bytes) defaults
 to 64 MiB. Each gathered row reserves
 1024 + 128 * final_variable_count + 16 * count_distinct_star_sets * final_variable_count
-+ 16 * order_key_count + 64 * having_node_count + 512 * computed_select_node_count bytes,
++ 16 * order_key_count + 64 * having_node_count + 512 * computed_select_node_count
++ 512 * having_value_aggregate_count bytes,
 covering input vector growth and conservative per-row slack for retained binding
 arrays, sort keys/indices, DISTINCT trees and COUNT DISTINCT sets. This is a bounded
 input admission reservation. Each COUNT(DISTINCT *) is charged for its own full
@@ -74,7 +95,7 @@ not measured process RSS or a universal allocator
 limit. Shared dictionaries, YB client infrastructure and output decoding are
 excluded. Unsupported unbounded expression/concatenation aggregates are not
 admitted into this path. Exceeding the reservation fails before global output.
-final_variable_count includes future private slots for HAVING and nested SELECT COUNTs;
+final_variable_count includes future private slots for HAVING and nested SELECT aggregates;
 count_distinct_star_sets includes both SELECT and HAVING sets. HAVING is limited
 to 128 nodes, depth 16, 16 aggregates and 128 final variables. These bounds are
 checked before remote work. The small bounded expression tree and empty-input
@@ -86,8 +107,12 @@ Direct projected COUNTs retain their existing admission charge. Each computed
 node reserves space for intermediate integer dictionary identities and row
 state. Unknown-type group variables in arithmetic, functions, multiplication,
 division and other aggregates retain the coordinator path before launch.
+Each SELECT value aggregate charges one computed node (512 bytes per input
+row); each HAVING value aggregate adds another 512 bytes. This covers bounded
+numeric state, result identities and its own scalar DISTINCT tree. MIN/MAX
+need no DISTINCT tree because duplicate elimination cannot change an extremum.
 
-The COUNT predicate boundary excludes arithmetic, functions, computed COUNT
+The HAVING predicate boundary excludes arithmetic, functions, computed aggregate
 arguments, nested/other aggregates, general literals, SELECT-alias references
 and bare group variables as effective-boolean conditions. Unsupported forms
 retain the coordinator path before launch. Invalid comparisons are expression
@@ -130,5 +155,9 @@ SELECT coverage checks complete grouped and ungrouped results, alias chains,
 hidden COUNT variants, arithmetic error propagation, ordering and slicing,
 empty inputs, exact reservation boundaries and recovery after worker/output
 failure. Unit tests exercise both signed int64 overflow boundaries.
+Value-aggregate coverage checks all four aggregates, DISTINCT, value ordering,
+integer cancellation/overflow, decimal/float/double promotion, empty and error
+inputs, exact budget admission and cancellation/failure recovery. These tests
+do not establish multi-host performance or arbitrary-precision arithmetic.
 Semantics follow SPARQL 1.1 sections 18.2.4 and 18.2.5:
 https://www.w3.org/TR/sparql11-query/#convertSolMod
