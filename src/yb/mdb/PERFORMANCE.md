@@ -145,3 +145,30 @@ Unique keys may not benefit, and full-page/multi-page fanout may fall back.
 Measure remote storage operation counts and complete end-to-end results for
 all shapes, not just the shared-key case. The wire protocol, Gather accounting,
 default join strategies and global/exchange execution remain unchanged.
+
+
+## Worker leaf lookahead batches
+
+The last triple can look ahead at up to eight raw parent-page rows. It rebinds
+each candidate with the current prefix, groups identical known IDs/permutation,
+and flushes their first pages together through DocDBScanCursor::NextBatches.
+Emission keeps depth-first row order and rechecks every binding. Complete
+first pages may serve duplicate keys within the window; partial pages transfer
+their own cursor/continuation exactly once. Intermediate levels keep streaming.
+A parent generation changes on new pages and on cached-page reopen, so reused
+parent data cannot retain an earlier prefix's lookahead window.
+
+Additional cursor/page storage is charged against memory_bytes minus the
+unchanged FragmentBufferedReservation. Each slot reserves its object state,
+8192 bytes plus page_rows*256 and variable_count*16 bytes. At most eight slots
+are reserved. Fewer than two affordable slots disables lookahead and keeps the
+original serial path; the original minimum memory remains valid. This is a
+conservative buffered-state reservation, not a total RSS or allocator proof.
+All probes use the same child snapshot/session, deadline and restart checks.
+
+MDB_WORKER_IO_PROFILE=1 enables one stderr JSON record per successful fragment
+before EOF: logical read operations, synchronous flush rounds, maximum queued
+reads, prefetch hits, base and additional reservations. A flush is not a wire
+RPC. Diagnostics are opt-in; the protobuf protocol and default join strategy
+are unchanged. Process reuse and batching at intermediate levels remain work
+for separate milestones.

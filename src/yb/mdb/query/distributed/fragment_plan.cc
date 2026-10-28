@@ -236,6 +236,11 @@ Status FragmentPlan::ValidateCoverage(const std::vector<TabletInfo>& tasks) {
   return Status::OK();
 }
 
+uint64_t FragmentBufferedReservation(const FragmentOpenPB& open) {
+  return 4 * kFragmentMaxFrame + uint64_t(open.triples_size()) *
+      (uint64_t(open.variable_count()) * 8 + uint64_t(open.page_rows()) * 96 + 4096);
+}
+
 Status ValidateFragmentOpen(const FragmentOpenPB& open) {
   if (open.id_namespace() != "rdf_idmap-v1" || open.master_addresses().empty() ||
       open.keyspace().empty() || open.table_ids_size() != 6 || !open.has_transaction() ||
@@ -247,8 +252,7 @@ Status ValidateFragmentOpen(const FragmentOpenPB& open) {
       !open.timeout_ms() || open.timeout_ms() > 30000)
     return STATUS(InvalidArgument, "MDB fragment dimensions exceed supported limits");
   // Include all frame copies, depth-first bindings, decoded pages and protocol slack.
-  const uint64_t reserved = 4 * kFragmentMaxFrame + uint64_t(open.triples_size()) *
-      (uint64_t(open.variable_count()) * 8 + uint64_t(open.page_rows()) * 96 + 4096);
+  const uint64_t reserved = FragmentBufferedReservation(open);
   if (open.memory_bytes() < reserved || open.memory_bytes() > 64 * 1024 * 1024)
     return STATUS(RuntimeError, "MDB fragment buffered-state budget exceeded");
   for (const auto& id : open.table_ids()) if (id.empty())

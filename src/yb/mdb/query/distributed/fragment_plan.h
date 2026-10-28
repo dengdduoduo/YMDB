@@ -45,6 +45,7 @@ struct FragmentPlan {
 };
 
 // Validation also runs at the worker boundary before allocation or storage reads.
+uint64_t FragmentBufferedReservation(const FragmentOpenPB& open);
 Status ValidateFragmentOpen(const FragmentOpenPB& open);
 
 }  // namespace yb::mdb

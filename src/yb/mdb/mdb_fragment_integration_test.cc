@@ -3442,3 +3442,136 @@ TEST_F(MdbWorkerProbeTest, CacheHitsStillHonorCancellationAndDeadline) {
 }
 }  // namespace
 }  // namespace yb::mdb
+
+
+namespace yb::mdb {
+namespace {
+class MdbWorkerBatchTest : public MdbWorkerProbeTest {
+ protected:
+  Rows SeedUnique(size_t count, size_t fanout = 1) {
+    Rows expected;
+    for (uint64_t s = 101; s < 101 + count; ++s) {
+      Write(s,9000,10000+s);
+      for (uint64_t j = 0; j < fanout; ++j) {
+        Write(10000+s,9001,20000+j);
+        expected.insert({s,20000+j});
+      }
+    }
+    return expected;
+  }
+};
+
+TEST_F(MdbWorkerBatchTest, DifferentKeysPreserveEveryRowAcrossCredits) {
+  const auto expected = SeedUnique(128);
+  ASSERT_OK(RdfYBModel::Instance().Flush());
+  const auto plan = Plan({{-1,9000,-2},{-2,9001,-3}},3,{0,2},16,1);
+  ASSERT_OK(plan);
+  for (size_t workers : {1,3}) {
+    Rows actual; uint64_t reads = 0;
+    ASSERT_OK(Read(*plan,&actual,&reads,workers));
+    ASSERT_EQ(actual,expected);
+  }
+}
+
+TEST_F(MdbWorkerBatchTest, RepeatedParentVariablesAndMissingProbesKeepBag) {
+  Rows expected;
+  for (uint64_t s = 101; s < 197; ++s) {
+    Write(s,9000,s+10000);
+    if (s % 2 == 0) {
+      Write(s,9000,s);
+      if (s % 4 == 0) {
+        Write(s,9001,20001); Write(s,9001,20002);
+        expected.insert({s,20001}); expected.insert({s,20002});
+      }
+    }
+  }
+  ASSERT_OK(RdfYBModel::Instance().Flush());
+  const auto plan=Plan({{-1,9000,-1},{-1,9001,-2}},2,{0,1},16,1);
+  ASSERT_OK(plan);
+  Rows actual; uint64_t reads=0;
+  ASSERT_OK(Read(*plan,&actual,&reads)); ASSERT_EQ(actual,expected);
+}
+
+TEST_F(MdbWorkerBatchTest, DifferentMultiPageProbesRetainTheirOwnContinuations) {
+  const auto expected=SeedUnique(32,17);
+  ASSERT_OK(RdfYBModel::Instance().Flush());
+  const auto plan=Plan({{-1,9000,-2},{-2,9001,-3}},3,{0,2},4,2);
+  ASSERT_OK(plan);
+  Rows actual; uint64_t reads=0;
+  ASSERT_OK(Read(*plan,&actual,&reads)); ASSERT_EQ(actual,expected);
+}
+
+TEST_F(MdbWorkerBatchTest, ParentPageReuseRebindsPrefixBeforeLeafLookahead) {
+  Seed(64);
+  Rows expected;
+  for (uint64_t s=101;s<165;++s) {
+    const uint64_t middle=s%2 ? 1001 : 1002;
+    Write(middle,9002,s); expected.insert({s,middle});
+  }
+  ASSERT_OK(RdfYBModel::Instance().Flush());
+  const auto plan=Plan({{-1,9000,-2},{-2,9001,-3},{-3,9002,-1}},3,{0,2},4,1);
+  ASSERT_OK(plan);
+  Rows actual; uint64_t reads=0;
+  ASSERT_OK(Read(*plan,&actual,&reads)); ASSERT_EQ(actual,expected);
+}
+
+TEST_F(MdbWorkerBatchTest, ExactMinimumBudgetFallsBackWithoutDroppingRows) {
+  const auto expected=SeedUnique(32,3);
+  ASSERT_OK(RdfYBModel::Instance().Flush());
+  auto plan=Plan({{-1,9000,-2},{-2,9001,-3}},3,{0,2},4,1);
+  ASSERT_OK(plan);
+  const auto minimum=FragmentBufferedReservation(plan->physical);
+  plan->physical.set_memory_bytes(minimum);
+  Rows actual; uint64_t reads=0;
+  ASSERT_OK(Read(*plan,&actual,&reads)); ASSERT_EQ(actual,expected);
+  plan->physical.set_memory_bytes(minimum-1);
+  Rows rejected; ASSERT_NOK(Read(*plan,&rejected,&reads)); ASSERT_TRUE(rejected.empty());
+  plan->physical.set_memory_bytes(workers_.memory_bytes);
+  Rows recovered; ASSERT_OK(Read(*plan,&recovered,&reads)); ASSERT_EQ(recovered,expected);
+}
+
+TEST_F(MdbWorkerBatchTest, CancelledOrExpiredPrefetchCanRecover) {
+  const auto expected=SeedUnique(96);
+  ASSERT_OK(RdfYBModel::Instance().Flush());
+  const auto plan=Plan({{-1,9000,-2},{-2,9001,-3}},3,{0,2},16,1);
+  ASSERT_OK(plan);
+  auto options=workers_; options.page_rows=16; options.batch_rows=1;
+  for (bool cancel : {true,false}) {
+    auto view=RdfYBModel::Instance().NewQueryReadContext(); ASSERT_OK(view);
+    size_t callbacks=0;
+    auto status=GatherFragments(*plan,options,**view,[&](const auto&) {
+      if (++callbacks==1) {
+        if(cancel) (*view)->cancelled=true;
+        else (*view)->deadline=CoarseMonoClock::Now();
+      }
+      return Status::OK();
+    });
+    ASSERT_NOK(status); ASSERT_EQ(callbacks,1);
+  }
+  Rows actual; uint64_t reads=0;
+  ASSERT_OK(Read(*plan,&actual,&reads)); ASSERT_EQ(actual,expected);
+}
+}  // namespace
+}  // namespace yb::mdb
+
+
+namespace yb::mdb {
+namespace {
+TEST_F(MdbWorkerBatchTest, ConcurrentCommitDoesNotMoveLookaheadReadView) {
+  const auto expected=SeedUnique(96);
+  ASSERT_OK(RdfYBModel::Instance().Flush());
+  const auto plan=Plan({{-1,9000,-2},{-2,9001,-3}},3,{0,2},16,1);
+  ASSERT_OK(plan);
+  auto view=RdfYBModel::Instance().NewQueryReadContext(); ASSERT_OK(view);
+  auto fresh_expected=expected;
+  for(uint64_t s=101;s<197;++s) {
+    Write(10000+s,9001,30000); fresh_expected.insert({s,30000});
+  }
+  ASSERT_OK(RdfYBModel::Instance().Flush());
+  Rows snapshot; uint64_t reads=0;
+  ASSERT_OK(ReadView(*plan,**view,&snapshot,&reads)); ASSERT_EQ(snapshot,expected);
+  Rows fresh;
+  ASSERT_OK(Read(*plan,&fresh,&reads)); ASSERT_EQ(fresh,fresh_expected);
+}
+}  // namespace
+}  // namespace yb::mdb
