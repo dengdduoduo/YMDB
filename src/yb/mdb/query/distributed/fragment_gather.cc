@@ -2,8 +2,10 @@
 #include "yb/mdb/query/distributed/fragment_gather.h"
 
 #include <algorithm>
+#include <cerrno>
 #include <chrono>
 #include <memory>
+#include <poll.h>
 #include <unistd.h>
 
 #include "yb/mdb/query/distributed/fragment_transport.h"
@@ -30,6 +32,7 @@ struct Stream {
   // remote pull loop; an in-progress remote read remains bounded by its deadline.
   std::unique_ptr<Subprocess> process;
   FragmentRequestPB request;
+  FragmentFrameReader reader;
   uint64_t read_operations = 0;
 };
 
@@ -143,14 +146,38 @@ Status GatherFragments(const FragmentPlan& plan, const WorkerOptions& options,
   };
   for (auto& stream : active) RETURN_NOT_OK(open_ack(*stream));
   size_t current = 0;
+  auto read_ready = [&](FragmentResponsePB* response) -> Status {
+    std::vector<pollfd> fds;
+    for (const auto& stream : active)
+      fds.push_back({stream->process->from_child_stdout_fd(), POLLIN, 0});
+    for (;;) {
+      if (context.cancelled.load()) return STATUS(Aborted, "MDB Gather cancelled");
+      if (CoarseMonoClock::Now() >= context.deadline)
+        return STATUS(TimedOut, "MDB Gather deadline expired");
+      const auto ready = poll(fds.data(), fds.size(), 20);
+      if (ready < 0 && errno == EINTR) continue;
+      if (ready < 0) return STATUS(IOError, "MDB Gather pipe poll failed");
+      // Rotate preference after each complete frame. A partial frame never
+      // reserves the consumer while another credited stream is ready.
+      for (size_t offset = 0; offset < active.size(); ++offset) {
+        const auto index = (current + offset) % active.size();
+        if (!fds[index].revents) continue;
+        if (fds[index].revents & POLLNVAL)
+          return STATUS(IOError, "MDB Gather invalid worker pipe");
+        bool complete;
+        RETURN_NOT_OK(active[index]->reader.ReadAvailable(
+            fds[index].fd, response, &complete, context.deadline, &context.cancelled));
+        if (complete) { current = index; return Status::OK(); }
+      }
+    }
+  };
   while (!active.empty()) {
-    auto& stream = *active[current];
     FragmentResponsePB response;
     {
       WallTimeScope timer(&context.stats.remote_pull_wait_us);
-      RETURN_NOT_OK(ReadFragmentFrame(stream.process->from_child_stdout_fd(), &response,
-                                     context.deadline, &context.cancelled));
+      RETURN_NOT_OK(read_ready(&response));
     }
+    auto& stream = *active[current];
     RETURN_NOT_OK(CheckResponse(response, stream.request));
     const auto width = plan.physical.projection_size();
     if (response.rows() > options.batch_rows ||

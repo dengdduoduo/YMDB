@@ -61,3 +61,24 @@ API median was 372.93 ms (previous batch 377.21 ms); median cleanup was 12.36 ms
 This is a related no-regression check, not a new speedup claim or a tail-latency
 measurement. Persistent process/client pools are deferred pending measured
 benefit and explicit state/snapshot reset design.
+
+
+## Ready-frame Gather follow-up
+
+Sixteen related Release tests passed: five new frame/progress tests and eleven
+existing cross-tablet, global order/distinct/slice, exchange/composite join,
+snapshot, failure, authenticated SSH, CLI staging, probe/batch cancellation,
+late-exit and Shared4096 fixtures. A real-worker relay gates fragment zero on
+output from another fragment: unchanged code hit the gate timeout; new code
+completed without timeout for zero bytes, a partial header and a partial body.
+The full bag matched in every successful gated run. Pending-frame cancellation
+and expiry failed explicitly and recovered in a fresh query. Frame tests check
+split/back-to-back input, zero/oversized lengths, malformed protobuf and EOF.
+
+Shared4096 rechecked 26 complete typed observations; three-worker median was
+420.11 ms (previous completion-boundary batch 372.93 ms).
+All modes were slower in this sequential recheck, including the untouched
+coordinator control (266.37 to 328.16 ms). This does not isolate a regression
+caused by receive scheduling, or establish a no-regression/speedup claim. The gate proves
+independent progress, not a network benchmark. OPEN and EOF cleanup remain
+synchronous; full distributed exchange/global extensions remain future work.

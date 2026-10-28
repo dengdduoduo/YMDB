@@ -188,3 +188,22 @@ Process/client pools are deferred. Current OPEN timing includes storage/client
 initialization and snapshot setup, so it is not an estimate of reusable startup
 cost. Persistent workers would need explicit snapshot/state reset and failure
 isolation; this change adds neither a service nor a new protocol/configuration.
+
+
+## Ready-frame Gather
+
+After OPEN, Gather polls all credited worker outputs and consumes the next
+complete ready frame, rotating preference among ready streams. Each stream's
+incremental reader preserves a partial four-byte header or body without
+blocking other streams. It accepts at most the existing 1 MiB frame payload;
+the payload allocation is released after parsing. At most 16 active streams
+can retain one partial payload each (16 MiB payload bound, plus one parsed
+response and allocator/metadata overhead). This transport bound is separate
+from coordinator_memory_bytes, which continues to limit retained operator
+input rather than process RSS. No result-sized queue or extra credit is added.
+
+Per-stream sequence/schema/identity, snapshot and final zero-exit checks remain.
+Unordered query rows may interleave differently; ORDER BY still uses the global
+finalizer. OPEN acknowledgements, EOF cleanup and the sink remain synchronous.
+This is receive-side progress under uneven workers, not parallel exchange
+consumers, external global sorting or a persistent worker service.

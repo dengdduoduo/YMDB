@@ -1,5 +1,7 @@
 // Copyright (c) YugabyteDB, Inc.
 #include <gtest/gtest.h>
+#include <arpa/inet.h>
+#include "yb/mdb/query/distributed/fragment_transport.h"
 #include <limits>
 #include "yb/mdb/import/persistent_id_map.h"
 #include "yb/util/test_thread_holder.h"
@@ -3701,6 +3703,177 @@ TEST_F(MdbWorkerExitTest, EofCleanupHonorsCancellationAndReaps) {
   ASSERT_NO_FATALS(CheckReaped((*view)->stats.remote_worker_pids));
   const auto recovered = Query(kQuery, workers_);
   ASSERT_EQ(recovered.status, 0); ASSERT_EQ(recovered.values.size(), 6);
+}
+}  // namespace
+}  // namespace yb::mdb
+
+
+namespace yb::mdb {
+namespace {
+class MdbReadyGatherTest : public MdbWorkerProbeTest {
+ protected:
+  std::string Relay(const std::string& release, const std::string& expired, size_t prefix) {
+    const auto path = GetTestPath("ready-relay-" + std::to_string(prefix));
+    std::ofstream file(path);
+    file << "#!/usr/bin/python3\nimport os,struct,subprocess,sys,time\n"
+            "worker='" << workers_.binary << "'\nrelease='" << release << "'\nexpired='" << expired << "'\nprefix=" << prefix << R"PY(
+def exact(stream,n):
+    out=b''
+    while len(out)<n:
+        part=stream.read(n-len(out))
+        if not part: raise EOFError('truncated frame')
+        out+=part
+    return out
+def frame(stream):
+    h=exact(stream,4);n=struct.unpack('!I',h)[0]
+    if not 0<n<=1048576: raise ValueError('frame limit')
+    return h+exact(stream,n)
+def varint(data,pos):
+    value=0;shift=0
+    while True:
+        b=data[pos];pos+=1;value|=(b&127)<<shift
+        if b<128:return value,pos
+        shift+=7
+def number(data,field):
+    pos=0
+    while pos<len(data):
+        tag,pos=varint(data,pos);wire=tag&7
+        if wire==0:
+            value,pos=varint(data,pos)
+            if tag>>3==field:return value
+        elif wire==1:pos+=8
+        elif wire==2:n,pos=varint(data,pos);pos+=n
+        elif wire==5:pos+=4
+        else:raise ValueError('wire type')
+    return 0
+p=subprocess.Popen([worker]+sys.argv[1:],stdin=subprocess.PIPE,stdout=subprocess.PIPE)
+first=True
+try:
+    while True:
+        request=frame(sys.stdin.buffer);p.stdin.write(request);p.stdin.flush()
+        response=frame(p.stdout)
+        eof=number(response[4:],9)
+        if first:fragment=number(request[4:],3);first=False
+        elif fragment==0 and not os.path.exists(release):
+            sys.stdout.buffer.write(response[:prefix]);sys.stdout.buffer.flush()
+            until=time.monotonic()+2
+            while not os.path.exists(release) and time.monotonic()<until:time.sleep(.001)
+            if not os.path.exists(release):open(expired,'w').close()
+            response=response[prefix:]
+        sys.stdout.buffer.write(response);sys.stdout.buffer.flush()
+        if eof:break
+    p.stdin.close();sys.exit(p.wait())
+finally:
+    if p.poll() is None:p.kill();p.wait()
+)PY";
+    file.close();
+    std::filesystem::permissions(path, std::filesystem::perms::owner_all);
+    return path;
+  }
+};
+
+TEST_F(MdbReadyGatherTest, OtherWorkersProgressBeforePartialFrameCompletes) {
+  Seed(32);
+  auto plan = Plan({{-1,9000,-2},{-2,9001,-3}},3,{0,2},4,1); ASSERT_OK(plan);
+  Rows expected;
+  for (uint64_t s=101;s<133;++s) for (uint64_t o:{1001,1002}) expected.insert({s,o});
+  for (size_t prefix : {0,2,5}) {
+    const auto release=GetTestPath("release-"+std::to_string(prefix));
+    const auto expired=GetTestPath("expired-"+std::to_string(prefix));
+    auto options=workers_;options.binary=Relay(release,expired,prefix);
+    options.page_rows=4;options.batch_rows=1;
+    auto view=RdfYBModel::Instance().NewQueryReadContext(); ASSERT_OK(view);
+    Rows rows;
+    ASSERT_OK(GatherFragments(*plan,options,**view,[&](const auto& row) {
+      rows.insert(row); std::ofstream signal(release); signal << "ready\n";
+      return Status::OK();
+    }));
+    ASSERT_EQ(rows,expected);
+    ASSERT_FALSE(std::filesystem::exists(expired)) << "prefix=" << prefix;
+    ASSERT_EQ((*view)->stats.remote_fragments,4);
+  }
+}
+
+TEST_F(MdbReadyGatherTest, PendingFrameCancellationDeadlineAndRecovery) {
+  Seed(32);
+  auto plan = Plan({{-1,9000,-2},{-2,9001,-3}},3,{0,2},4,1); ASSERT_OK(plan);
+  for (bool cancel : {true,false}) {
+    const auto release=GetTestPath(cancel?"cancel-release":"deadline-release");
+    const auto expired=GetTestPath(cancel?"cancel-expired":"deadline-expired");
+    auto options=workers_;options.binary=Relay(release,expired,2);
+    options.page_rows=4;options.batch_rows=1;
+    auto view=RdfYBModel::Instance().NewQueryReadContext(); ASSERT_OK(view);
+    size_t callbacks=0;
+    const auto status=GatherFragments(*plan,options,**view,[&](const auto&) {
+      ++callbacks;
+      if(cancel)(*view)->cancelled=true;else (*view)->deadline=CoarseMonoClock::Now();
+      return Status::OK();
+    });
+    ASSERT_TRUE(cancel?status.IsAborted():status.IsTimedOut()) << status;
+    ASSERT_EQ(callbacks,1); ASSERT_FALSE(std::filesystem::exists(expired));
+  }
+  const auto fresh=Query(kQuery,workers_);
+  ASSERT_EQ(fresh.status,0);ASSERT_EQ(fresh.values.size(),64);
+}
+}  // namespace
+}  // namespace yb::mdb
+
+
+namespace yb::mdb {
+namespace {
+class MdbFrameReaderTest : public YBTest {
+ protected:
+  void SetUp() override {
+    YBTest::SetUp(); ASSERT_EQ(pipe(fds_),0); ASSERT_OK(SetFragmentNonblocking(fds_[0]));
+  }
+  void TearDown() override {
+    for(auto fd:fds_) if(fd>=0)close(fd);
+    YBTest::TearDown();
+  }
+  std::string Frame(const std::string& payload) {
+    const auto length=htonl(payload.size());
+    return std::string(reinterpret_cast<const char*>(&length),4)+payload;
+  }
+  void Send(const std::string& bytes) { ASSERT_EQ(write(fds_[1],bytes.data(),bytes.size()),bytes.size()); }
+  Status Read(bool* complete, CoarseTimePoint deadline=CoarseMonoClock::Now()+MonoDelta::FromSeconds(5),
+              const std::atomic<bool>* cancelled=nullptr) {
+    return reader_.ReadAvailable(fds_[0],&response_,complete,deadline,cancelled);
+  }
+  int fds_[2]={-1,-1};
+  FragmentFrameReader reader_;
+  FragmentResponsePB response_;
+};
+
+TEST_F(MdbFrameReaderTest, PartialHeaderBodyAndBackToBackFrames) {
+  FragmentResponsePB expected;expected.set_query_id("ready-test");expected.set_batch_seq(3);
+  const auto frame=Frame(expected.SerializeAsString());
+  bool done=true;ASSERT_OK(Read(&done));ASSERT_FALSE(done);
+  ASSERT_NO_FATALS(Send(frame.substr(0,2)));ASSERT_OK(Read(&done));ASSERT_FALSE(done);
+  ASSERT_NO_FATALS(Send(frame.substr(2,3)));ASSERT_OK(Read(&done));ASSERT_FALSE(done);
+  ASSERT_NO_FATALS(Send(frame.substr(5)+frame));
+  ASSERT_OK(Read(&done));ASSERT_TRUE(done);ASSERT_EQ(response_.SerializeAsString(),expected.SerializeAsString());
+  ASSERT_OK(Read(&done));ASSERT_TRUE(done);ASSERT_EQ(response_.SerializeAsString(),expected.SerializeAsString());
+  ASSERT_OK(Read(&done));ASSERT_FALSE(done);
+}
+
+TEST_F(MdbFrameReaderTest, RejectsOversizedZeroMalformedAndTruncatedFrames) {
+  for(const auto& frame:std::vector<std::string>{std::string(4,'\0'),
+      Frame(std::string(kFragmentMaxFrame+1,'x')).substr(0,4),Frame(std::string(1,'\xff'))}) {
+    FragmentFrameReader reader;bool done=false;
+    ASSERT_NO_FATALS(Send(frame));
+    const auto status=reader.ReadAvailable(fds_[0],&response_,&done,CoarseMonoClock::Now()+MonoDelta::FromSeconds(5));
+    ASSERT_NOK(status);ASSERT_FALSE(done);
+  }
+  ASSERT_NO_FATALS(Send(Frame("abc").substr(0,5)));close(fds_[1]);fds_[1]=-1;
+  bool done=false;ASSERT_TRUE(Read(&done).IsNetworkError());ASSERT_FALSE(done);
+}
+
+TEST_F(MdbFrameReaderTest, PartialFrameChecksCancellationAndDeadline) {
+  ASSERT_NO_FATALS(Send(std::string(1,'\0')));bool done=false;
+  ASSERT_OK(Read(&done));ASSERT_FALSE(done);
+  std::atomic<bool> cancelled{true};
+  ASSERT_TRUE(Read(&done,CoarseMonoClock::Now()+MonoDelta::FromSeconds(5),&cancelled).IsAborted());
+  cancelled=false;ASSERT_TRUE(Read(&done,CoarseMonoClock::Now(),&cancelled).IsTimedOut());
 }
 }  // namespace
 }  // namespace yb::mdb
