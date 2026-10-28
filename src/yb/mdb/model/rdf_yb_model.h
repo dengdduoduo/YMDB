@@ -58,6 +58,7 @@ class RdfYBModel {
   void SetWorkerOptions(WorkerOptions options) { worker_options_ = std::move(options); }
   const WorkerOptions& GetWorkerOptions() const { return worker_options_; }
 
+  Status RestoreTermMap(IdMap& local_map);
   Result<uint64_t> ResolveTerm(IdMap& local_map, std::string_view term);
   Result<uint64_t> ResolveRdfTerm(
       IdMap& local_map, TripleTermType type, const std::string& lexical,
@@ -135,7 +136,7 @@ class RdfYBModel {
   yb::client::TableHandle tables_[6];
   yb::client::YBSessionPtr write_session_;
   PersistentIdMap term_dictionary_;
-  std::unique_ptr<client::TransactionManager> txn_manager_;
+  std::shared_ptr<client::TransactionManager> txn_manager_;
   client::YBTransactionPtr current_txn_;
   std::shared_ptr<client::YBSession> read_session_;
   DocDBRangeCache caches_[6];

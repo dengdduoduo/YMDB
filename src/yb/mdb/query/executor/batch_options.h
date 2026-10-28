@@ -21,6 +21,19 @@ struct BatchJoinOptions {
 };
 
 struct BatchQueryStats {
+  uint64_t adapter_parse_us = 0;
+  uint64_t adapter_read_view_us = 0;
+  uint64_t adapter_dictionary_us = 0;
+  uint64_t adapter_plan_us = 0;
+  uint64_t adapter_execute_us = 0;
+  uint64_t adapter_total_us = 0;
+  uint64_t storage_flush_us = 0;
+  uint64_t storage_decode_us = 0;
+  uint64_t remote_spawn_us = 0;
+  uint64_t remote_open_wait_us = 0;
+  uint64_t remote_pull_wait_us = 0;
+  uint64_t remote_sink_us = 0;
+  uint64_t remote_cleanup_us = 0;
   uint64_t read_operations = 0;
   uint64_t flush_rounds = 0;
   uint64_t response_payload_bytes = 0;
@@ -46,6 +59,7 @@ struct BatchQueryStats {
   uint64_t estimated_hash_build_rows = 0;
   uint64_t estimated_hash_build_bytes = 0;
   std::string join_decisions;
+  uint64_t remote_read_operations = 0;
   uint64_t remote_fragments = 0;
   uint64_t remote_max_workers = 0;
   uint64_t remote_batches = 0;

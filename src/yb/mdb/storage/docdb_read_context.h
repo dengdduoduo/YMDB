@@ -15,13 +15,14 @@
 namespace yb::mdb {
 
 // Owned by one query, activated explicitly for legacy synchronous operators.
-// The transaction manager and client must outlive this object. Sessions are
-// never shared concurrently, and read restarts fail the query rather than
+// The client must outlive its callbacks. Each transaction retains its manager
+// through delayed RPC destruction. Sessions are never shared concurrently,
+// and read restarts fail the query rather than
 // mixing rows from two views.
 class DocDBReadContext {
  public:
   static Result<std::unique_ptr<DocDBReadContext>> Create(
-      client::YBClient* client, client::TransactionManager* manager);
+      client::YBClient* client, const std::shared_ptr<client::TransactionManager>& manager);
   ~DocDBReadContext();
   Result<ChildTransactionDataPB> ExportChild();
   Status ApplyChild(const ChildTransactionResultPB& result);

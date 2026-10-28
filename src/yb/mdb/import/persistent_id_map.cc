@@ -25,6 +25,7 @@ std::string TermKey(std::string_view term) { return "term:" + std::string(term);
 
 Status PersistentIdMap::Init(client::YBClient* client, const std::string& namespace_name) {
   initialized_ = false;
+  init_stats_ = {};
   if (!client) return STATUS(InvalidArgument, "YBClient is null");
   client_ = client;
   client::YBTableName name(YQL_DATABASE_CQL, namespace_name, kTableName);
@@ -38,7 +39,10 @@ Status PersistentIdMap::Init(client::YBClient* client, const std::string& namesp
   RETURN_NOT_OK(MigrateLegacy(namespace_name));
   RETURN_NOT_OK(EnsureMinimumId(0));
   initialized_ = true;
-  return Status::OK();
+  IdMap restored;
+  auto restore_status = Restore(&restored);
+  if (!restore_status.ok()) initialized_ = false;
+  return restore_status;
 }
 
 Result<std::optional<int64_t>> PersistentIdMap::Read(const std::string& key) {
@@ -124,15 +128,115 @@ Status PersistentIdMap::MigrateLegacy(const std::string& namespace_name) {
     }
   }
   RETURN_NOT_OK(scan_status);
+  init_stats_.legacy_terms = restored.Size();
   RETURN_NOT_OK(EnsureMinimumId(static_cast<int64_t>(restored.MaxId())));
+  if (restored.Size() == 0) return Status::OK();
+  IdMap claims;
+  RETURN_NOT_OK(ScanClaims(&claims));
+  // Validate the entire legacy set before publishing anything. Otherwise a
+  // missing term can claim an ID already owned by a different term.
   for (const auto& [id, term] : restored.Entries()) {
+    const auto by_id = claims.Entries().find(id);
+    if ((claims.Contains(term) && claims.Get(term) != id) ||
+        (by_id != claims.Entries().end() && by_id->second != term)) {
+      return STATUS(Corruption, "Legacy RDF term conflicts with persistent dictionary");
+    }
+  }
+  for (const auto& [id, term] : restored.Entries()) {
+    // Claims are immutable. A strong scan can validate existing claims in
+    // batches; missing claims still arbitrate with concurrent clients by CAS.
+    if (claims.Contains(term)) {
+      ++init_stats_.known_terms;
+      continue;
+    }
+    ++init_stats_.conditional_claims;
     if (!VERIFY_RESULT(CompareExchange(TermKey(term), std::nullopt, id))) {
       auto existing = VERIFY_RESULT(Read(TermKey(term)));
       if (!existing || *existing != static_cast<int64_t>(id)) {
         return STATUS(Corruption, "Legacy RDF term conflicts with persistent dictionary");
       }
+      ++init_stats_.known_terms;
+    } else {
+      ++init_stats_.new_terms;
     }
   }
+  return Status::OK();
+}
+
+Status PersistentIdMap::ScanClaims(IdMap* destination) {
+  constexpr uint64_t kPageRows = 1024;
+  scan_stats_ = {};
+  scan_stats_.page_counts_available = true;
+  IdMap restored;
+  auto session = client_->NewSession(MonoDelta::FromSeconds(60));
+  client::YBqlReadOpPtr previous;
+  auto reset_arena = [](const auto& value) {
+    if constexpr (requires { value->ResetArena(nullptr); }) value->ResetArena(nullptr);
+  };
+  for (;;) {
+    // Keep the preceding operation alive while copying its continuation into
+    // the new arena; completed pages must not accumulate for the whole scan.
+    reset_arena(session);
+    auto op = NewMdbReadOp(table_, session);
+    op->set_yb_consistency_level(YBConsistencyLevel::STRONG);
+    auto* request = op->mutable_request();
+    table_.AddColumns({"term_key", "term_id"}, request);
+    request->set_limit(kPageRows);
+    request->set_return_paging_state(true);
+    if (previous) *request->mutable_paging_state() = previous->response().paging_state();
+    ++scan_stats_.page_read_operations;
+    RETURN_NOT_OK(session->TEST_ApplyAndFlush(op));
+    if (op->response().status() != QLResponsePB::YQL_STATUS_OK) {
+      return STATUS(RuntimeError,
+          "Scan RDF dictionary: " + std::string(op->response().error_message()));
+    }
+    scan_stats_.response_bytes += op->rows_data().size();
+    auto rows = VERIFY_RESULT(op->MakeRowBlock());
+    if (rows.row_count() > kPageRows)
+      return STATUS(Corruption, "RDF dictionary page exceeds its row limit");
+    for (const auto& row : rows.rows()) {
+      ++scan_stats_.rows;
+      if (row.column(0).IsNull() || row.column(1).IsNull())
+        return STATUS(Corruption, "Incomplete persistent RDF dictionary row");
+      const auto key = row.column(0).string_value();
+      const auto id = row.column(1).int64_value();
+      if (key == kCounterKey) continue;
+      if (key.compare(0, 5, "term:") != 0 || id <= 0 ||
+          !restored.Restore(static_cast<uint64_t>(id), std::string_view(key).substr(5))) {
+        return STATUS(Corruption, "Conflicting or invalid persistent RDF dictionary");
+      }
+    }
+    // Empty pages can advance to the next tablet and are not necessarily EOF.
+    if (!op->response().has_paging_state()) break;
+    if (previous) {
+      const auto& before = previous->response().paging_state();
+      const auto& after = op->response().paging_state();
+      if (before.next_partition_key() == after.next_partition_key() &&
+          before.next_row_key() == after.next_row_key()) {
+        return STATUS(Corruption, "RDF dictionary scan continuation did not advance");
+      }
+    }
+    previous = std::move(op);
+  }
+  // Read after scanning: concurrent claims can advance the counter, never
+  // decrease it. A missing/rewound counter must not allocate a reused ID.
+  auto counter = VERIFY_RESULT(Read(kCounterKey));
+  if (!counter || static_cast<uint64_t>(*counter) < restored.MaxId())
+    return STATUS(Corruption, "RDF ID counter precedes persisted claims");
+  *destination = std::move(restored);
+  return Status::OK();
+}
+
+Status PersistentIdMap::Restore(IdMap* destination) {
+  if (!initialized_) return STATUS(IllegalState, "Persistent RDF dictionary is not initialized");
+  if (!destination) return STATUS(InvalidArgument, "Missing RDF dictionary destination");
+  IdMap restored;
+  RETURN_NOT_OK(ScanClaims(&restored));
+  for (const auto& [id, term] : destination->Entries()) {
+    if (!restored.Contains(term) || restored.Get(term) != id)
+      return STATUS(Corruption, "Persistent RDF dictionary conflicts with local mapping");
+  }
+  *destination = std::move(restored);
   return Status::OK();
 }
 

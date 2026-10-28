@@ -59,7 +59,7 @@ void ReplaceSingleValues::visit(OpBind& op_bind)
 
 void ReplaceSingleValues::visit(OpValues& op_values)
 {
-    if (op_values.vars.size() == op_values.values.size()) {
+    if (!op_values.vars.empty() && op_values.row_count == 1) {
         for (size_t i = 0; i < op_values.vars.size(); i++) {
             if (!op_values.has_undef[i]) {
                 assigned_values[op_values.vars[i]] = op_values.values[i];

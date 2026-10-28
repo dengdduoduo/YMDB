@@ -94,6 +94,19 @@ void BatchBindingIter::print(std::ostream& os, int indent, bool stats) const {
 std::string BatchQueryStats::ToJson() const {
   std::string result = "{";
 #define MDB_STAT(name) result += "\"" #name "\":" + std::to_string(name) + ","
+  MDB_STAT(adapter_parse_us);
+  MDB_STAT(adapter_read_view_us);
+  MDB_STAT(adapter_dictionary_us);
+  MDB_STAT(adapter_plan_us);
+  MDB_STAT(adapter_execute_us);
+  MDB_STAT(adapter_total_us);
+  MDB_STAT(storage_flush_us);
+  MDB_STAT(storage_decode_us);
+  MDB_STAT(remote_spawn_us);
+  MDB_STAT(remote_open_wait_us);
+  MDB_STAT(remote_pull_wait_us);
+  MDB_STAT(remote_sink_us);
+  MDB_STAT(remote_cleanup_us);
   MDB_STAT(read_operations); MDB_STAT(flush_rounds); MDB_STAT(response_payload_bytes);
   MDB_STAT(decoded_rows); MDB_STAT(join_operators); MDB_STAT(outer_rows);
   MDB_STAT(unique_probes); MDB_STAT(duplicate_rows); MDB_STAT(negative_cache_hits);
@@ -105,6 +118,7 @@ std::string BatchQueryStats::ToJson() const {
   MDB_STAT(optimizer_missing_stats);
   MDB_STAT(hash_build_right_operators); MDB_STAT(estimated_hash_build_rows);
   MDB_STAT(estimated_hash_build_bytes);
+  MDB_STAT(remote_read_operations);
   MDB_STAT(remote_fragments); MDB_STAT(remote_max_workers); MDB_STAT(remote_batches);
   MDB_STAT(remote_rows); MDB_STAT(remote_response_bytes); MDB_STAT(remote_peak_frame_bytes);
   MDB_STAT(remote_coordinator_fallbacks);

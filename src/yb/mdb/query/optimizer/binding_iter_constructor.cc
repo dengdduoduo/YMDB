@@ -1,3 +1,5 @@
+#include <algorithm>
+#include <iterator>
 #include <cassert>
 #include <iostream>
 #include <map>
@@ -58,6 +60,7 @@
 #include "query/parser/op/sparql/op_group_by.h"
 #include "query/parser/op/sparql/op_having.h"
 #include "query/parser/op/sparql/op_minus.h"
+#include "query/parser/op/sparql/op_join.h"
 #include "query/parser/op/sparql/op_not_exists.h"
 #include "query/parser/op/sparql/op_optional.h"
 #include "query/parser/op/sparql/op_order_by.h"
@@ -115,6 +118,9 @@ void BindingIterConstructor::visit(OpSelect& op_select) {
 
 void BindingIterConstructor::visit(OpAsk& op_ask) {
     op_ask.op->accept_visitor(*this);
+    const auto scope = op_ask.op->get_scope_vars();
+    projection_vars.assign(scope.begin(), scope.end());
+    make_solution_modifier_operators(true, false, op_ask.offset, op_ask.limit);
 }
 
 void BindingIterConstructor::visit(OpDescribe& op_describe) {
@@ -153,13 +159,9 @@ void BindingIterConstructor::visit(OpDescribe& op_describe) {
 
 void BindingIterConstructor::visit(OpConstruct& op_construct) {
     op_construct.op->accept_visitor(*this);
-
-    uint64_t construct_offset = op_construct.offset;
-    uint64_t construct_limit = op_construct.limit;
-
-    if (construct_offset != 0 || construct_limit != 0) {
-        tmp = std::make_unique<Slice>(std::move(tmp), construct_offset, construct_limit);
-    }
+    const auto scope = op_construct.op->get_scope_vars();
+    projection_vars.assign(scope.begin(), scope.end());
+    make_solution_modifier_operators(true, false, op_construct.offset, op_construct.limit);
 }
 
 void BindingIterConstructor::visit(OpBasicGraphPattern& op_bgp) {
@@ -250,9 +252,27 @@ void BindingIterConstructor::visit(OpFilter& op_filter) {
 }
 
 void BindingIterConstructor::visit(OpSequence& op_sequence) {
-    for (auto& op : op_sequence.ops) {
-        op->accept_visitor(*this);
+    if (op_sequence.ops.empty()) {
+        tmp = std::make_unique<SingleResultBindingIter>();
+        return;
     }
+    auto combined = std::move(op_sequence.ops.front());
+    for (size_t i = 1; i < op_sequence.ops.size(); ++i) {
+        auto child = std::move(op_sequence.ops[i]);
+        // BIND extends each preceding solution; it is not an independent
+        // relation evaluated before those variables have been bound.
+        if (auto* bind = dynamic_cast<OpBind*>(child.get());
+            bind && dynamic_cast<OpUnitTable*>(bind->op.get())) {
+            bind->op = std::move(combined);
+            combined = std::move(child);
+        } else {
+            combined = std::make_unique<OpJoin>(std::move(combined), std::move(child));
+        }
+    }
+    // Keep the tree alive: modifier visitors can retain pointers into it.
+    op_sequence.ops.clear();
+    op_sequence.ops.push_back(std::move(combined));
+    op_sequence.ops.front()->accept_visitor(*this);
 }
 
 void BindingIterConstructor::visit(OpUnion& op_union) {
@@ -317,41 +337,44 @@ void BindingIterConstructor::visit(OpOptional& op_optional) {
 }
 
 void BindingIterConstructor::visit(OpMinus& op_minus) {
-    BindingIterConstructor lhs_constructor;
-    lhs_constructor.safe_assigned_vars = safe_assigned_vars;
-    op_minus.lhs->accept_visitor(lhs_constructor);
+    BindingIterConstructor left, right;
+    left.safe_assigned_vars = safe_assigned_vars;
+    right.safe_assigned_vars = safe_assigned_vars;
+    op_minus.lhs->accept_visitor(left);
+    op_minus.rhs->accept_visitor(right);
+    const auto lhs_vars = op_minus.lhs->get_scope_vars();
+    const auto rhs_vars = op_minus.rhs->get_scope_vars();
+    std::vector<VarId> common;
+    std::set_intersection(lhs_vars.begin(), lhs_vars.end(), rhs_vars.begin(), rhs_vars.end(),
+                          std::back_inserter(common));
+    tmp = std::make_unique<Minus>(std::move(left.tmp), std::move(right.tmp),
+        std::move(common), std::vector<VarId>(safe_assigned_vars.begin(), safe_assigned_vars.end()),
+        std::vector<VarId>(lhs_vars.begin(), lhs_vars.end()));
+    const auto safe = op_minus.lhs->get_safe_vars();
+    safe_assigned_vars.insert(safe.begin(), safe.end());
+}
 
-    auto join_vars = calculate_join_vars(*op_minus.lhs, *op_minus.rhs);
-
-    BindingIterConstructor rhs_constructor;
-    rhs_constructor.safe_assigned_vars = join_vars.parent_safe_vars;
-    for (auto& var : join_vars.safe_join_vars) {
-        rhs_constructor.safe_assigned_vars.insert(var);
-    }
-    for (auto& var : join_vars.rhs_fixable_vars) {
-        rhs_constructor.safe_assigned_vars.insert(var);
-    }
-    op_minus.rhs->accept_visitor(rhs_constructor);
-
-    safe_assigned_vars = join_vars.parent_safe_vars;
-    safe_assigned_vars.insert(join_vars.lhs_only_vars.begin(), join_vars.lhs_only_vars.end());
-
-    std::vector<VarId> safe_join_vars_vec(join_vars.safe_join_vars.begin(), join_vars.safe_join_vars.end());
-    std::vector<VarId> unsafe_join_vars_vec(join_vars.unsafe_join_vars.begin(), join_vars.unsafe_join_vars.end());
-    std::vector<VarId> parent_safe_vars_vec(join_vars.parent_safe_vars.begin(), join_vars.parent_safe_vars.end());
-
-    if (join_vars.unsafe_join_vars.empty()) {
-        tmp = std::make_unique<NoFreeVariableMinus>(
-            std::move(lhs_constructor.tmp),
-            std::move(rhs_constructor.tmp));
+void BindingIterConstructor::visit(OpJoin& op_join) {
+    BindingIterConstructor left, right;
+    left.safe_assigned_vars = safe_assigned_vars;
+    op_join.lhs->accept_visitor(left);
+    const auto vars = calculate_join_vars(*op_join.lhs, *op_join.rhs);
+    right.safe_assigned_vars = vars.parent_safe_vars;
+    right.safe_assigned_vars.insert(vars.safe_join_vars.begin(), vars.safe_join_vars.end());
+    right.safe_assigned_vars.insert(vars.rhs_fixable_vars.begin(), vars.rhs_fixable_vars.end());
+    op_join.rhs->accept_visitor(right);
+    if (vars.unsafe_join_vars.empty()) {
+        tmp = std::make_unique<IndexNestedLoopJoin>(std::move(left.tmp), std::move(right.tmp));
     } else {
-        tmp = std::make_unique<Minus>(
-            std::move(lhs_constructor.tmp),
-            std::move(rhs_constructor.tmp),
-            std::move(safe_join_vars_vec),
-            std::move(unsafe_join_vars_vec),
-            std::move(parent_safe_vars_vec));
+        tmp = std::make_unique<NestedLoopJoin>(std::move(left.tmp), std::move(right.tmp),
+            std::vector<VarId>(vars.safe_join_vars.begin(), vars.safe_join_vars.end()),
+            std::vector<VarId>(vars.unsafe_join_vars.begin(), vars.unsafe_join_vars.end()),
+            std::vector<VarId>(vars.parent_safe_vars.begin(), vars.parent_safe_vars.end()),
+            std::vector<VarId>(vars.lhs_only_vars.begin(), vars.lhs_only_vars.end()),
+            std::vector<VarId>(vars.rhs_only_vars.begin(), vars.rhs_only_vars.end()));
     }
+    const auto safe = op_join.get_safe_vars();
+    safe_assigned_vars.insert(safe.begin(), safe.end());
 }
 
 void BindingIterConstructor::visit(OpNotExists& op_not_exists) {
@@ -453,7 +476,10 @@ void BindingIterConstructor::visit(OpValues& op_values) {
         vars_with_undef.emplace_back(op_values.vars[i], op_values.has_undef[i]);
     }
 
-    tmp = std::make_unique<Values>(std::move(vars_with_undef), std::move(op_values.values));
+    std::vector<bool> fixed;
+    for (auto var : op_values.vars) fixed.push_back(safe_assigned_vars.count(var) != 0);
+    tmp = std::make_unique<Values>(std::move(vars_with_undef),
+        std::vector<ObjectId>(op_values.values), std::move(fixed), op_values.row_count);
 
     for (size_t i = 0; i < op_values.vars.size(); i++) {
         if (!op_values.has_undef[i]) {

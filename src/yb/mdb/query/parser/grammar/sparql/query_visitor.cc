@@ -135,7 +135,7 @@ Any QueryVisitor::visitDescribeQuery(SparqlParser::DescribeQueryContext* ctx) {
 Any QueryVisitor::visitAskQuery(SparqlParser::AskQueryContext* ctx) {
     LOG_VISITOR
     visitChildren(ctx);
-    current_op = std::make_unique<OpAsk>(std::move(current_op));
+    current_op = std::make_unique<OpAsk>(std::move(current_op), offset, limit);
     return 0;
 }
 
@@ -737,7 +737,7 @@ Any QueryVisitor::visitInlineDataFull(SparqlParser::InlineDataFullContext* ctx) 
         }
     }
 
-    auto values_op = std::make_unique<OpValues>(std::move(vars), std::move(values));
+    auto values_op = std::make_unique<OpValues>(std::move(vars), std::move(values), ctx->dataBlockValues().size());
     if (current_op != nullptr && dynamic_cast<OpUnitTable*>(current_op.get()) == nullptr) {
         current_op = std::make_unique<OpJoin>(std::move(current_op), std::move(values_op));
     } else {
@@ -2044,7 +2044,7 @@ Any QueryVisitor::visitPathEltOrInverse(SparqlParser::PathEltOrInverseContext* c
             negated_set.push_back(PathAtom(std::move(iri), path_one->INVERSE() != nullptr));
         }
         current_path = std::make_unique<PathNegatedSet>(std::move(negated_set));
-        throw NotSupportedException("PathNegatedSet");
+
     }
 
     current_path_inverse = previous_current_path_inverse;

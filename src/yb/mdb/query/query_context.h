@@ -25,6 +25,10 @@ public:
     ThreadInfo thread_info;
 
     std::string get_var_name(uint64_t id) const { return "v" + std::to_string(id); }
+    std::string get_original_var_name(VarId var) const {
+        for (const auto& item : var_names_) if (item.second == var) return item.first;
+        return get_var_name(var.id);
+    }
     std::size_t get_var_size() const { return var_names_.size(); }
     std::size_t get_var_size(uint64_t) const { return var_names_.size(); }
     std::size_t get_var_size(const VarId&) const { return var_names_.size(); }

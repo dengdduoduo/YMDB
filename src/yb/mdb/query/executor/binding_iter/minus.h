@@ -7,17 +7,11 @@
 
 class Minus : public BindingIter {
 public:
-    Minus(
-        std::unique_ptr<BindingIter> lhs,
-        std::unique_ptr<BindingIter> rhs,
-        std::vector<VarId> safe_join_vars,
-        std::vector<VarId> unsafe_join_vars,
-        std::vector<VarId> parent_safe_vars) :
-        lhs             (std::move(lhs)),
-        rhs             (std::move(rhs)),
-        safe_join_vars  (std::move(safe_join_vars)),
-        unsafe_join_vars(std::move(unsafe_join_vars)),
-        parent_safe_vars(std::move(parent_safe_vars)) { }
+    Minus(std::unique_ptr<BindingIter> lhs, std::unique_ptr<BindingIter> rhs,
+          std::vector<VarId> common_vars, std::vector<VarId> parent_safe_vars,
+          std::vector<VarId> output_vars)
+        : lhs(std::move(lhs)), rhs(std::move(rhs)), common_vars(std::move(common_vars)),
+          parent_safe_vars(std::move(parent_safe_vars)), output_vars(std::move(output_vars)) {}
 
     void print(std::ostream& os, int indent, bool stats) const override;
     void _begin(Binding& parent_binding) override;
@@ -27,9 +21,9 @@ public:
 
     std::unique_ptr<BindingIter> lhs;
     std::unique_ptr<BindingIter> rhs;
-    std::vector<VarId> safe_join_vars;
-    std::vector<VarId> unsafe_join_vars;
+    std::vector<VarId> common_vars;
     std::vector<VarId> parent_safe_vars;
+    std::vector<VarId> output_vars;
 
 private:
     Binding* parent_binding;

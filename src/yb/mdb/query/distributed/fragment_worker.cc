@@ -18,6 +18,7 @@
 #include "yb/mdb/query/distributed/fragment_transport.h"
 #include "yb/mdb/storage/docdb_key_encoder.h"
 #include "yb/mdb/storage/docdb_scan_cursor.h"
+#include "yb/mdb/storage/managed_transaction.h"
 #include "yb/server/clock.h"
 #include "yb/server/hybrid_clock.h"
 
@@ -32,6 +33,8 @@ class Worker {
     session_.reset();
     transaction_.reset();
     if (manager_) manager_->Shutdown();
+    // Drain callbacks while the client and stopped manager still exist.
+    if (client_) client_->Shutdown();
   }
 
   Status Open(const FragmentOpenPB& open) {
@@ -51,10 +54,10 @@ class Worker {
       if (tables_[perm].table()->id() != open.table_ids(perm))
         return STATUS(Corruption, "MDB table generation changed before worker open");
     }
-    manager_ = std::make_unique<client::TransactionManager>(
+    manager_ = std::make_shared<client::TransactionManager>(
         client_.get(), scoped_refptr<server::Clock>(client_->Clock()), client::LocalTabletFilter());
     auto data = VERIFY_RESULT(client::ChildTransactionData::FromPB(open.transaction()));
-    transaction_ = std::make_shared<client::YBTransaction>(manager_.get(), std::move(data));
+    transaction_ = MakeManagedTransaction(manager_, std::move(data));
     session_ = client_->NewSession(MonoDelta::FromMilliseconds(open.timeout_ms()));
     session_->SetTransaction(transaction_);
     levels_.resize(open.triples_size());
@@ -68,13 +71,17 @@ class Worker {
     for (size_t work = 0; work < 4096 && rows < open_.batch_rows(); ++work) {
       if (CoarseMonoClock::Now() >= deadline_)
         return STATUS(TimedOut, "MDB worker execution deadline expired");
+      if (session_->IsRestartRequired())
+        return STATUS(TryAgain, "MDB child read view requires restart");
       auto& level = levels_[depth_];
       if (!level.open) RETURN_NOT_OK(OpenLevel());
       if (level.position == level.batch.rows.size()) {
         if (level.batch.eof) {
           level.cursor.Close();
           level.open = false;
-          level.batch = {};
+          // One completed page stays in its existing level buffer. Never
+          // retain a tail page as if it were the complete probe result.
+          if (!level.reusable) level.batch = {};
           level.position = 0;
           if (depth_ == 0) {
             auto result = VERIFY_RESULT(transaction_->FinishChild());
@@ -89,6 +96,8 @@ class Worker {
         }
         const auto before = level.cursor.rpc_calls();
         level.batch = VERIFY_RESULT(level.cursor.NextBatch());
+        ++level.pages;
+        level.reusable = depth_ != 0 && level.pages == 1 && level.batch.eof;
         read_operations_ += level.cursor.rpc_calls() - before;
         level.position = 0;
         if (level.batch.rows.empty()) continue;
@@ -132,6 +141,10 @@ class Worker {
     size_t position = 0;
     int perm = 0;
     bool open = false;
+    // This state and one decoded page fit the existing per-level reservation.
+    std::array<uint64_t, 3> probe_key{};
+    size_t pages = 0;
+    bool reusable = false;
   };
 
   Status OpenLevel() {
@@ -143,7 +156,18 @@ class Worker {
       known[i] = term.has_constant() ? term.constant() : bindings_[depth_][term.variable()];
     }
     // Only the anchor owns a partition. Every inner probe is free to cross tablets.
-    level.perm = depth_ == 0 ? 0 : known[0] ? 0 : known[2] ? 2 : known[1] ? 1 : 0;
+    const int perm = depth_ == 0 ? 0 : known[0] ? 0 : known[2] ? 2 : known[1] ? 1 : 0;
+    // Only this fragment's immutable child read view owns the buffer. Rebind
+    // every incoming row normally, even when its raw probe rows are reused.
+    if (depth_ != 0 && level.reusable && level.perm == perm && level.probe_key == known) {
+      level.position = 0;
+      level.open = true;
+      return Status::OK();
+    }
+    level.perm = perm;
+    level.probe_key = known;
+    level.pages = 0;
+    level.reusable = false;
     std::array<uint64_t, 3> keys{};
     DocKeyEncoder::Permute(level.perm, known[0], known[1], known[2], &keys[0], &keys[1], &keys[2]);
     DocDBScanSpec spec;
@@ -168,7 +192,7 @@ class Worker {
   CoarseTimePoint deadline_;
   scoped_refptr<server::Clock> clock_;
   std::unique_ptr<client::YBClient> client_;
-  std::unique_ptr<client::TransactionManager> manager_;
+  std::shared_ptr<client::TransactionManager> manager_;
   client::YBTransactionPtr transaction_;
   client::YBSessionPtr session_;
   std::array<client::TableHandle, 6> tables_;

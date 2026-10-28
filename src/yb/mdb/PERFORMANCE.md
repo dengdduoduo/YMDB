@@ -1,0 +1,147 @@
+# Query measurement
+
+`mdb_cli --mdb_query_profile=true ... query '<SPARQL>'` writes JSON records
+prefixed `MDB_QUERY_PROFILE` and `MDB_CLI_TIMING` to stderr. Result stdout is
+unchanged. `YBCMdbGetLastQueryProfile()` exposes the query record to API callers.
+Fields are additive; a zero counter can mean that its path was not used.
+
+All `*_us` fields use a monotonic wall clock, not CPU time. The adapter reports
+parsing/rewriting, read-view setup, dictionary restoration, planning, execution,
+and total time. Execution includes result callbacks and, where applicable,
+fragment gathering, exchange, and global finalization. Total excludes outer
+adapter locking and final read-context destruction.
+
+`storage_flush_us` and `storage_decode_us` describe coordinator data pages;
+they do not include dictionary restoration. Remote counters describe spawning,
+waiting for OPEN, waiting for pull responses, consuming rows, and cleanup.
+These fields are nested inside execution, not additional total time. Workers
+may run concurrently. OPEN waiting includes worker client/table/transaction
+setup; pull waiting includes worker reads, joins, and transport. Neither is a
+measurement of pure worker CPU time.
+
+`remote_read_operations` sums differences of each fragment's cumulative read
+counter. Local and remote read-operation counts are not wire RPC packet counts
+and do not include every metadata operation during initialization.
+
+The CLI separately reports initialization, optional statistics collection,
+execution, publication, total RunQuery time, and status. External process timing
+also includes loader/flag processing and shutdown. Do not mix fresh CLI timings
+with an already initialized API endpoint. Report the complete result boundary,
+build flags, resources, cache conditions, and initialization policy.
+
+The `MdbStage9BaselineTest` cases are opt-in diagnostic fixtures. Set
+`MDB_STAGE9_DATASETS` to the generated six-file dataset directory; without it
+the cases are skipped, not validated. `MDB_STAGE9_REPEATS` controls repetitions
+(default five), separate from the first observation. Run each case individually
+through `yb_build.sh`, using the matching build root. Correctness assertions
+check the complete result multiset and schema before a sample is accepted.
+
+Generate the default six datasets with:
+
+```sh
+python3 src/yb/mdb/test_data/gen_stage9_baseline.py --output /path/to/baseline-data
+```
+
+The generator records hashes and refuses to replace differing files. Pass that
+directory through MDB_STAGE9_DATASETS when invoking one baseline case with
+yb_build.sh. A matching hash identifies input bytes; it is not a correctness or
+performance result by itself.
+
+## Shutdown and rejected samples
+
+The adapter owns its cluster client. Call YBCMdbShutdown before process teardown
+to close the model and client while thread-local infrastructure is alive. The
+CLI does this on every exit path. Calls are serialized with queries; callbacks
+must not re-enter shutdown. Repeated successful shutdown calls are safe.
+
+MDB transaction handles retain their manager until their last strong reference
+is destroyed, including references held by asynchronous read callbacks after
+a synchronous flush returns. Shutdown first stops manager work; the manager is
+not freed while those transactions still need its RPC registry. Worker shutdown
+also drains its owned client before manager/client member destruction.
+
+Reject samples with a nonzero process exit even if output was already produced.
+Keep pre-fix data separate when a lifecycle fix changes measured binaries.
+
+Reinitializing the public adapter releases its old model before replacing the
+owned client, including when changing namespaces. It preserves configured query
+options on success. An initialization error discards partially opened tables,
+dictionary, model, and client; retry does not reuse a dangling client pointer.
+These changes do not optimize dictionary scans or conditional writes.
+
+
+## Dictionary initialization
+
+Legacy migration validates the complete legacy mapping against a strong scan
+of authoritative term claims before publishing missing entries. Already known
+claims need no per-term conditional write or follow-up read. Missing claims
+still use the existing single-row conditional write, and a competing winner
+must have the same ID. Counter floors, final authoritative validation, and
+per-query dictionary refresh remain enabled. No migration marker or counter
+heuristic replaces those checks. Conflicts fail initialization; reserving a
+counter floor can leave a gap but must not publish a conflicting term claim.
+
+This relies on the existing append-only claim contract. Concurrent modern
+allocators reserve IDs before publishing claims; manual rewrites and old
+writers inventing overlapping IDs during migration are not supported.
+Migration temporarily holds both legacy and authoritative maps, so its memory
+use remains linear and can exceed the old migration peak. First-time migration
+still performs one conditional claim per missing term; startup gains apply to
+already migrated terms and do not imply faster joins or per-query refresh.
+
+MdbDictionaryInitTest.Startup128, Startup1024 and Startup8192 are opt-in: set
+MDB_DICT_INIT_BENCHMARK=1 and run one case at a time through yb_build.sh. Each
+case checks complete ID/term mappings, records one first plus five repeated
+dictionary initializations, and separately records two fresh CLI processes.
+InitStats counts legacy term claim attempts, not total storage or wire RPCs.
+Controlled dictionary seeding is outside timing. First is not cold-cache;
+two CLI observations do not establish tail latency or multi-machine scaling.
+
+
+## Authoritative dictionary pages
+
+MDB scans rdf_terms with strong 1024-row pages, following continuations across
+tablets, including empty pages. The preceding operation retains its arena
+while its continuation is copied; the session starts a new arena per page.
+Only the application-owned previous/current pages are retained this way;
+asynchronous client references and total process peak memory are not measured.
+There is no strict page byte budget: long RDF terms can make a page large.
+The complete dictionary still uses O(N) memory. Generic TableRange and the
+legacy mirror scan retain their original defaults.
+
+Row/null/identity/counter checks, atomic destination replacement on success,
+and refresh after pinning the data view remain enabled. A counter reservation
+can precede publication: an unchanged counter never justifies skipping refresh.
+ScanStats reports rows including the counter, page read operations and serialized
+response bytes; it excludes the separate counter read and metadata work, and
+does not count wire RPCs. It describes the last scan, including a failed scan.
+
+MdbDictionaryScanTest.Refresh128 and Refresh8192 are opt-in via
+MDB_DICT_SCAN_BENCHMARK=1. Run each separately through yb_build.sh. They compare
+complete bidirectional mappings after one first plus five repeated Restores.
+Report dictionary-only, initialized API and fresh CLI timings separately.
+The same scanner runs during initialization and migration validation, so
+worker OPEN and CLI initialization can also change without worker reuse.
+
+
+## Worker last-probe page reuse
+
+An inner depth can reuse its existing decoded page only when the first fetch
+completed that entire probe. The permutation and all three known term IDs
+must match. Raw triples are rebound for every incoming row; result bag and
+repeated-variable checks are unchanged. Complete empty probes can be reused.
+Anchors, multi-page probes and an exact-size page needing a further EOF fetch
+are not admitted. Changing keys replaces the single last-probe entry.
+
+The page belongs to one fragment and its immutable child transaction snapshot;
+it never survives a new OPEN/process/query. Restart and deadline checks remain
+active. No second decoded buffer or result-sized cache is allocated. The
+small key/counter state and one page fit the existing per-level conservative
+reservation, with the same page, credit and memory admission limits. This is
+not a total process RSS bound or a claim that peak memory was measured.
+
+This is repeated-probe reuse, not batching different keys or reusing processes.
+Unique keys may not benefit, and full-page/multi-page fanout may fall back.
+Measure remote storage operation counts and complete end-to-end results for
+all shapes, not just the shared-key case. The wire protocol, Gather accounting,
+default join strategies and global/exchange execution remain unchanged.

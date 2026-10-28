@@ -282,7 +282,7 @@ std::unique_ptr<BindingIter> TriplePlan::get_binding_iter() const {
 
     yb::mdb::DocDBRangeCache* cache = nullptr;
 
-    if (model.IsConnected() && model.UseStreamingReads()) {
+    if (model.IsConnected() && (model.UseStreamingReads() || yb::mdb::DocDBReadContextScope::Current())) {
         auto* read_context = yb::mdb::DocDBReadContextScope::Current();
         if (!read_context) throw QueryException("Streaming scan requires a query read context");
         return std::make_unique<DocDBScan>(

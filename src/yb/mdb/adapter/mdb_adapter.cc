@@ -12,7 +12,13 @@
 //
 
 #include "yb/mdb/adapter/mdb_adapter.h"
+#include "yb/mdb/adapter/result_sink.h"
+#include "yb/mdb/query/executor/wall_time_scope.h"
+#include "query/parser/op/sparql/op_ask.h"
+#include "query/parser/op/sparql/op_construct.h"
 
+#include <array>
+#include <set>
 #include <fstream>
 #include <memory>
 #include <mutex>
@@ -70,6 +76,8 @@
 #include "yb/mdb/query/distributed/exchange.h"
 #include "yb/server/hybrid_clock.h"
 #include "yb/util/logging.h"
+#include "yb/util/flags.h"
+#include "yb/util/monotime.h"
 #include "yb/util/status.h"
 #include "yb/util/scope_exit.h"
 
@@ -77,6 +85,9 @@ using yb::MonoDelta;
 using yb::Status;
 using yb::YQL_DATABASE_CQL;
 using namespace SPARQL;
+
+DEFINE_test_flag(int32, mdb_pause_before_dictionary_mirror_ms, 0,
+                 "Pause after imported data commits and before its legacy dictionary mirror");
 
 static const char* kIdMapTableName = "rdf_idmap";
 
@@ -118,6 +129,17 @@ scoped_refptr<yb::server::HybridClock> g_clock;
 bool g_cluster_initialized = false;
 
 std::string g_keyspace;
+
+// Called only while AdapterScope owns the public adapter lock.
+void ResetAdapter() {
+  yb::mdb::RdfYBModel::Instance().ClearAll();
+  g_cluster_initialized = false;
+  g_id_map.reset();
+  g_yb_client.reset();
+  g_clock.reset();
+  g_keyspace.clear();
+  last_query_profile.clear();
+}
 
 std::string IdToString(uint64_t id) {
   auto graph = g_gmap_to_pack.find(id);
@@ -221,6 +243,7 @@ Status LoadIdMapFromDocDB() {
   }
 
   RETURN_NOT_OK(scan_status);
+  RETURN_NOT_OK(yb::mdb::RdfYBModel::Instance().RestoreTermMap(*g_id_map));
   LOG(INFO) << "Loaded " << g_pack_to_gmap.size() << " idmap entries";
   return Status::OK();
 }
@@ -231,7 +254,7 @@ void RebindOpId(Id& id) {
   auto it = g_pack_to_gmap.find(oid);
   if (it != g_pack_to_gmap.end()) {
     id = ObjectId(it->second);
-  } else if (yb::mdb::RdfYBModel::Instance().UseStreamingReads()) {
+  } else if (g_cluster_initialized || yb::mdb::RdfYBModel::Instance().UseStreamingReads()) {
     id = ObjectId::get_not_found();
   }
 }
@@ -245,8 +268,12 @@ void RebindOpTriple(OpTriple& triple) {
 }
 
 void RebindOpPath(OpPath& path) {
-  RebindOpId(path.subject);
-  RebindOpId(path.object);
+  // Unknown endpoint terms still participate in zero-length paths.
+  for (auto* id : {&path.subject, &path.object}) {
+    if (!id->is_OID()) continue;
+    const auto found = g_pack_to_gmap.find(id->get_OID().id);
+    if (found != g_pack_to_gmap.end()) *id = ObjectId(found->second);
+  }
 }
 
 void RebindOpBasicGraphPattern(OpBasicGraphPattern& bgp) {
@@ -286,7 +313,12 @@ void RebindOptionalChild(std::unique_ptr<Op>& op) {
 void RebindOpIds(std::unique_ptr<Op>& op) {
   if (op == nullptr) return;
 
-  if (auto* sel = dynamic_cast<OpSelect*>(op.get())) {
+  if (auto* ask = dynamic_cast<OpAsk*>(op.get())) {
+    RebindOpIds(ask->op);
+  } else if (auto* construct = dynamic_cast<OpConstruct*>(op.get())) {
+    // Template terms are output identities and may not exist in storage.
+    RebindOpIds(construct->op);
+  } else if (auto* sel = dynamic_cast<OpSelect*>(op.get())) {
     if (sel->op) RebindOpIds(sel->op);
   } else if (auto* filter = dynamic_cast<OpFilter*>(op.get())) {
     if (filter->op) RebindOpIds(filter->op);
@@ -332,6 +364,38 @@ void RebindOpIds(std::unique_ptr<Op>& op) {
   }
 }
 
+bool ContainsPaths(const Op* op) {
+  if (!op) return false;
+  if (auto* bgp = dynamic_cast<const OpBasicGraphPattern*>(op)) return !bgp->paths.empty();
+  if (auto* join = dynamic_cast<const OpJoin*>(op))
+    return ContainsPaths(join->lhs.get()) || ContainsPaths(join->rhs.get());
+  if (auto* opt = dynamic_cast<const OpOptional*>(op))
+    return ContainsPaths(opt->lhs.get()) || ContainsPaths(opt->rhs.get());
+  if (auto* minus = dynamic_cast<const OpMinus*>(op))
+    return ContainsPaths(minus->lhs.get()) || ContainsPaths(minus->rhs.get());
+  if (auto* ne = dynamic_cast<const OpNotExists*>(op))
+    return ContainsPaths(ne->lhs.get()) || ContainsPaths(ne->rhs.get());
+  if (auto* semi = dynamic_cast<const OpSemiJoin*>(op))
+    return ContainsPaths(semi->lhs.get()) || ContainsPaths(semi->rhs.get());
+  if (auto* uni = dynamic_cast<const OpUnion*>(op)) {
+    for (const auto& child : uni->unions) if (ContainsPaths(child.get())) return true;
+  }
+  if (auto* seq = dynamic_cast<const OpSequence*>(op)) {
+    for (const auto& child : seq->ops) if (ContainsPaths(child.get())) return true;
+  }
+  if (auto* node = dynamic_cast<const OpSelect*>(op)) return ContainsPaths(node->op.get());
+  if (auto* node = dynamic_cast<const OpFilter*>(op)) return ContainsPaths(node->op.get());
+  if (auto* node = dynamic_cast<const OpGroupBy*>(op)) return ContainsPaths(node->op.get());
+  if (auto* node = dynamic_cast<const OpHaving*>(op)) return ContainsPaths(node->op.get());
+  if (auto* node = dynamic_cast<const OpOrderBy*>(op)) return ContainsPaths(node->op.get());
+  if (auto* node = dynamic_cast<const OpBind*>(op)) return ContainsPaths(node->op.get());
+  if (auto* node = dynamic_cast<const OpGraph*>(op)) return ContainsPaths(node->op.get());
+  if (auto* node = dynamic_cast<const OpDescribe*>(op)) return ContainsPaths(node->op.get());
+  if (auto* node = dynamic_cast<const OpAsk*>(op)) return ContainsPaths(node->op.get());
+  if (auto* node = dynamic_cast<const OpConstruct*>(op)) return ContainsPaths(node->op.get());
+  return false;
+}
+
 int ExecuteInsertData(const std::string& query_text) {
   if (g_id_map == nullptr) {
     g_id_map = std::make_unique<yb::mdb::IdMap>();
@@ -357,10 +421,9 @@ int ExecuteInsertData(const std::string& query_text) {
 }
 
 int ExecuteSparql(
-    const std::string& query_text,
-    YBCMdbRowCallback row_callback,
-    void* ctx)
+    const std::string& query_text, ResultSink& sink)
 {
+  const auto query_started = yb::mdb::WallMicros();
   QueryContext query_context;
   QueryContextScope query_scope(query_context);
   QueryParser qp(query_text);
@@ -384,15 +447,15 @@ int ExecuteSparql(
   }
 
   op = QueryParser::rewrite(std::move(op));
-
-  if (!g_pack_to_gmap.empty() || yb::mdb::RdfYBModel::Instance().UseStreamingReads()) {
-    RebindOpIds(op);
-  }
+  const auto parse_finished = yb::mdb::WallMicros();
 
   auto& model = yb::mdb::RdfYBModel::Instance();
   std::unique_ptr<yb::mdb::DocDBReadContext> read_context;
   std::optional<yb::mdb::DocDBReadContextScope> read_scope;
-  const bool use_stream = model.IsConnected() && model.UseStreamingReads();
+  // Public transactional queries must not reuse caches from an earlier query
+  // after another importer commits. Join policy selection remains unchanged.
+  const bool use_stream = model.IsConnected() && (model.UseStreamingReads() ||
+      ContainsPaths(op.get()) || (g_cluster_initialized && model.UseTransactions()));
   const bool use_snapshot = model.IsConnected() && model.UseTransactions() && !use_stream;
   if (use_stream) {
     auto result = model.NewQueryReadContext();
@@ -409,10 +472,30 @@ int ExecuteSparql(
       return 1;
     }
   }
+  if (read_context) {
+    read_context->stats.adapter_parse_us = parse_finished - query_started;
+    read_context->stats.adapter_read_view_us = yb::mdb::WallMicros() - parse_finished;
+  }
   auto snapshot_cleanup = yb::ScopeExit([&] {
-    if (read_context) last_query_profile = read_context->stats.ToJson();
+    if (read_context) {
+      read_context->stats.adapter_total_us = yb::mdb::WallMicros() - query_started;
+      last_query_profile = read_context->stats.ToJson();
+    }
     if (use_snapshot) model.EndReadSnapshot();
   });
+
+  // Pin the data read point before refreshing immutable term claims. Every
+  // term referenced by that view was persisted before its data committed.
+  if (g_cluster_initialized && g_id_map) {
+    yb::mdb::WallTimeScope timer(read_context ? &read_context->stats.adapter_dictionary_us : nullptr);
+    const auto status = model.RestoreTermMap(*g_id_map);
+    if (!status.ok()) {
+      LOG(WARNING) << "Cannot refresh MDB term dictionary: " << status;
+      return 1;
+    }
+  }
+  if (g_cluster_initialized || !g_pack_to_gmap.empty() || model.UseStreamingReads())
+    RebindOpIds(op);
 
   const auto worker_options = model.GetWorkerOptions();
   if (worker_options.exchange != yb::mdb::ExchangeMode::None && worker_options.targets.empty()) {
@@ -424,10 +507,12 @@ int ExecuteSparql(
       LOG(WARNING) << "MDB workers require query-owned streaming reads";
       return 1;
     }
+    const auto plan_started = yb::mdb::WallMicros();
     auto physical = read_context->batch_options.policy == yb::mdb::JoinPolicy::Index
         ? yb::mdb::FragmentPlan::Build(*op, model, worker_options)
         : yb::Result<yb::mdb::FragmentPlan>(STATUS(NotSupported,
             "Worker hash/auto join policies remain at MDB coordinator"));
+    read_context->stats.adapter_plan_us += yb::mdb::WallMicros() - plan_started;
     if (!physical.ok()) {
       if (!physical.status().IsNotSupported()) {
         LOG(WARNING) << "MDB fragment planning failed: " << physical.status();
@@ -436,6 +521,7 @@ int ExecuteSparql(
       // Capability fallback happens only before remote work or output starts.
       ++read_context->stats.remote_coordinator_fallbacks;
     } else {
+      yb::mdb::WallTimeScope timer(&read_context->stats.adapter_execute_us);
       const auto* select = dynamic_cast<const OpSelect*>(op.get());
       std::vector<ObjectId> gathered;
       std::vector<VarId> gathered_vars;
@@ -443,6 +529,7 @@ int ExecuteSparql(
       if (physical->coordinator_finalize) {
         for (auto var : physical->physical.projection()) gathered_vars.emplace_back(var);
       }
+      if (!physical->coordinator_finalize) sink.Begin(YBC_MDB_BINDINGS, select->vars);
       const auto gather = worker_options.exchange == yb::mdb::ExchangeMode::None
           ? yb::mdb::GatherFragments : yb::mdb::GatherExchangeFragments;
       auto status = gather(*physical, worker_options, *read_context,
@@ -466,18 +553,19 @@ int ExecuteSparql(
               read_context->stats.global_reserved_bytes = reserved;
               return Status::OK();
             }
-            for (size_t col = 0; col < row.size(); ++col) {
-              if (g_gmap_to_pack.find(row[col]) == g_gmap_to_pack.end())
+            std::vector<ObjectId> typed;
+            for (auto id : row) {
+              const auto found = g_gmap_to_pack.find(id);
+              if (found == g_gmap_to_pack.end())
                 return STATUS(Corruption, "Missing typed dictionary identity for worker output");
-              const auto name = get_query_ctx().get_var_name(select->vars[col]);
-              const auto value = IdToString(row[col]);
-              row_callback(name.c_str(), value.c_str(), ctx);
+              typed.push_back(found->second);
             }
+            sink.Row(typed);
             return Status::OK();
           });
       if (!status.ok()) LOG(WARNING) << "MDB fragment query failed: " << status;
       if (!status.ok()) return 1;
-      if (!physical->coordinator_finalize) return 0;
+      if (!physical->coordinator_finalize) { sink.End(); return 0; }
       // Gather all child transaction results before exposing global output.
       // The original modifier tree executes exactly once over the complete bag.
       *yb::mdb::FragmentPlan::InputSlot(*op) = std::make_unique<OpValues>(
@@ -486,12 +574,18 @@ int ExecuteSparql(
     }
   }
 
-  BindingIterConstructor optimizer;
-  op->accept_visitor(optimizer);
-  auto iter = std::move(optimizer.tmp);
+  auto iter = [&] {
+    yb::mdb::WallTimeScope timer(read_context ? &read_context->stats.adapter_plan_us : nullptr);
+    BindingIterConstructor optimizer;
+    op->accept_visitor(optimizer);
+    return std::move(optimizer.tmp);
+  }();
+  yb::mdb::WallTimeScope execution_timer(
+      read_context ? &read_context->stats.adapter_execute_us : nullptr);
 
   if (auto* describe = dynamic_cast<OpDescribe*>(op.get())) {
     if (!describe->op && !describe->iris.empty()) {
+      sink.Begin(YBC_MDB_GRAPH);
       std::unordered_set<std::string> seen_triples;
 
       for (const auto& iri_str : describe->iris) {
@@ -515,9 +609,7 @@ int ExecuteSparql(
 
             std::string triple_key = iri_uri + " " + pred_str + " " + obj_str;
             if (seen_triples.insert(triple_key).second) {
-              row_callback("subject", iri_uri.c_str(), ctx);
-              row_callback("predicate", pred_str.c_str(), ctx);
-              row_callback("object", obj_str.c_str(), ctx);
+              sink.Triple({iri_oid, pred_oid, obj_oid});
             }
           }
         }
@@ -536,21 +628,18 @@ int ExecuteSparql(
 
             std::string triple_key = subj_str + " " + pred_str + " " + iri_uri;
             if (seen_triples.insert(triple_key).second) {
-              row_callback("subject", subj_str.c_str(), ctx);
-              row_callback("predicate", pred_str.c_str(), ctx);
-              row_callback("object", iri_uri.c_str(), ctx);
+              sink.Triple({subj_oid, pred_oid, iri_oid});
             }
           }
         }
       }
 
+      sink.End();
       return 0;
     }
   }
 
-  if (iter == nullptr) {
-    return 0;
-  }
+  if (iter == nullptr) throw QueryException("MDB query produced no executable iterator");
 
   Binding binding(get_query_ctx().get_var_size());
   auto check_global_state = [&] {
@@ -562,32 +651,65 @@ int ExecuteSparql(
   iter->begin(binding);
   check_global_state();
 
-  std::vector<VarId> output_vars;
-  if (const auto* select = dynamic_cast<const OpSelect*>(op.get())) {
-    output_vars = select->vars;
-  } else {
-    for (std::size_t i = 0; i < binding.size; ++i) output_vars.emplace_back(i);
+  if (dynamic_cast<const OpAsk*>(op.get())) {
+    sink.Begin(YBC_MDB_BOOLEAN);
+    const bool answer = iter->next();
+    check_global_state();
+    sink.Boolean(answer);
+    sink.End();
+    return 0;
   }
 
+  if (auto* construct = dynamic_cast<const OpConstruct*>(op.get())) {
+    sink.Begin(YBC_MDB_GRAPH);
+    std::set<std::array<uint64_t, 3>> seen;
+    const auto blank_scope = yb::Uuid::Generate().ToString();
+    uint64_t solution = 0;
+    while (iter->next()) {
+      check_global_state();
+      ++solution;
+      std::map<VarId, ObjectId> blanks;
+      auto term = [&](Id id) -> ObjectId {
+        if (id.is_OID()) return id.get_OID();
+        const auto var = id.get_var();
+        const auto name = get_query_ctx().get_original_var_name(var);
+        if (name.rfind("_:", 0) == 0) {
+          auto found = blanks.find(var);
+          if (found != blanks.end()) return found->second;
+          auto value = yb::mdb::PackRdfIdentity({'B', std::to_string(solution) + ":" + name, blank_scope});
+          blanks.emplace(var, value);
+          return value;
+        }
+        return binding[var];
+      };
+      for (const auto& triple : construct->triples) {
+        const auto s = term(triple.subject), p = term(triple.predicate), o = term(triple.object);
+        if (s.is_null() || p.is_null() || o.is_null()) continue;
+        const auto st = RDF_OID::get_generic_type(s), pt = RDF_OID::get_generic_type(p);
+        if ((st != RDF_OID::GenericType::IRI && st != RDF_OID::GenericType::BLANK) ||
+            pt != RDF_OID::GenericType::IRI) continue;
+        if (seen.size() >= worker_options.coordinator_memory_bytes / 128)
+          throw QueryException("MDB CONSTRUCT result deduplication budget exceeded");
+        if (seen.insert({s.id, p.id, o.id}).second) sink.Triple({s, p, o});
+      }
+    }
+    check_global_state();
+    sink.End();
+    return 0;
+  }
+
+  std::vector<VarId> output_vars;
+  if (const auto* select = dynamic_cast<const OpSelect*>(op.get())) output_vars = select->vars;
+  else for (size_t i = 0; i < binding.size; ++i) output_vars.emplace_back(i);
+  sink.Begin(YBC_MDB_BINDINGS, output_vars);
   while (iter->next()) {
     check_global_state();
-    for (const auto& var : output_vars) {
-      const auto& oid = binding[var];
-      if (oid.is_null()) {
-        continue;
-      }
-
-      auto var_name = get_query_ctx().get_var_name(var);
-      if (var_name.empty()) {
-        continue;
-      }
-
-      auto value_str = IdToString(oid.id);
-      row_callback(var_name.c_str(), value_str.c_str(), ctx);
-    }
+    std::vector<ObjectId> row;
+    for (const auto var : output_vars) row.push_back(binding[var]);
+    sink.Row(row);
   }
-
   check_global_state();
+  sink.End();
   return 0;
 }
 
@@ -689,7 +811,31 @@ int YBCMdbExecuteSparql(
   }
 
   try {
-    return ExecuteSparql(query_str, row_callback, ctx);
+    ResultSink sink(row_callback, nullptr, ctx);
+    return ExecuteSparql(query_str, sink);
+  } catch (const std::exception& error) {
+    LOG(WARNING) << "MDB query failed: " << error.what();
+    return 1;
+  } catch (...) {
+    LOG(WARNING) << "MDB query failed with an unknown exception";
+    return 1;
+  }
+}
+
+int YBCMdbExecuteSparqlWithResults(
+    const char* query_text, const YBCMdbResultCallbacks* callbacks, void* ctx) {
+  AdapterScope scope;
+  if (!scope.entered()) return 1;
+  last_query_profile.clear();
+  if (!query_text || !callbacks || !callbacks->begin || !callbacks->row ||
+      !callbacks->boolean_result || !callbacks->triple || !callbacks->end) return 1;
+  try {
+    const std::string query(query_text);
+    const auto first = query.find_first_not_of(" \t\r\n");
+    if (first != std::string::npos && query.compare(first, 11, "INSERT DATA") == 0)
+      return ExecuteInsertData(query);
+    ResultSink sink(nullptr, callbacks, ctx);
+    return ExecuteSparql(query, sink);
   } catch (const std::exception& error) {
     LOG(WARNING) << "MDB query failed: " << error.what();
     return 1;
@@ -701,6 +847,13 @@ int YBCMdbExecuteSparql(
 
 const char* YBCMdbGetLastQueryProfile() { return last_query_profile.c_str(); }
 
+int YBCMdbShutdown() {
+  AdapterScope scope;
+  if (!scope.entered()) return 1;
+  ResetAdapter();
+  return 0;
+}
+
 int YBCMdbInitCluster(const char* master_addrs, const char* keyspace) {
   AdapterScope scope;
   if (!scope.entered()) return 1;
@@ -708,8 +861,19 @@ int YBCMdbInitCluster(const char* master_addrs, const char* keyspace) {
     return 1;
   }
 
-  std::string master_addrs_str(master_addrs);
-  g_keyspace = std::string(keyspace);
+  const std::string master_addrs_str(master_addrs);
+  const std::string keyspace_str(keyspace);
+  auto& model = yb::mdb::RdfYBModel::Instance();
+  const auto worker_options = model.GetWorkerOptions();
+  // The model stores a borrowed client pointer. Drop it before replacing an
+  // owned client, also when switching namespaces or retrying a failed Init.
+  ResetAdapter();
+  model.SetWorkerOptions(worker_options);
+  g_keyspace = keyspace_str;
+  bool initialized = false;
+  auto initialization_cleanup = yb::ScopeExit([&] {
+    if (!initialized) ResetAdapter();
+  });
 
   LOG(INFO) << "Connecting to masters at " << master_addrs_str;
 
@@ -777,6 +941,7 @@ int YBCMdbInitCluster(const char* master_addrs, const char* keyspace) {
   }
 
   g_cluster_initialized = true;
+  initialized = true;
   LOG(INFO) << "Cluster initialized successfully, keyspace=" << g_keyspace;
   return 0;
 }
@@ -808,6 +973,9 @@ int YBCMdbImportFile(const char* file_path) {
   LOG(INFO) << "Import: parsed=" << parsed
             << " written=" << written
             << " errors=" << errors;
+
+  if (FLAGS_TEST_mdb_pause_before_dictionary_mirror_ms > 0)
+    yb::SleepFor(MonoDelta::FromMilliseconds(FLAGS_TEST_mdb_pause_before_dictionary_mirror_ms));
 
   auto save_idmap_status = SaveIdMapToDocDB();
   if (!save_idmap_status.ok()) {

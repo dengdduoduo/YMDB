@@ -22,11 +22,14 @@
 #include <vector>
 
 #include "yb/mdb/adapter/mdb_adapter.h"
+#include "yb/mdb/tools/cli_result_writer.h"
 #include "yb/mdb/model/rdf_yb_model.h"
 #include "yb/mdb/storage/docdb_read_context.h"
 #include "yb/util/flags.h"
 #include "yb/util/scope_exit.h"
+#include "yb/mdb/query/executor/wall_time_scope.h"
 
+DEFINE_string(mdb_result_format, "text", "Query output: text or json (typed SELECT/ASK; graph triples JSON)");
 DEFINE_string(mdb_masters, "127.0.0.1:7100", "Master addresses");
 DEFINE_string(mdb_keyspace, "mdb_test", "Keyspace name");
 DEFINE_bool(mdb_use_partition_load, true, "Use partition loading for queries");
@@ -85,6 +88,17 @@ static int RunImport(int argc, char* argv[]) {
 }
 
 static int RunQuery(int argc, char* argv[]) {
+  const auto command_started = yb::mdb::WallMicros();
+  uint64_t init_us = 0, analyze_us = 0, execute_us = 0, publish_us = 0;
+  int command_status = 1;
+  auto timing_cleanup = yb::ScopeExit([&] {
+    if (FLAGS_mdb_query_profile)
+      std::cerr << "MDB_CLI_TIMING {\"init_us\":" << init_us
+                << ",\"analyze_us\":" << analyze_us << ",\"execute_us\":" << execute_us
+                << ",\"publish_us\":" << publish_us << ",\"total_us\":"
+                << yb::mdb::WallMicros() - command_started
+                << ",\"status\":" << command_status << "}" << std::endl;
+  });
   if (argc < 1) {
     std::cerr << "Usage: mdb_cli query <sparql_query>" << std::endl;
     return 1;
@@ -145,13 +159,17 @@ static int RunQuery(int argc, char* argv[]) {
   yb::mdb::RdfYBModel::Instance().SetWorkerOptions(std::move(workers));
   yb::mdb::RdfYBModel::Instance().SetUseTransactions(FLAGS_mdb_use_transactions);
 
-  int init_ret = YBCMdbInitCluster(
-      FLAGS_mdb_masters.c_str(), FLAGS_mdb_keyspace.c_str());
+  int init_ret;
+  {
+    yb::mdb::WallTimeScope timer(&init_us);
+    init_ret = YBCMdbInitCluster(FLAGS_mdb_masters.c_str(), FLAGS_mdb_keyspace.c_str());
+  }
   if (init_ret != 0) {
     return init_ret;
   }
 
   if (FLAGS_mdb_analyze_statistics) {
+    yb::mdb::WallTimeScope timer(&analyze_us);
     auto status = yb::mdb::RdfYBModel::Instance().AnalyzeStatistics();
     if (!status.ok()) { std::cerr << status.ToString() << std::endl; return 1; }
   }
@@ -163,115 +181,36 @@ static int RunQuery(int argc, char* argv[]) {
     query += argv[i];
   }
 
-  struct Ctx {
-    std::vector<std::pair<std::string, std::string>> bindings;
-    FILE* spool = nullptr;
-    uint64_t bytes = 0;
-    uint64_t records = 0;
-    bool failed = false;
-    bool first_row_complete = false;
-    std::set<std::string> first_row_vars;
-  };
-
-  Ctx ctx;
-  auto spool_cleanup = yb::ScopeExit([&] { if (ctx.spool) std::fclose(ctx.spool); });
-  if (!FLAGS_mdb_worker_targets.empty()) {
-    ctx.spool = std::tmpfile();
-    if (!ctx.spool) { std::cerr << "Cannot create MDB result staging file" << std::endl; return 1; }
-  }
-
-  auto callback = [](const char* name, const char* value, void* ctx_ptr) {
-    auto* c = static_cast<Ctx*>(ctx_ptr);
-    if (c->spool) {
-      if (c->failed) return;
-      const auto name_size = std::strlen(name), value_size = std::strlen(value);
-      const uint64_t size = name_size + value_size + 2;
-      auto write = [&](const void* bytes, size_t length) {
-        if (std::fwrite(bytes, 1, length, c->spool) != length) c->failed = true;
-      };
-      if (size > FLAGS_mdb_worker_output_spool_bytes ||
-          c->bytes > FLAGS_mdb_worker_output_spool_bytes - size ||
-          FLAGS_mdb_worker_output_spool_bytes - size - c->bytes < sizeof(size)) c->failed = true;
-      if (!c->failed) {
-        write(&size, sizeof(size)); write(name, name_size); write("\t", 1);
-        write(value, value_size); write("\n", 1);
-        c->bytes += size + sizeof(size);
-        ++c->records;
-        if (!c->first_row_complete && !c->first_row_vars.insert(name).second)
-          c->first_row_complete = true;
-      }
-      if (c->failed) {
-        if (auto* context = yb::mdb::DocDBReadContextScope::Current()) context->cancelled = true;
-      }
-      return;
-    }
-    c->bindings.emplace_back(name, value);
-  };
-
-  int ret = YBCMdbExecuteSparql(query.c_str(), callback, &ctx);
-  if (FLAGS_mdb_query_profile && *YBCMdbGetLastQueryProfile()) {
-    std::cerr << "MDB_QUERY_PROFILE " << YBCMdbGetLastQueryProfile() << std::endl;
-  }
-  // A later page can fail after callbacks have delivered earlier rows.
-  // Do not print that incomplete result as a successful query answer.
-  if (ctx.failed) {
-    std::cerr << "MDB result staging failed or exceeded its byte limit" << std::endl;
+  if (FLAGS_mdb_result_format != "text" && FLAGS_mdb_result_format != "json") {
+    std::cerr << "Invalid --mdb_result_format" << std::endl;
     return 1;
   }
-  if (ret != 0) return ret;
-
-  if (ctx.spool) {
-    if (ctx.failed || std::fflush(ctx.spool) || std::fseek(ctx.spool, 0, SEEK_SET)) {
-      std::cerr << "MDB result staging failed or exceeded its byte limit" << std::endl;
-      return 1;
+  try {
+    MdbCliResultWriter writer(FLAGS_mdb_result_format == "json", FLAGS_mdb_worker_output_spool_bytes);
+    int ret;
+    {
+      yb::mdb::WallTimeScope timer(&execute_us);
+      ret = YBCMdbExecuteSparqlWithResults(
+          query.c_str(), MdbCliResultWriter::Callbacks(), &writer);
     }
-    const auto width = ctx.first_row_vars.size();
-    char buffer[8192];
-    for (uint64_t record = 0; record < ctx.records; ++record) {
-      if (record && width && record % width == 0) std::cout << "---\n";
-      uint64_t size;
-      if (std::fread(&size, sizeof(size), 1, ctx.spool) != 1) return 1;
-      while (size) {
-        const auto part = static_cast<size_t>(std::min<uint64_t>(size, sizeof(buffer)));
-        if (std::fread(buffer, 1, part, ctx.spool) != part) return 1;
-        std::cout.write(buffer, part);
-        size -= part;
-      }
+    if (FLAGS_mdb_query_profile && *YBCMdbGetLastQueryProfile())
+      std::cerr << "MDB_QUERY_PROFILE " << YBCMdbGetLastQueryProfile() << std::endl;
+    if (ret != 0) { command_status = ret; return ret; }
+    {
+      yb::mdb::WallTimeScope timer(&publish_us);
+      command_status = writer.Publish();
     }
-    return std::cout.good() ? 0 : 1;
+    return command_status;
+  } catch (const std::exception& error) {
+    std::cerr << error.what() << std::endl;
+    return 1;
   }
-
-  if (ctx.bindings.empty()) {
-    return ret;
-  }
-
-  std::set<std::string> unique_vars;
-  for (auto& [n, v] : ctx.bindings) {
-    if (unique_vars.find(n) != unique_vars.end()) {
-      break;
-    }
-    unique_vars.insert(n);
-  }
-  size_t vars_per_row = unique_vars.size();
-
-  if (vars_per_row == 0) {
-    return ret;
-  }
-
-  for (size_t i = 0; i < ctx.bindings.size(); i++) {
-    if (i > 0 && i % vars_per_row == 0) {
-      std::cout << "---" << std::endl;
-    }
-    std::cout << ctx.bindings[i].first << "\t" << ctx.bindings[i].second << std::endl;
-  }
-
-  return ret;
 }
 
 int main(int argc, char* argv[]) {
   yb::ParseCommandLineFlags(&argc, &argv, true);
   // Drain transaction RPCs before process-static response buffers are destroyed.
-  auto cleanup = yb::ScopeExit([] { yb::mdb::RdfYBModel::Instance().ClearAll(); });
+  auto cleanup = yb::ScopeExit([] { (void)YBCMdbShutdown(); });
 
   if (argc < 2) {
     std::cerr << "Usage: mdb_cli <command> [args...]" << std::endl;

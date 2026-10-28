@@ -48,8 +48,9 @@ public:
     }
 
     std::unique_ptr<RegularPathExpr> invert() const override {
-        // TODO: implement this
-        throw std::runtime_error("PathNegatedSet::invert() not implemented");
+        auto atoms = negated_set;
+        for (auto& atom : atoms) atom.inverse = !atom.inverse;
+        return std::make_unique<PathNegatedSet>(std::move(atoms));
     }
 
     bool nullable() const override {

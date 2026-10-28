@@ -33,6 +33,7 @@
 #include "yb/gutil/macros.h"
 #include "yb/mdb/storage/yb_client_compat.h"
 #include "yb/mdb/storage/docdb_read_context.h"
+#include "yb/mdb/storage/managed_transaction.h"
 #include "yb/mdb/storage/docdb_scan_cursor.h"
 #include "yb/server/clock.h"
 #include "yb/util/status.h"
@@ -71,7 +72,7 @@ Status RdfYBModel::Init(yb::client::YBClient* client, const std::string& namespa
   RETURN_NOT_OK(term_dictionary_.Init(client, namespace_name));
   write_session_ = client->NewSession(MonoDelta::FromSeconds(15));
 
-  txn_manager_ = std::make_unique<client::TransactionManager>(
+  txn_manager_ = std::make_shared<client::TransactionManager>(
       client, scoped_refptr<server::Clock>(client->Clock()), client::LocalTabletFilter());
 
   connected_ = true;
@@ -84,6 +85,21 @@ const yb::client::TableHandle* RdfYBModel::GetTable(int perm_index) const {
     return nullptr;
   }
   return &tables_[perm_index];
+}
+
+Status RdfYBModel::RestoreTermMap(IdMap& local_map) {
+  RETURN_NOT_OK(term_dictionary_.Restore(&local_map));
+  try {
+    for (const auto& [id, key] : local_map.Entries()) {
+      const auto term = SPARQL::RdfTermIdentity::IsKey(key)
+          ? SPARQL::RdfTermIdentity::Decode(key)
+          : SPARQL::RdfTermIdentity{'I', key, ""};
+      RegisterRdfIdentity(id, term);
+    }
+    return Status::OK();
+  } catch (const std::exception& error) {
+    return STATUS(Corruption, error.what());
+  }
 }
 
 Result<uint64_t> RdfYBModel::ResolveTerm(IdMap& local_map, std::string_view term) {
@@ -237,7 +253,7 @@ Status RdfYBModel::BeginTransaction() {
   }
 
   // Use the constructor's default locality instead of naming a version-specific type.
-  current_txn_ = std::make_shared<client::YBTransaction>(txn_manager_.get());
+  current_txn_ = MakeManagedTransaction(txn_manager_);
   RETURN_NOT_OK(current_txn_->Init(IsolationLevel::SNAPSHOT_ISOLATION));
   write_session_->SetTransaction(current_txn_);
 
@@ -292,7 +308,7 @@ Status RdfYBModel::BeginReadSnapshot() {
 Result<std::unique_ptr<DocDBReadContext>> RdfYBModel::NewQueryReadContext() {
   if (!connected_) return STATUS(IllegalState, "MDB model is not connected");
   if (!use_transactions_) return STATUS(NotSupported, "Streaming reads require transactions");
-  auto context = VERIFY_RESULT(DocDBReadContext::Create(client_, txn_manager_.get()));
+  auto context = VERIFY_RESULT(DocDBReadContext::Create(client_, txn_manager_));
   context->page_rows = streaming_page_rows_;
   context->batch_options = batch_join_options_;
   context->statistics = statistics_;

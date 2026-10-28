@@ -9,41 +9,50 @@
 
 class Values : public BindingIter {
 public:
-    Values(std::vector<std::pair<VarId, bool>>&& vars, std::vector<ObjectId>&& values) :
+    Values(std::vector<std::pair<VarId, bool>>&& vars, std::vector<ObjectId>&& values,
+           std::vector<bool> fixed = {}, size_t empty_rows = 0) :
         vars(std::move(vars)), values(std::move(values))
     {
         num_cols_ = this->vars.size();
+        row_count_ = num_cols_ ? this->values.size() / num_cols_ : empty_rows;
+        fixed_ = std::move(fixed);
+        fixed_.resize(num_cols_, false);
     }
 
     void _begin(Binding& parent_binding) override
     {
         parent_binding_ = &parent_binding;
-        current_row_ = 0;
+        _reset();
     }
 
     bool _next() override
     {
-        if (current_row_ * num_cols_ >= values.size()) {
-            return false;
+        while (current_row_ < row_count_) {
+            const auto base = current_row_++ * num_cols_;
+            bool compatible = true;
+            for (size_t i = 0; i < num_cols_; ++i) {
+                if (fixed_[i] && !input_[i].is_null() && !values[base + i].is_null() &&
+                    input_[i] != values[base + i]) { compatible = false; break; }
+            }
+            if (!compatible) continue;
+            for (size_t i = 0; i < num_cols_; ++i)
+                parent_binding_->add(vars[i].first,
+                    fixed_[i] && values[base + i].is_null() ? input_[i] : values[base + i]);
+            return true;
         }
-
-        size_t base = current_row_ * num_cols_;
-        for (size_t i = 0; i < num_cols_; i++) {
-            parent_binding_->add(vars[i].first, values[base + i]);
-        }
-        current_row_++;
-        return true;
+        return false;
     }
 
-    void _reset() override
-    {
+    void _reset() override {
         current_row_ = 0;
+        input_.clear();
+        for (const auto& var : vars) input_.push_back((*parent_binding_)[var.first]);
     }
 
     void assign_nulls() override
     {
         for (size_t i = 0; i < num_cols_; i++) {
-            parent_binding_->add(vars[i].first, ObjectId::get_null());
+            if (!fixed_[i]) parent_binding_->add(vars[i].first, ObjectId::get_null());
         }
     }
 
@@ -60,7 +69,7 @@ public:
         }
         os << ")\n";
 
-        size_t num_rows = values.size() / num_cols_;
+        size_t num_rows = row_count_;
         for (size_t row = 0; row < num_rows; row++) {
             os << std::string(indent + 2, ' ') << "(";
             for (size_t col = 0; col < num_cols_; col++) {
@@ -76,6 +85,9 @@ public:
 
 private:
     size_t num_cols_;
+    size_t row_count_ = 0;
+    std::vector<bool> fixed_;
+    std::vector<ObjectId> input_;
     size_t current_row_ = 0;
     Binding* parent_binding_ = nullptr;
 };

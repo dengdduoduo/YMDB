@@ -9,6 +9,7 @@
 #include "yb/mdb/query/distributed/fragment_transport.h"
 #include "yb/util/subprocess.h"
 #include "yb/util/uuid.h"
+#include "yb/mdb/query/executor/wall_time_scope.h"
 
 namespace yb::mdb {
 namespace {
@@ -29,6 +30,7 @@ struct Stream {
   // remote pull loop; an in-progress remote read remains bounded by its deadline.
   std::unique_ptr<Subprocess> process;
   FragmentRequestPB request;
+  uint64_t read_operations = 0;
 };
 
 Status CheckResponse(const FragmentResponsePB& response, const FragmentRequestPB& request) {
@@ -61,6 +63,7 @@ Status GatherFragments(const FragmentPlan& plan, const WorkerOptions& options,
   std::vector<std::unique_ptr<Stream>> active;
   size_t next_task = 0;
   auto start = [&]() -> Status {
+    WallTimeScope timer(&context.stats.remote_spawn_us);
     auto stream = std::make_unique<Stream>();
     auto& request = stream->request;
     request.set_version(kFragmentVersion);
@@ -106,8 +109,11 @@ Status GatherFragments(const FragmentPlan& plan, const WorkerOptions& options,
   // Read OPEN acknowledgements, then let all workers compute concurrently.
   auto open_ack = [&](Stream& stream) -> Status {
     FragmentResponsePB response;
-    RETURN_NOT_OK(ReadFragmentFrame(stream.process->from_child_stdout_fd(), &response,
-                                   context.deadline, &context.cancelled));
+    {
+      WallTimeScope timer(&context.stats.remote_open_wait_us);
+      RETURN_NOT_OK(ReadFragmentFrame(stream.process->from_child_stdout_fd(), &response,
+                                     context.deadline, &context.cancelled));
+    }
     RETURN_NOT_OK(CheckResponse(response, stream.request));
     if (response.rows() || response.values_size() || response.eof())
       return STATUS(Corruption, "Unexpected MDB OPEN acknowledgement payload");
@@ -123,33 +129,46 @@ Status GatherFragments(const FragmentPlan& plan, const WorkerOptions& options,
   while (!active.empty()) {
     auto& stream = *active[current];
     FragmentResponsePB response;
-    RETURN_NOT_OK(ReadFragmentFrame(stream.process->from_child_stdout_fd(), &response,
-                                   context.deadline, &context.cancelled));
+    {
+      WallTimeScope timer(&context.stats.remote_pull_wait_us);
+      RETURN_NOT_OK(ReadFragmentFrame(stream.process->from_child_stdout_fd(), &response,
+                                     context.deadline, &context.cancelled));
+    }
     RETURN_NOT_OK(CheckResponse(response, stream.request));
     const auto width = plan.physical.projection_size();
     if (response.rows() > options.batch_rows ||
         static_cast<uint64_t>(response.values_size()) != uint64_t(response.rows()) * width ||
         (!response.eof() && response.has_transaction_result()))
       return STATUS(Corruption, "MDB worker batch schema or row count mismatch");
+    // Responses report cumulative reads for this fragment, not a per-batch count.
+    const auto reads = std::max(stream.read_operations, response.read_operations());
+    context.stats.remote_read_operations += reads - stream.read_operations;
+    stream.read_operations = reads;
     ++context.stats.remote_batches;
     context.stats.remote_response_bytes += response.ByteSizeLong();
     context.stats.remote_peak_frame_bytes = std::max<uint64_t>(
         context.stats.remote_peak_frame_bytes, response.ByteSizeLong());
-    std::vector<uint64_t> row(width);
-    for (uint32_t r = 0; r < response.rows(); ++r) {
-      if (context.cancelled.load()) return STATUS(Aborted, "MDB Gather cancelled by consumer");
-      if (CoarseMonoClock::Now() >= context.deadline) return STATUS(TimedOut, "MDB Gather deadline expired");
-      for (int c = 0; c < width; ++c) {
-        row[c] = response.values(r * width + c);
-        if (!row[c]) return STATUS(Corruption, "MDB worker returned an unbound RDF ID");
+    {
+      WallTimeScope timer(&context.stats.remote_sink_us);
+      std::vector<uint64_t> row(width);
+      for (uint32_t r = 0; r < response.rows(); ++r) {
+        if (context.cancelled.load()) return STATUS(Aborted, "MDB Gather cancelled by consumer");
+        if (CoarseMonoClock::Now() >= context.deadline) return STATUS(TimedOut, "MDB Gather deadline expired");
+        for (int c = 0; c < width; ++c) {
+          row[c] = response.values(r * width + c);
+          if (!row[c]) return STATUS(Corruption, "MDB worker returned an unbound RDF ID");
+        }
+        RETURN_NOT_OK(sink(row));
+        ++context.stats.remote_rows;
       }
-      RETURN_NOT_OK(sink(row));
-      ++context.stats.remote_rows;
     }
     if (response.eof()) {
       if (!response.has_transaction_result()) return STATUS(Corruption, "Missing MDB child read result");
-      RETURN_NOT_OK(context.ApplyChild(response.transaction_result()));
-      active.erase(active.begin() + current);
+      {
+        WallTimeScope timer(&context.stats.remote_cleanup_us);
+        RETURN_NOT_OK(context.ApplyChild(response.transaction_result()));
+        active.erase(active.begin() + current);
+      }
       if (next_task < plan.tasks.size()) {
         RETURN_NOT_OK(start());
         RETURN_NOT_OK(open_ack(*active.back()));

@@ -1,5 +1,7 @@
 #pragma once
 
+#include "yb/client/session.h"
+
 namespace yb::mdb {
 
 // Newer clients allocate operations in the session arena; older clients expose

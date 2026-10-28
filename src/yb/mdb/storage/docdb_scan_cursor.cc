@@ -9,8 +9,11 @@
 #include "yb/client/table_handle.h"
 #include "yb/client/yb_op.h"
 #include "yb/common/ql_protocol_util.h"
+#include "yb/common/ql_value.h"
 #include "yb/dockv/partition.h"
 #include "yb/mdb/storage/yb_client_compat.h"
+#include "yb/mdb/storage/docdb_read_context.h"
+#include "yb/mdb/query/executor/wall_time_scope.h"
 
 namespace yb::mdb {
 namespace {
@@ -83,9 +86,17 @@ Result<std::vector<DocDBScanBatch>> DocDBScanCursor::NextBatches(
       auto deadline = cursors.front()->spec_.deadline;
       for (auto* cursor : cursors) deadline = std::min(deadline, cursor->spec_.deadline);
       session->SetDeadline(deadline);
-      RETURN_NOT_OK(session->TEST_Flush());
+      {
+        auto* context = DocDBReadContextScope::Current();
+        WallTimeScope timer(context && context->session == session ?
+            &context->stats.storage_flush_us : nullptr);
+        RETURN_NOT_OK(session->TEST_Flush());
+      }
       if (session->IsRestartRequired()) return STATUS(TryAgain, "MDB query read view requires restart");
     }
+    auto* context = DocDBReadContextScope::Current();
+    WallTimeScope timer(context && context->session == session ?
+        &context->stats.storage_decode_us : nullptr);
     std::vector<DocDBScanBatch> batches;
     batches.reserve(cursors.size());
     for (size_t i = 0; i < cursors.size(); ++i) {

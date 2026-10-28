@@ -142,7 +142,7 @@ public:
 
     // not possible to visit
     void visit(OpAsk&) override;
-    void visit(OpJoin&) override { }
+    void visit(OpJoin&) override;
     void visit(OpPath&) override { }
     void visit(OpShow&) override { }
     void visit(OpTriple&) override { }

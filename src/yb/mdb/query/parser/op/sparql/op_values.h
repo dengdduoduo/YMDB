@@ -12,17 +12,19 @@ public:
     std::vector<VarId> vars;
     std::vector<bool> has_undef;
     std::vector<ObjectId> values;
+    size_t row_count;
 
     OpValues(
         std::vector<VarId>&& _vars,
-        std::vector<ObjectId>&& _values
+        std::vector<ObjectId>&& _values, size_t empty_rows = 0
     ) :
         vars   (std::move(_vars)),
-        values (std::move(_values))
+        values (std::move(_values)),
+        row_count(vars.empty() ? empty_rows : values.size() / vars.size())
     {
-        assert(values.size() % vars.size() == 0);
+        assert(vars.empty() ? values.empty() : values.size() % vars.size() == 0);
         has_undef = std::vector<bool>(vars.size(), false);
-        for(size_t row = 0; row < values.size() / vars.size(); row++) {
+        for(size_t row = 0; row < row_count; row++) {
             for (size_t var = 0; var < vars.size(); var++) {
                 auto i = row * vars.size() + var;
                 if (values[i].is_null()) {
@@ -48,7 +50,7 @@ public:
 
         return std::make_unique<OpValues>(
             std::move(vars_clone),
-            std::move(values_clone)
+            std::move(values_clone), row_count
         );
     }
 
@@ -95,7 +97,8 @@ public:
 
         os << "\n";
 
-        for (size_t i = 0; i < values.size(); i += vars.size()) {
+        for (size_t row = 0; row < row_count; ++row) {
+            const auto i = row * vars.size();
             os << std::string(indent + 2, ' ') << '(';
             for (size_t j = 0; j < vars.size(); j++) {
                 if (j != 0) os << ", ";

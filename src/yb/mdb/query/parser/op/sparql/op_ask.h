@@ -8,11 +8,15 @@ class OpAsk : public Op {
 public:
     std::unique_ptr<Op> op;
 
-    OpAsk(std::unique_ptr<Op> op) :
-        op (std::move(op)) { }
+    const uint64_t offset;
+    const uint64_t limit;
+
+    OpAsk(std::unique_ptr<Op> op, uint64_t offset = Op::DEFAULT_OFFSET,
+          uint64_t limit = Op::DEFAULT_LIMIT)
+        : op(std::move(op)), offset(offset), limit(limit) {}
 
     std::unique_ptr<Op> clone() const override {
-        return std::make_unique<OpAsk>(op->clone());
+        return std::make_unique<OpAsk>(op->clone(), offset, limit);
     }
 
     void accept_visitor(OpVisitor& visitor) override {
