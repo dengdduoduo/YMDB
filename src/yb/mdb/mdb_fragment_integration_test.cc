@@ -3877,3 +3877,53 @@ TEST_F(MdbFrameReaderTest, PartialFrameChecksCancellationAndDeadline) {
 }
 }  // namespace
 }  // namespace yb::mdb
+
+
+namespace yb::mdb {
+namespace {
+TEST_F(MdbFragmentIntegrationTest, ExchangeStageTimingsFailureAndReset) {
+  Seed(8);
+  const auto root=GetTestPath("exchange-profile");std::filesystem::create_directory(root);
+  auto options=workers_;options.exchange=ExchangeMode::Hash;
+  options.exchange_spill_directory=root;options.batch_rows=128;options.page_rows=16;
+  auto check=[&](const std::string& profile,bool active) {
+    rapidjson::Document value;value.Parse(profile.c_str());ASSERT_FALSE(value.HasParseError());
+    for(const auto* name:{"exchange_total_us","exchange_setup_us","exchange_left_input_us",
+        "exchange_right_input_us","exchange_partition_us","exchange_consume_us",
+        "exchange_sink_us","exchange_cleanup_us"}) {
+      ASSERT_TRUE(value.HasMember(name)) << name;ASSERT_TRUE(value[name].IsUint64());
+      if(!active)ASSERT_EQ(value[name].GetUint64(),0) << name;
+    }
+    const auto total=value["exchange_total_us"].GetUint64();
+    const auto inputs=value["exchange_left_input_us"].GetUint64()+value["exchange_right_input_us"].GetUint64();
+    ASSERT_GE(total,inputs+value["exchange_setup_us"].GetUint64()+
+        value["exchange_consume_us"].GetUint64()+value["exchange_cleanup_us"].GetUint64());
+    ASSERT_GE(inputs,value["exchange_partition_us"].GetUint64());
+    ASSERT_GE(value["exchange_consume_us"].GetUint64(),value["exchange_sink_us"].GetUint64());
+    ASSERT_GE(value["adapter_execute_us"].GetUint64(),total);
+    if(active){ASSERT_GT(total,0);ASSERT_GT(value["exchange_cleanup_us"].GetUint64(),0);}
+    ASSERT_EQ(value["exchange_live_files"].GetUint64(),0);
+  };
+  const auto correct=Query(kQuery,options);ASSERT_EQ(correct.status,0);ASSERT_EQ(correct.values.size(),16);
+  ASSERT_NO_FATALS(check(correct.profile,true));
+  ASSERT_GT(Field(correct.profile,"exchange_left_input_us"),0);
+  ASSERT_GT(Field(correct.profile,"exchange_right_input_us"),0);
+  ASSERT_GT(Field(correct.profile,"exchange_partition_us"),0);
+  RdfYBModel::Instance().SetWorkerOptions(options);
+  size_t rows=0;
+  auto slow=[](const char*,const char*,void* arg) {
+    ++*static_cast<size_t*>(arg);SleepFor(MonoDelta::FromMilliseconds(1));
+  };
+  ASSERT_EQ(YBCMdbExecuteSparql(kQuery,slow,&rows),0);ASSERT_EQ(rows,16);
+  const std::string slow_profile=YBCMdbGetLastQueryProfile();
+  ASSERT_NO_FATALS(check(slow_profile,true));ASSERT_GT(Field(slow_profile,"exchange_sink_us"),8000);
+  auto limited=options;limited.exchange_spill_bytes=140;
+  const auto failed=Query(kQuery,limited);ASSERT_NE(failed.status,0);ASSERT_TRUE(failed.values.empty());
+  ASSERT_NO_FATALS(check(failed.profile,true));
+  const auto local=Query(kQuery,{});ASSERT_EQ(local.status,0);ASSERT_EQ(local.values,correct.values);
+  ASSERT_NO_FATALS(check(local.profile,false));
+  const auto recovered=Query(kQuery,options);ASSERT_EQ(recovered.status,0);ASSERT_EQ(recovered.values,correct.values);
+  ASSERT_NO_FATALS(check(recovered.profile,true));ASSERT_TRUE(std::filesystem::is_empty(root));
+}
+}  // namespace
+}  // namespace yb::mdb

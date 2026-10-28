@@ -82,3 +82,27 @@ coordinator control (266.37 to 328.16 ms). This does not isolate a regression
 caused by receive scheduling, or establish a no-regression/speedup claim. The gate proves
 independent progress, not a network benchmark. OPEN and EOF cleanup remain
 synchronous; full distributed exchange/global extensions remain future work.
+
+
+## Exchange profiling follow-up
+
+Eight related Release tests passed, including the new stage-timing nesting,
+slow sink, quota failure, reset and recovery gate. Existing hot-key spill,
+quota/cancellation, shared-snapshot and CLI cases passed. Unique4096, Shared4096
+and Fanout4096 checked 78 complete typed/schema observations (72 API, six fresh
+coordinator CLIs). Every profile passed nesting and non-exchange-zero checks.
+Input hashes match the earlier dataset archive. Execution strategy is unchanged.
+
+Five repeated exchange API samples per shape, median wall milliseconds:
+
+| Shape | Exchange total | Left input | Right input | Partition (nested) | Consume | Inputs share |
+|---|---:|---:|---:|---:|---:|---:|
+|unique|628.05|310.09|289.81|6.55|13.97|97.6%|
+|shared|520.93|289.48|178.72|4.89|9.75|97.8%|
+|fanout|630.50|329.52|257.09|4.76|48.66|92.8%|
+
+Percentages are medians of per-sample input/total ratios; phase medians need not
+sum exactly. Input includes partition; consume includes sink. These results
+identify sequential input production as the next candidate, without a speedup
+claim. No concurrent input implementation, default exchange selection, new
+memory budget or external/global consumer is introduced by this measurement.

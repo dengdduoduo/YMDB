@@ -207,3 +207,23 @@ Unordered query rows may interleave differently; ORDER BY still uses the global
 finalizer. OPEN acknowledgements, EOF cleanup and the sink remain synchronous.
 This is receive-side progress under uneven workers, not parallel exchange
 consumers, external global sorting or a persistent worker service.
+
+
+## Exchange stage profile
+
+Profiles add exchange_total_us, exchange_setup_us, exchange_left_input_us,
+exchange_right_input_us, exchange_partition_us, exchange_consume_us,
+exchange_sink_us and exchange_cleanup_us. Input scopes include their partition
+callbacks; the combined partition counter covers hashing/validation and spill
+write calls. Consume covers local spill reads/hash join and its output sink.
+Sink is nested in consume. Do not add nested counters to their parent phases.
+Cleanup covers explicit cleanup and destructor fallback, including error paths.
+Total starts after configuration/entry checks and includes metadata setup,
+sequential inputs, consumption and cleanup; non-exchange queries report zeros.
+These are elapsed wall times, not CPU time, physical disk latency or wire RPCs.
+
+The three 4096-size local fixtures attribute most exchange time to sequential
+inputs (see the validation checkpoint). This supports evaluating interleaved
+input scheduling under one parent snapshot and one aggregate worker limit.
+It does not establish the benefit of two producer threads, a process pool or
+parallel local join consumers. Execution order/policies and budgets are unchanged.

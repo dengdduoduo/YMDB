@@ -11,6 +11,7 @@
 #include <unistd.h>
 
 #include "query/exceptions.h"
+#include "yb/mdb/query/executor/wall_time_scope.h"
 #include "query/executor/hash_join.h"
 
 namespace yb::mdb {
@@ -126,6 +127,7 @@ class Spill {
     return Status::OK();
   }
   Status Cleanup() {
+    WallTimeScope timer(&c_.stats->exchange_cleanup_us);
     Status failure;
     for (auto& side : files) for (auto& file : side) {
       if (file.fd >= 0) { close(file.fd); file.fd = -1; }
@@ -248,6 +250,7 @@ Status ExchangeRows(const FragmentOpenPB& input, const WorkerOptions& options,
   if (!control.stats) return STATUS(InvalidArgument, "MDB exchange requires query statistics");
   RETURN_NOT_OK(Check(control));
   auto& stats = *control.stats;
+  WallTimeScope total_timer(&stats.exchange_total_us);
   ++stats.exchange_operators;
   const std::array<Layout, 2> layouts = {Variables(input.triples(0)), Variables(input.triples(1))};
   Layout keys;
@@ -258,80 +261,94 @@ Status ExchangeRows(const FragmentOpenPB& input, const WorkerOptions& options,
     key_columns[side].push_back(std::find(layouts[side].begin(), layouts[side].end(), key) - layouts[side].begin());
   try {
     Spill spill(options, control);
-    RETURN_NOT_OK(spill.Init(layouts));
+    {
+      WallTimeScope setup_timer(&stats.exchange_setup_us);
+      RETURN_NOT_OK(spill.Init(layouts));
+    }
     std::array<uint64_t, 2> totals = {0, 0};
     for (size_t side = 0; side < 2; ++side) {
       Status failure;
-      const auto load = producer(side, [&](const std::vector<uint64_t>& row) -> Status {
-        if (!failure.ok()) return failure;
-        auto append = [&]() -> Status {
-          RETURN_NOT_OK(Check(control));
-          if (row.size() != layouts[side].size()) return STATUS(Corruption, "Exchange producer layout mismatch");
-          std::vector<uint64_t> values;
-          for (auto col : key_columns[side]) values.push_back(row[col]);
-          const size_t p = options.exchange == ExchangeMode::Hash
-              ? Hash(values) % options.exchange_partitions : totals[side] % options.exchange_partitions;
-          if (side == 1 && options.exchange == ExchangeMode::Broadcast) {
-            for (size_t bucket = 0; bucket < options.exchange_partitions; ++bucket) {
-              RETURN_NOT_OK(spill.Append(side, bucket, row));
-              ++stats.exchange_broadcast_rows;
-            }
-          } else RETURN_NOT_OK(spill.Append(side, p, row));
-          ++totals[side];
-          if (side) ++stats.exchange_right_rows; else ++stats.exchange_left_rows;
-          return Status::OK();
-        };
-        failure = append();
-        return failure;
-      });
+      Status load;
+      {
+        WallTimeScope input_timer(side ? &stats.exchange_right_input_us : &stats.exchange_left_input_us);
+        load = producer(side, [&](const std::vector<uint64_t>& row) -> Status {
+          WallTimeScope partition_timer(&stats.exchange_partition_us);
+          if (!failure.ok()) return failure;
+          auto append = [&]() -> Status {
+            RETURN_NOT_OK(Check(control));
+            if (row.size() != layouts[side].size()) return STATUS(Corruption, "Exchange producer layout mismatch");
+            std::vector<uint64_t> values;
+            for (auto col : key_columns[side]) values.push_back(row[col]);
+            const size_t p = options.exchange == ExchangeMode::Hash
+                ? Hash(values) % options.exchange_partitions : totals[side] % options.exchange_partitions;
+            if (side == 1 && options.exchange == ExchangeMode::Broadcast) {
+              for (size_t bucket = 0; bucket < options.exchange_partitions; ++bucket) {
+                RETURN_NOT_OK(spill.Append(side, bucket, row));
+                ++stats.exchange_broadcast_rows;
+              }
+            } else RETURN_NOT_OK(spill.Append(side, p, row));
+            ++totals[side];
+            if (side) ++stats.exchange_right_rows; else ++stats.exchange_left_rows;
+            return Status::OK();
+          };
+          failure = append();
+          return failure;
+        });
+      }
       RETURN_NOT_OK(failure); RETURN_NOT_OK(load);
     }
     // One consumer at a time. Oversized/hot build partitions are range-chunked;
     // each left partition is rescanned for every disjoint right chunk. Duplicate
     // keys keep their complete Cartesian bag without recursive repartitioning.
-    for (size_t p = 0; p < options.exchange_partitions; ++p) {
-      RETURN_NOT_OK(Check(control));
-      const auto& left = spill.files[0][p]; const auto& right = spill.files[1][p];
-      RETURN_NOT_OK(spill.Validate(left)); RETURN_NOT_OK(spill.Validate(right));
-      if (!left.rows || !right.rows) continue;
-      const uint64_t average = options.exchange == ExchangeMode::Broadcast ? totals[1] :
-          (totals[1] + options.exchange_partitions - 1) / options.exchange_partitions;
-      if (right.rows > average * options.exchange_skew_factor) ++stats.exchange_skew_partitions;
-      for (uint64_t offset = 0; offset < right.rows;) {
-        auto build = std::make_unique<DiskIter>(spill, right, layouts[1], offset, right.rows - offset);
-        auto* range = build.get();
-        auto probe = std::make_unique<DiskIter>(spill, left, layouts[0], 0, left.rows);
-        std::vector<VarId> join_keys, build_vars;
-        for (auto key : keys) join_keys.emplace_back(key);
-        for (auto var : layouts[1]) build_vars.emplace_back(var);
-        BatchJoinOptions hash_options;
-        hash_options.memory_bytes = options.exchange_memory_bytes - Overhead(input, options);
-        hash_options.batch_bytes = 4096; hash_options.input_rows = 32; hash_options.output_rows = 64;
-        // Disk sources perform the explicit query checks. No storage pages or
-        // shared parent transaction session are opened by this local HashJoin.
-        HashJoin join(std::move(build), std::move(probe), std::move(join_keys), std::move(build_vars), nullptr, hash_options);
-        Binding binding(input.variable_count());
-        RETURN_NOT_OK(join.Open(binding));
-        const auto count = std::min<uint64_t>(right.rows - offset, join.build_capacity());
-        range->SetLimit(count);
-        stats.exchange_peak_reserved_bytes = std::max<uint64_t>(stats.exchange_peak_reserved_bytes,
-            join.reserved_bytes() + Overhead(input, options));
-        ++stats.exchange_join_passes;
-        if (count < right.rows) ++stats.exchange_chunked_passes;
-        while (true) {
-          RETURN_NOT_OK(Check(control));
-          auto batch = VERIFY_RESULT(join.NextBatch());
-          for (size_t row = 0; row < batch.rows(); ++row) {
+    {
+      WallTimeScope consume_timer(&stats.exchange_consume_us);
+      for (size_t p = 0; p < options.exchange_partitions; ++p) {
+        RETURN_NOT_OK(Check(control));
+        const auto& left = spill.files[0][p]; const auto& right = spill.files[1][p];
+        RETURN_NOT_OK(spill.Validate(left)); RETURN_NOT_OK(spill.Validate(right));
+        if (!left.rows || !right.rows) continue;
+        const uint64_t average = options.exchange == ExchangeMode::Broadcast ? totals[1] :
+            (totals[1] + options.exchange_partitions - 1) / options.exchange_partitions;
+        if (right.rows > average * options.exchange_skew_factor) ++stats.exchange_skew_partitions;
+        for (uint64_t offset = 0; offset < right.rows;) {
+          auto build = std::make_unique<DiskIter>(spill, right, layouts[1], offset, right.rows - offset);
+          auto* range = build.get();
+          auto probe = std::make_unique<DiskIter>(spill, left, layouts[0], 0, left.rows);
+          std::vector<VarId> join_keys, build_vars;
+          for (auto key : keys) join_keys.emplace_back(key);
+          for (auto var : layouts[1]) build_vars.emplace_back(var);
+          BatchJoinOptions hash_options;
+          hash_options.memory_bytes = options.exchange_memory_bytes - Overhead(input, options);
+          hash_options.batch_bytes = 4096; hash_options.input_rows = 32; hash_options.output_rows = 64;
+          // Disk sources perform the explicit query checks. No storage pages or
+          // shared parent transaction session are opened by this local HashJoin.
+          HashJoin join(std::move(build), std::move(probe), std::move(join_keys), std::move(build_vars), nullptr, hash_options);
+          Binding binding(input.variable_count());
+          RETURN_NOT_OK(join.Open(binding));
+          const auto count = std::min<uint64_t>(right.rows - offset, join.build_capacity());
+          range->SetLimit(count);
+          stats.exchange_peak_reserved_bytes = std::max<uint64_t>(stats.exchange_peak_reserved_bytes,
+              join.reserved_bytes() + Overhead(input, options));
+          ++stats.exchange_join_passes;
+          if (count < right.rows) ++stats.exchange_chunked_passes;
+          while (true) {
             RETURN_NOT_OK(Check(control));
-            RETURN_NOT_OK(batch.CopyRow(row, &binding));
-            std::vector<uint64_t> output;
-            for (auto var : input.projection()) output.push_back(binding[VarId(var)].id);
-            RETURN_NOT_OK(sink(output));
-            ++stats.exchange_output_rows;
+            auto batch = VERIFY_RESULT(join.NextBatch());
+            for (size_t row = 0; row < batch.rows(); ++row) {
+              RETURN_NOT_OK(Check(control));
+              RETURN_NOT_OK(batch.CopyRow(row, &binding));
+              std::vector<uint64_t> output;
+              for (auto var : input.projection()) output.push_back(binding[VarId(var)].id);
+              {
+                WallTimeScope sink_timer(&stats.exchange_sink_us);
+                RETURN_NOT_OK(sink(output));
+              }
+              ++stats.exchange_output_rows;
+            }
+            if (batch.eof) break;
           }
-          if (batch.eof) break;
+          offset += count;
         }
-        offset += count;
       }
     }
     RETURN_NOT_OK(Check(control));
