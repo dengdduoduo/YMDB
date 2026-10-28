@@ -12,6 +12,7 @@
 #include "rapidjson/document.h"
 #include <algorithm>
 #include <chrono>
+#include <cerrno>
 #include <cstdlib>
 #include <csignal>
 #include <fstream>
@@ -3572,6 +3573,134 @@ TEST_F(MdbWorkerBatchTest, ConcurrentCommitDoesNotMoveLookaheadReadView) {
   ASSERT_OK(ReadView(*plan,**view,&snapshot,&reads)); ASSERT_EQ(snapshot,expected);
   Rows fresh;
   ASSERT_OK(Read(*plan,&fresh,&reads)); ASSERT_EQ(fresh,fresh_expected);
+}
+}  // namespace
+}  // namespace yb::mdb
+
+
+namespace yb::mdb {
+namespace {
+class MdbWorkerExitTest : public MdbWorkerProbeTest {
+ protected:
+  Result<FragmentPlan> WholeTablePlan() {
+    auto plan = VERIFY_RESULT(Plan({{-1,9000,-2},{-2,9001,-3}}, 3, {0,2}, 4, 128));
+    // One task spanning the table isolates EOF cleanup from scheduling other tasks.
+    plan.tasks.resize(1);
+    plan.tasks.front().partition_end.clear();
+    return plan;
+  }
+  std::string Wrapper(const std::string& suffix) {
+    const auto path = GetTestPath("worker-exit-wrapper");
+    std::ofstream file(path);
+    file << "#!/bin/sh\n'" << workers_.binary << "' \"$@\"\n"
+            "rc=$?\n[ \"$rc\" -eq 0 ] || exit \"$rc\"\n" << suffix;
+    file.close();
+    std::filesystem::permissions(path, std::filesystem::perms::owner_all);
+    return path;
+  }
+  Status Run(const FragmentPlan& plan, DocDBReadContext& view, const std::string& binary,
+             Rows* rows, std::atomic<bool>* delivered = nullptr) {
+    auto options = workers_;
+    options.binary = binary;
+    options.page_rows = 4; options.batch_rows = 128; options.max_workers = 1;
+    return GatherFragments(plan, options, view, [&](const auto& row) {
+      rows->insert(row);
+      if (delivered && rows->size() == 6) *delivered = true;
+      return Status::OK();
+    });
+  }
+  void CheckReaped(const std::string& profile_pids) {
+    std::istringstream pids(profile_pids);
+    std::string pid;
+    while (std::getline(pids, pid, ',')) {
+      errno = 0;
+      ASSERT_EQ(kill(static_cast<pid_t>(std::stoll(pid)), 0), -1);
+      ASSERT_EQ(errno, ESRCH);
+    }
+  }
+};
+
+TEST_F(MdbWorkerExitTest, SuccessfulEofWaitsForNaturalExit) {
+  Seed(3);
+  auto plan = WholeTablePlan(); ASSERT_OK(plan);
+  const auto marker = GetTestPath("worker-completed");
+  const auto binary = Wrapper("sleep 0.1\nprintf '%s\\n' \"$$\" > '" + marker + "'\nexit 0\n");
+  auto view = RdfYBModel::Instance().NewQueryReadContext(); ASSERT_OK(view);
+  Rows rows, expected;
+  for (uint64_t s = 101; s < 104; ++s)
+    for (uint64_t o : {1001,1002}) expected.insert({s,o});
+  ASSERT_OK(Run(*plan, **view, binary, &rows));
+  ASSERT_EQ(rows, expected);
+  ASSERT_TRUE(std::filesystem::exists(marker));
+  ASSERT_NO_FATALS(CheckReaped((*view)->stats.remote_worker_pids));
+  std::ifstream completed(marker); std::string pid; completed >> pid;
+  ASSERT_FALSE(pid.empty()); ASSERT_NO_FATALS(CheckReaped(pid));
+}
+
+TEST_F(MdbWorkerExitTest, NonzeroOrSignalAfterEofFailsAndRecovers) {
+  Seed(3);
+  auto plan = WholeTablePlan(); ASSERT_OK(plan);
+  for (const auto& ending : {"exit 23\n", "kill -TERM $$\n"}) {
+    auto view = RdfYBModel::Instance().NewQueryReadContext(); ASSERT_OK(view);
+    Rows rows;
+    const auto status = Run(*plan, **view, Wrapper(ending), &rows);
+    ASSERT_TRUE(status.IsRuntimeError()) << status;
+    ASSERT_NE(status.ToString().find("non-zero exit status"), std::string::npos) << status;
+    ASSERT_EQ(rows.size(), 6);
+    ASSERT_NO_FATALS(CheckReaped((*view)->stats.remote_worker_pids));
+  }
+  auto fresh = Query(kQuery, workers_);
+  ASSERT_EQ(fresh.status, 0); ASSERT_EQ(fresh.values.size(), 6);
+}
+
+TEST_F(MdbWorkerExitTest, EofCleanupHonorsDeadlineAndReaps) {
+  Seed(3);
+  auto plan = WholeTablePlan(); ASSERT_OK(plan);
+  const auto marker = GetTestPath("worker-waiting");
+  const auto binary = Wrapper("printf '%s\\n' \"$$\" > '" + marker + "'\nexec /bin/sleep 30\n");
+  auto view = RdfYBModel::Instance().NewQueryReadContext(); ASSERT_OK(view);
+  (*view)->deadline = CoarseMonoClock::Now() + MonoDelta::FromSeconds(5);
+  const auto begin = std::chrono::steady_clock::now();
+  Rows rows; const auto status = Run(*plan, **view, binary, &rows);
+  ASSERT_TRUE(status.IsTimedOut()) << status;
+  ASSERT_NE(status.ToString().find("worker exit"), std::string::npos) << status;
+  ASSERT_EQ(rows.size(), 6); ASSERT_TRUE(std::filesystem::exists(marker));
+  ASSERT_LT(std::chrono::steady_clock::now() - begin, std::chrono::seconds(8));
+  std::ifstream waiting(marker); std::string pid; waiting >> pid;
+  ASSERT_FALSE(pid.empty()); ASSERT_NO_FATALS(CheckReaped(pid));
+  ASSERT_NO_FATALS(CheckReaped((*view)->stats.remote_worker_pids));
+  const auto recovered = Query(kQuery, workers_);
+  ASSERT_EQ(recovered.status, 0); ASSERT_EQ(recovered.values.size(), 6);
+}
+
+TEST_F(MdbWorkerExitTest, EofCleanupHonorsCancellationAndReaps) {
+  Seed(3);
+  auto plan = WholeTablePlan(); ASSERT_OK(plan);
+  const auto marker = GetTestPath("worker-waiting");
+  const auto binary = Wrapper("printf '%s\\n' \"$$\" > '" + marker + "'\nexec /bin/sleep 30\n");
+  auto view = RdfYBModel::Instance().NewQueryReadContext(); ASSERT_OK(view);
+  std::atomic<bool> stop{false}, seen{false}, delivered{false};
+  TestThreadHolder cancellation;
+  cancellation.AddThreadFunctor([&] {
+    while (!stop.load()) {
+      if (delivered.load() && std::filesystem::exists(marker)) {
+        seen = true; (*view)->cancelled = true; break;
+      }
+      SleepFor(MonoDelta::FromMilliseconds(1));
+    }
+  });
+  const auto begin = std::chrono::steady_clock::now();
+  Rows rows; const auto status = Run(*plan, **view, binary, &rows, &delivered);
+  stop = true; cancellation.JoinAll();
+  ASSERT_TRUE(seen.load()); ASSERT_TRUE(status.IsAborted()) << status;
+  ASSERT_NE(status.ToString().find("worker exit"), std::string::npos) << status;
+  ASSERT_EQ(rows.size(), 6);
+  ASSERT_LT(std::chrono::steady_clock::now() - begin, std::chrono::seconds(5));
+  std::ifstream waiting(marker); std::string pid; waiting >> pid;
+  ASSERT_FALSE(pid.empty()); ASSERT_NO_FATALS(CheckReaped(pid));
+  ASSERT_NO_FATALS(CheckReaped((*view)->stats.remote_worker_pids));
+  const auto recovered = Query(kQuery, workers_);
+  ASSERT_EQ(recovered.status, 0); ASSERT_EQ(recovered.values.size(), 6);
 }
 }  // namespace
 }  // namespace yb::mdb

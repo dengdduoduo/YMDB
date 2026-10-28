@@ -6,7 +6,7 @@ typed result callbacks, persistent dictionary recovery and multi-writer checks,
 explicit client/transaction lifetime handling, dictionary startup/page work,
 and bounded worker probe reuse/lookahead. These are research prototype changes.
 
-## Latest actual validation
+## Leaf-batching validation
 
 Release/clang21 built through yb_build.sh. Latest batch: 27 distinct GTests passed,
 including seven new batch gates and existing probe/snapshot/budget/cancel/exit
@@ -40,4 +40,24 @@ coverage, tail latency, SOTA ranking or production readiness. Process reuse and
 parallel/global execution extensions remain separate work. No latest Debug,
 ASan or peak-RSS validation was performed. A historical mismatched-size-class
 shutdown incident has not recurred in the latest gates but its exact root cause
-is still unconfirmed. Full natural worker-exit protocol remains incomplete.
+is still unconfirmed. Normal EOF now waits for a zero local worker or SSH transport exit. Failure
+cleanup still uses local kill/reap; full remote failure lifecycle under real
+multi-machine faults remains unverified.
+
+
+## Worker completion follow-up
+
+Ten related Release tests passed: four new MdbWorkerExitTest gates (delayed
+normal exit, nonzero/signal after EOF, deadline, cancellation) and existing
+worker-failure/recovery, shared snapshot, authenticated SSH/host-key rejection,
+CLI output staging, repeated API/fresh CLI shutdown, and Shared4096 fixtures.
+Before the fix, the first two gates reproduced premature kill and a false
+successful query after a failing process exit. EOF completion now checks exit
+status before adopting the child result; deadline/cancellation still apply.
+Consumers must discard already streamed rows when the final query status fails.
+
+Shared4096 recheck validated all 26 typed observations. Three-worker repeated
+API median was 372.93 ms (previous batch 377.21 ms); median cleanup was 12.36 ms.
+This is a related no-regression check, not a new speedup claim or a tail-latency
+measurement. Persistent process/client pools are deferred pending measured
+benefit and explicit state/snapshot reset design.

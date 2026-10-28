@@ -172,3 +172,19 @@ reads, prefetch hits, base and additional reservations. A flush is not a wire
 RPC. Diagnostics are opt-in; the protobuf protocol and default join strategy
 are unchanged. Process reuse and batching at intermediate levels remain work
 for separate milestones.
+
+
+## Worker completion boundary
+
+Gather waits for a zero worker (or SSH transport) exit after a valid final
+frame, before adopting its child transaction result or scheduling the next
+task. Closing stdin ends the request side; nonblocking wait polls still honor
+the original query deadline and cancellation. Errors retain the existing
+kill/reap fallback. EOF alone no longer hides a failing process destructor.
+Streaming callbacks may already have received rows before a late failure;
+callers must discard failed query output, as the CLI already does.
+
+Process/client pools are deferred. Current OPEN timing includes storage/client
+initialization and snapshot setup, so it is not an estimate of reusable startup
+cost. Persistent workers would need explicit snapshot/state reset and failure
+isolation; this change adds neither a service nor a new protocol/configuration.

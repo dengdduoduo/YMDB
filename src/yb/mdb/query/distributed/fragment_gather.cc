@@ -33,6 +33,23 @@ struct Stream {
   uint64_t read_operations = 0;
 };
 
+Status FinishWorker(Subprocess& process, DocDBReadContext& context) {
+  // EOF completes the data stream, not the process. A cleanup crash must fail
+  // the query instead of being hidden by Subprocess's SIGKILL fallback.
+  close(process.ReleaseChildStdinFd());
+  for (;;) {
+    if (context.cancelled.load(std::memory_order_relaxed))
+      return STATUS(Aborted, "MDB worker exit cancelled");
+    if (CoarseMonoClock::Now() >= context.deadline)
+      return STATUS(TimedOut, "MDB worker exit deadline expired");
+    int exit_status;
+    const auto status = process.WaitNoBlock(&exit_status);
+    if (status.ok()) return process.Wait();  // Checks the cached exit status.
+    if (!status.IsTimedOut()) return status;
+    SleepFor(MonoDelta::FromMilliseconds(1));
+  }
+}
+
 Status CheckResponse(const FragmentResponsePB& response, const FragmentRequestPB& request) {
   if (response.version() != request.version() || response.query_id() != request.query_id() ||
       response.fragment_id() != request.fragment_id() || response.attempt_id() != request.attempt_id() ||
@@ -166,6 +183,7 @@ Status GatherFragments(const FragmentPlan& plan, const WorkerOptions& options,
       if (!response.has_transaction_result()) return STATUS(Corruption, "Missing MDB child read result");
       {
         WallTimeScope timer(&context.stats.remote_cleanup_us);
+        RETURN_NOT_OK(FinishWorker(*stream.process, context));
         RETURN_NOT_OK(context.ApplyChild(response.transaction_result()));
         active.erase(active.begin() + current);
       }
