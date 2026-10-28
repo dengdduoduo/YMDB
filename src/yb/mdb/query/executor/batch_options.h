@@ -71,6 +71,8 @@ struct BatchQueryStats {
   uint64_t global_reserved_bytes = 0;
   uint64_t global_finalize_operators = 0;
   // Input includes partition callbacks; consume includes the output sink.
+  uint64_t exchange_input_us = 0;
+  uint64_t exchange_interleaved_operators = 0;
   uint64_t exchange_total_us = 0;
   uint64_t exchange_setup_us = 0;
   uint64_t exchange_left_input_us = 0;

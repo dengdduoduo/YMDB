@@ -125,6 +125,8 @@ std::string BatchQueryStats::ToJson() const {
   MDB_STAT(global_input_rows);
   MDB_STAT(global_reserved_bytes);
   MDB_STAT(global_finalize_operators);
+  MDB_STAT(exchange_input_us);
+  MDB_STAT(exchange_interleaved_operators);
   MDB_STAT(exchange_total_us);
   MDB_STAT(exchange_setup_us);
   MDB_STAT(exchange_left_input_us);

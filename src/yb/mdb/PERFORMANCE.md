@@ -204,7 +204,8 @@ input rather than process RSS. No result-sized queue or extra credit is added.
 
 Per-stream sequence/schema/identity, snapshot and final zero-exit checks remain.
 Unordered query rows may interleave differently; ORDER BY still uses the global
-finalizer. OPEN acknowledgements, EOF cleanup and the sink remain synchronous.
+finalizer. EOF cleanup and the sink remain synchronous. OPEN acknowledgements now use
+the same ready-frame loop (see the two-input follow-up).
 This is receive-side progress under uneven workers, not parallel exchange
 consumers, external global sorting or a persistent worker service.
 
@@ -227,3 +228,35 @@ inputs (see the validation checkpoint). This supports evaluating interleaved
 input scheduling under one parent snapshot and one aggregate worker limit.
 It does not establish the benefit of two producer threads, a process pool or
 parallel local join consumers. Execution order/policies and budgets are unchanged.
+
+
+## Interleaved two-input follow-up
+
+Opt-in Hash/Broadcast exchange now supplies both inputs through one Gather
+event loop. It alternates task admission across inputs and skips exhausted or
+empty inputs, with one aggregate max_workers cap. All tasks use one exported
+child read view. Storage identity/coverage and both physical inputs are checked
+before launch; fragment IDs are unique across the pair, and each stream uses
+its own projection width. Per-stream credit, frame bounds, schema/envelope and
+zero-exit completion checks remain. Both inputs must succeed before join output.
+
+OPEN acknowledgements and data frames share the bounded incremental reader.
+Refilling a slot no longer blocks on that worker's OPEN; other active streams
+can progress. remote_open_wait_us counts pooled waits ending in an OPEN frame;
+remote_pull_wait_us counts waits ending in data (and failed waits). These are
+disjoint coordinator wait samples, not individual worker startup lifetimes.
+Their attribution differs from the prior synchronous OPEN implementation.
+
+exchange_input_us is the whole, non-overlapping input phase in both APIs.
+The retained serial ExchangeRows API also records left_input/right_input_us;
+those legacy fields are zero for the interleaved adapter path. The adapter
+increments exchange_interleaved_operators. Use setup+input+consume+cleanup
+against exchange_total_us; partition remains nested in input, sink in consume.
+Do not infer that zero legacy side counters mean no input work.
+
+No new threads, CLI flag, process pool, extra credit, default exchange selection
+or larger resource budget is introduced. Plan-pair metadata replaces sequential
+child-plan metadata; buffered frames and worker reservations still depend on
+the aggregate active count, not twice that count. EOF cleanup, sinks and local
+join consumers remain synchronous. Current small local comparisons have mixed
+timing results; independent progress is validated, not universal speedup.

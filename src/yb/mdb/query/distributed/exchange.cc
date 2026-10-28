@@ -244,8 +244,9 @@ Status ValidateExchange(const FragmentOpenPB& input, const WorkerOptions& option
   return Status::OK();
 }
 
-Status ExchangeRows(const FragmentOpenPB& input, const WorkerOptions& options,
-                    ExchangeControl control, const ExchangeInput& producer, const FragmentRowSink& sink) {
+Status ExchangeRowsWithInputs(const FragmentOpenPB& input, const WorkerOptions& options,
+                              ExchangeControl control, const ExchangeInputs& producer,
+                              const FragmentRowSink& sink) {
   RETURN_NOT_OK(ValidateExchange(input, options));
   if (!control.stats) return STATUS(InvalidArgument, "MDB exchange requires query statistics");
   RETURN_NOT_OK(Check(control));
@@ -266,37 +267,36 @@ Status ExchangeRows(const FragmentOpenPB& input, const WorkerOptions& options,
       RETURN_NOT_OK(spill.Init(layouts));
     }
     std::array<uint64_t, 2> totals = {0, 0};
-    for (size_t side = 0; side < 2; ++side) {
-      Status failure;
-      Status load;
-      {
-        WallTimeScope input_timer(side ? &stats.exchange_right_input_us : &stats.exchange_left_input_us);
-        load = producer(side, [&](const std::vector<uint64_t>& row) -> Status {
-          WallTimeScope partition_timer(&stats.exchange_partition_us);
-          if (!failure.ok()) return failure;
-          auto append = [&]() -> Status {
-            RETURN_NOT_OK(Check(control));
-            if (row.size() != layouts[side].size()) return STATUS(Corruption, "Exchange producer layout mismatch");
-            std::vector<uint64_t> values;
-            for (auto col : key_columns[side]) values.push_back(row[col]);
-            const size_t p = options.exchange == ExchangeMode::Hash
-                ? Hash(values) % options.exchange_partitions : totals[side] % options.exchange_partitions;
-            if (side == 1 && options.exchange == ExchangeMode::Broadcast) {
-              for (size_t bucket = 0; bucket < options.exchange_partitions; ++bucket) {
-                RETURN_NOT_OK(spill.Append(side, bucket, row));
-                ++stats.exchange_broadcast_rows;
-              }
-            } else RETURN_NOT_OK(spill.Append(side, p, row));
-            ++totals[side];
-            if (side) ++stats.exchange_right_rows; else ++stats.exchange_left_rows;
-            return Status::OK();
-          };
-          failure = append();
-          return failure;
-        });
-      }
-      RETURN_NOT_OK(failure); RETURN_NOT_OK(load);
+    Status failure;
+    Status load;
+    {
+      WallTimeScope input_timer(&stats.exchange_input_us);
+      load = producer([&](size_t side, const std::vector<uint64_t>& row) -> Status {
+        WallTimeScope partition_timer(&stats.exchange_partition_us);
+        if (!failure.ok()) return failure;
+        auto append = [&]() -> Status {
+          RETURN_NOT_OK(Check(control));
+          if (side >= 2) return STATUS(InvalidArgument, "Exchange producer side outside pair");
+          if (row.size() != layouts[side].size()) return STATUS(Corruption, "Exchange producer layout mismatch");
+          std::vector<uint64_t> values;
+          for (auto col : key_columns[side]) values.push_back(row[col]);
+          const size_t p = options.exchange == ExchangeMode::Hash
+              ? Hash(values) % options.exchange_partitions : totals[side] % options.exchange_partitions;
+          if (side == 1 && options.exchange == ExchangeMode::Broadcast) {
+            for (size_t bucket = 0; bucket < options.exchange_partitions; ++bucket) {
+              RETURN_NOT_OK(spill.Append(side, bucket, row));
+              ++stats.exchange_broadcast_rows;
+            }
+          } else RETURN_NOT_OK(spill.Append(side, p, row));
+          ++totals[side];
+          if (side) ++stats.exchange_right_rows; else ++stats.exchange_left_rows;
+          return Status::OK();
+        };
+        failure = append();
+        return failure;
+      });
     }
+    RETURN_NOT_OK(failure); RETURN_NOT_OK(load);
     // One consumer at a time. Oversized/hot build partitions are range-chunked;
     // each left partition is rescanned for every disjoint right chunk. Duplicate
     // keys keep their complete Cartesian bag without recursive repartitioning.
@@ -358,17 +358,34 @@ Status ExchangeRows(const FragmentOpenPB& input, const WorkerOptions& options,
   }
 }
 
+Status ExchangeRows(const FragmentOpenPB& input, const WorkerOptions& options,
+                    ExchangeControl control, const ExchangeInput& producer,
+                    const FragmentRowSink& sink) {
+  return ExchangeRowsWithInputs(input, options, control, [&](const FragmentInputSink& append) -> Status {
+    for (size_t side = 0; side < 2; ++side) {
+      WallTimeScope timer(side ? &control.stats->exchange_right_input_us :
+                                 &control.stats->exchange_left_input_us);
+      RETURN_NOT_OK(producer(side, [&](const auto& row) { return append(side, row); }));
+    }
+    return Status::OK();
+  }, sink);
+}
+
 Status GatherExchangeFragments(const FragmentPlan& plan, const WorkerOptions& options,
                                DocDBReadContext& context, const FragmentRowSink& sink) {
   ExchangeControl control{&context.cancelled, context.deadline, &context.stats, &context.deadline};
-  return ExchangeRows(plan.physical, options, control,
-      [&](size_t side, const FragmentRowSink& input) -> Status {
-        FragmentPlan child = plan;
-        child.physical.clear_triples();
-        *child.physical.add_triples() = plan.physical.triples(side);
-        child.physical.clear_projection();
-        for (auto var : Variables(child.physical.triples(0))) child.physical.add_projection(var);
-        return GatherFragments(child, options, context, input);
+  return ExchangeRowsWithInputs(plan.physical, options, control,
+      [&](const FragmentInputSink& input) -> Status {
+        std::array<FragmentPlan, 2> children = {plan, plan};
+        for (size_t side = 0; side < 2; ++side) {
+          auto& child = children[side];
+          child.physical.clear_triples();
+          *child.physical.add_triples() = plan.physical.triples(side);
+          child.physical.clear_projection();
+          for (auto var : Variables(child.physical.triples(0))) child.physical.add_projection(var);
+        }
+        ++context.stats.exchange_interleaved_operators;
+        return GatherFragmentPair(children, options, context, input);
       }, sink);
 }
 

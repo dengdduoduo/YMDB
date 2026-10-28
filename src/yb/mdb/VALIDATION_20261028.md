@@ -106,3 +106,38 @@ sum exactly. Input includes partition; consume includes sink. These results
 identify sequential input production as the next candidate, without a speedup
 claim. No concurrent input implementation, default exchange selection, new
 memory budget or external/global consumer is introduced by this measurement.
+
+
+## Interleaved two-input follow-up
+
+Nineteen distinct related Release GTests passed after the OPEN refinement.
+Seven new cases include four pair/schema/coverage/snapshot/failure gates and
+three comparisons. The first implementation passed correctness but regressed
+local timing; its synchronous OPEN refills were not published. OPEN now uses
+ready-frame dispatch, with a gate proving the right input progresses while the
+left has a partial OPEN or PULL frame. All relevant cases were rerun after this
+source change. The old round and source snapshots remain separate evidence.
+
+Final comparison: 72 complete storage-ID bag observations, n=512, same binary,
+two CPU affinity, workers=1/3, serial/interleaved order alternated, first plus
+five repeats. The serial path uses the same refined single-input Gather.
+Read-context creation, import, parsing and dictionary work are outside this
+boundary. Change is interleaved/serial minus one; positive means slower.
+
+| Shape | Max workers | Serial ms | Interleaved ms | Change |
+|---|---:|---:|---:|---:|
+|unique|1|628.20|622.32|-0.9%|
+|unique|3|437.76|449.73|+2.7%|
+|shared|1|629.40|607.37|-3.5%|
+|shared|3|407.55|378.15|-7.2%|
+|fanout|1|677.92|634.25|-6.4%|
+|fanout|3|482.55|503.47|+4.3%|
+
+Shared4096 additionally checked 26 typed/schema API and fresh coordinator CLI
+observations. Final gates preserve mixed widths, Hash/Broadcast bags, shared
+snapshot vs new writes, aggregate worker/memory limits, prelaunch rejection,
+empty-side completion, quota/cancel/timeout/late-exit cleanup and recovery,
+global modifiers, SSH and CLI behavior. This is one WSL host, not multi-machine
+scaling or a SOTA/tail-latency result. Timing gains are mixed; no general speedup
+or statistical no-regression claim. Profile readers should use exchange_input_us;
+legacy serial side timers are zero on the interleaved adapter path.

@@ -15,12 +15,18 @@ struct ExchangeControl {
 };
 using ExchangeInput = std::function<Status(size_t, const FragmentRowSink&)>;
 
+using ExchangeInputs = std::function<Status(const FragmentInputSink&)>;
+
 Status ValidateExchange(const FragmentOpenPB& input, const WorkerOptions& options);
 // Producers supply all bound columns of their own triple, sorted by variable ID.
 // Both inputs finish before any join output. Errors never become EOF or retry.
 Status ExchangeRows(const FragmentOpenPB& input, const WorkerOptions& options,
                     ExchangeControl control, const ExchangeInput& producer,
                     const FragmentRowSink& sink);
+// A combined producer may interleave the two sides; no consumer starts early.
+Status ExchangeRowsWithInputs(const FragmentOpenPB& input, const WorkerOptions& options,
+                              ExchangeControl control, const ExchangeInputs& producer,
+                              const FragmentRowSink& sink);
 Status GatherExchangeFragments(const FragmentPlan& plan, const WorkerOptions& options,
                                DocDBReadContext& context, const FragmentRowSink& sink);
 

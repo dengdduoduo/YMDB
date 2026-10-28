@@ -3712,11 +3712,11 @@ namespace yb::mdb {
 namespace {
 class MdbReadyGatherTest : public MdbWorkerProbeTest {
  protected:
-  std::string Relay(const std::string& release, const std::string& expired, size_t prefix) {
+  std::string Relay(const std::string& release, const std::string& expired, size_t prefix, bool gate_open = false) {
     const auto path = GetTestPath("ready-relay-" + std::to_string(prefix));
     std::ofstream file(path);
     file << "#!/usr/bin/python3\nimport os,struct,subprocess,sys,time\n"
-            "worker='" << workers_.binary << "'\nrelease='" << release << "'\nexpired='" << expired << "'\nprefix=" << prefix << R"PY(
+            "worker='" << workers_.binary << "'\nrelease='" << release << "'\nexpired='" << expired << "'\nprefix=" << prefix << "\ngate_open=" << (gate_open ? "True" : "False") << R"PY(
 def exact(stream,n):
     out=b''
     while len(out)<n:
@@ -3753,13 +3753,14 @@ try:
         request=frame(sys.stdin.buffer);p.stdin.write(request);p.stdin.flush()
         response=frame(p.stdout)
         eof=number(response[4:],9)
-        if first:fragment=number(request[4:],3);first=False
-        elif fragment==0 and not os.path.exists(release):
+        fragment=number(request[4:],3)
+        if fragment==0 and first==gate_open and not os.path.exists(release):
             sys.stdout.buffer.write(response[:prefix]);sys.stdout.buffer.flush()
             until=time.monotonic()+2
             while not os.path.exists(release) and time.monotonic()<until:time.sleep(.001)
             if not os.path.exists(release):open(expired,'w').close()
             response=response[prefix:]
+        first=False
         sys.stdout.buffer.write(response);sys.stdout.buffer.flush()
         if eof:break
     p.stdin.close();sys.exit(p.wait())
@@ -3888,14 +3889,14 @@ TEST_F(MdbFragmentIntegrationTest, ExchangeStageTimingsFailureAndReset) {
   options.exchange_spill_directory=root;options.batch_rows=128;options.page_rows=16;
   auto check=[&](const std::string& profile,bool active) {
     rapidjson::Document value;value.Parse(profile.c_str());ASSERT_FALSE(value.HasParseError());
-    for(const auto* name:{"exchange_total_us","exchange_setup_us","exchange_left_input_us",
+    for(const auto* name:{"exchange_input_us","exchange_total_us","exchange_setup_us","exchange_left_input_us",
         "exchange_right_input_us","exchange_partition_us","exchange_consume_us",
         "exchange_sink_us","exchange_cleanup_us"}) {
       ASSERT_TRUE(value.HasMember(name)) << name;ASSERT_TRUE(value[name].IsUint64());
       if(!active)ASSERT_EQ(value[name].GetUint64(),0) << name;
     }
     const auto total=value["exchange_total_us"].GetUint64();
-    const auto inputs=value["exchange_left_input_us"].GetUint64()+value["exchange_right_input_us"].GetUint64();
+    const auto inputs=value["exchange_input_us"].GetUint64();
     ASSERT_GE(total,inputs+value["exchange_setup_us"].GetUint64()+
         value["exchange_consume_us"].GetUint64()+value["exchange_cleanup_us"].GetUint64());
     ASSERT_GE(inputs,value["exchange_partition_us"].GetUint64());
@@ -3906,8 +3907,10 @@ TEST_F(MdbFragmentIntegrationTest, ExchangeStageTimingsFailureAndReset) {
   };
   const auto correct=Query(kQuery,options);ASSERT_EQ(correct.status,0);ASSERT_EQ(correct.values.size(),16);
   ASSERT_NO_FATALS(check(correct.profile,true));
-  ASSERT_GT(Field(correct.profile,"exchange_left_input_us"),0);
-  ASSERT_GT(Field(correct.profile,"exchange_right_input_us"),0);
+  ASSERT_GT(Field(correct.profile,"exchange_input_us"),0);
+  ASSERT_EQ(Field(correct.profile,"exchange_left_input_us"),0);
+  ASSERT_EQ(Field(correct.profile,"exchange_right_input_us"),0);
+  ASSERT_EQ(Field(correct.profile,"exchange_interleaved_operators"),1);
   ASSERT_GT(Field(correct.profile,"exchange_partition_us"),0);
   RdfYBModel::Instance().SetWorkerOptions(options);
   size_t rows=0;
@@ -3925,5 +3928,168 @@ TEST_F(MdbFragmentIntegrationTest, ExchangeStageTimingsFailureAndReset) {
   const auto recovered=Query(kQuery,options);ASSERT_EQ(recovered.status,0);ASSERT_EQ(recovered.values,correct.values);
   ASSERT_NO_FATALS(check(recovered.profile,true));ASSERT_TRUE(std::filesystem::is_empty(root));
 }
+}  // namespace
+}  // namespace yb::mdb
+
+
+namespace yb::mdb {
+namespace {
+class MdbInterleavedExchangeTest : public MdbReadyGatherTest {
+ protected:
+  std::array<FragmentPlan,2> Inputs(const FragmentPlan& plan) {
+    std::array<FragmentPlan,2> result={plan,plan};
+    for(size_t side=0;side<2;++side) {
+      auto& open=result[side].physical;open.clear_triples();
+      *open.add_triples()=plan.physical.triples(side);open.clear_projection();
+      std::set<uint32_t> vars;
+      for(const auto& term:open.triples(0).terms())if(term.has_variable())vars.insert(term.variable());
+      for(auto var:vars)open.add_projection(var);
+    }
+    return result;
+  }
+  WorkerOptions Options(size_t workers=3) {
+    auto options=workers_;options.max_workers=workers;options.page_rows=16;options.batch_rows=128;
+    options.exchange=ExchangeMode::Hash;options.exchange_spill_directory=GetTestPath("paired-spill");
+    std::filesystem::create_directories(options.exchange_spill_directory);
+    return options;
+  }
+  Status Run(const FragmentPlan& plan,const WorkerOptions& options,DocDBReadContext& view,
+             bool interleaved,Rows* rows,const FragmentInputSink& hook={}) {
+    const auto children=Inputs(plan);
+    ExchangeControl control{&view.cancelled,view.deadline,&view.stats,&view.deadline};
+    auto output=[&](const auto& row){rows->insert(row);return Status::OK();};
+    if(interleaved) {
+      return ExchangeRowsWithInputs(plan.physical,options,control,[&](const FragmentInputSink& append) {
+        ++view.stats.exchange_interleaved_operators;
+        return GatherFragmentPair(children,options,view,[&](size_t side,const auto& row)->Status {
+          if(hook)RETURN_NOT_OK(hook(side,row));
+          return append(side,row);
+        });
+      },output);
+    }
+    return ExchangeRows(plan.physical,options,control,[&](size_t side,const FragmentRowSink& append) {
+      return GatherFragments(children[side],options,view,[&](const auto& row)->Status {
+        if(hook)RETURN_NOT_OK(hook(side,row));
+        return append(row);
+      });
+    },output);
+  }
+  void CheckClean(const WorkerOptions& options,const DocDBReadContext& view) {
+    ASSERT_EQ(view.stats.exchange_live_files,0);ASSERT_TRUE(std::filesystem::is_empty(options.exchange_spill_directory));
+    ASSERT_LE(view.stats.remote_max_workers,options.max_workers);
+  }
+  void Benchmark(const std::string& shape) {
+    constexpr size_t n=512;
+    const size_t groups=shape=="unique"?n:shape=="shared"?1:32;
+    const size_t fanout=shape=="unique"?1:shape=="shared"?2:16;
+    Rows expected;
+    for(size_t i=0;i<n;++i) {
+      Write(101+i,9000,10000+i%groups);
+      for(size_t j=0;j<fanout;++j)expected.insert({101+i,20000+(i%groups)*fanout+j});
+    }
+    for(size_t g=0;g<groups;++g)for(size_t j=0;j<fanout;++j)Write(10000+g,9001,20000+g*fanout+j);
+    ASSERT_OK(RdfYBModel::Instance().Flush());
+    auto plan=Plan({{-1,9000,-2},{-2,9001,-3}},3,{0,2},16,128);ASSERT_OK(plan);
+    for(size_t workers:{1,3})for(int sample=-1;sample<5;++sample)for(int offset=0;offset<2;++offset) {
+      const bool interleaved=(offset+sample+1)%2;
+      const auto options=Options(workers);auto view=RdfYBModel::Instance().NewQueryReadContext();ASSERT_OK(view);
+      Rows rows;const auto begin=WallMicros();const auto status=Run(*plan,options,**view,interleaved,&rows);
+      const auto elapsed=WallMicros()-begin;ASSERT_OK(status);ASSERT_EQ(rows,expected);
+      ASSERT_EQ((*view)->stats.remote_fragments,8);ASSERT_NO_FATALS(CheckClean(options,**view));
+      ASSERT_GT((*view)->stats.exchange_input_us,0);
+      if(!interleaved)ASSERT_GT((*view)->stats.exchange_left_input_us+(*view)->stats.exchange_right_input_us,0);
+      LOG(INFO)<<"INTERLEAVE_SAMPLE {\"shape\":\""<<shape<<"\",\"n\":"<<n
+          <<",\"workers\":"<<workers<<",\"mode\":\""<<(interleaved?"interleaved":"serial")
+          <<"\",\"sample\":"<<sample<<",\"elapsed_us\":"<<elapsed<<",\"rows\":"<<rows.size()
+          <<",\"correct\":true,\"profile\":"<<(*view)->stats.ToJson()<<"}";
+    }
+  }
+};
+
+TEST_F(MdbInterleavedExchangeTest, PairSchemasBagsAndAggregateWorkerLimit) {
+  Seed(32);auto plan=Plan({{-1,9000,-2},{-2,-4,-3}},4,{0,2},16,128);ASSERT_OK(plan);
+  Rows expected;for(uint64_t s=101;s<133;++s)for(uint64_t o:{1001,1002})expected.insert({s,o});
+  for(size_t workers:{1,2,3})for(auto mode:{ExchangeMode::Hash,ExchangeMode::Broadcast}) {
+    auto options=Options(workers);options.exchange=mode;options.exchange_memory_bytes=65536;
+    auto view=RdfYBModel::Instance().NewQueryReadContext();ASSERT_OK(view);Rows rows;
+    ASSERT_OK(Run(*plan,options,**view,true,&rows));ASSERT_EQ(rows,expected);
+    ASSERT_EQ((*view)->stats.remote_fragments,8);ASSERT_EQ((*view)->stats.remote_max_workers,workers);
+    ASSERT_LE((*view)->stats.exchange_peak_reserved_bytes,options.exchange_memory_bytes);
+    ASSERT_NO_FATALS(CheckClean(options,**view));
+  }
+}
+
+TEST_F(MdbInterleavedExchangeTest, OtherInputProgressesWhileFirstHasPartialFrame) {
+  Seed(32);auto plan=Plan({{-1,9000,-2},{-2,9001,-3}},3,{0,2},4,1);ASSERT_OK(plan);
+  auto options=Options();options.page_rows=4;options.batch_rows=1;
+  for(bool gate_open:{false,true}) {
+    const auto release=GetTestPath(gate_open?"right-open-release":"right-pull-release");
+    const auto expired=GetTestPath(gate_open?"right-open-expired":"right-pull-expired");
+    options.binary=Relay(release,expired,gate_open?2:5,gate_open);
+    auto view=RdfYBModel::Instance().NewQueryReadContext();ASSERT_OK(view);Rows rows;
+    ASSERT_OK(Run(*plan,options,**view,true,&rows,[&](size_t side,const auto&)->Status {
+      if(side==1){std::ofstream signal(release);signal<<"right input progressed\n";}
+      return Status::OK();
+    }));
+    Rows expected;for(uint64_t s=101;s<133;++s)for(uint64_t o:{1001,1002})expected.insert({s,o});
+    ASSERT_EQ(rows,expected);ASSERT_TRUE(std::filesystem::exists(release));
+    ASSERT_FALSE(std::filesystem::exists(expired));ASSERT_NO_FATALS(CheckClean(options,**view));
+  }
+}
+
+TEST_F(MdbInterleavedExchangeTest, SharedSnapshotAndFreshQueryVisibility) {
+  Seed(32);RegisterRdfIdentity(1003,RdfIdentity(TripleTermType::URI,Iri(1003)));
+  auto plan=Plan({{-1,9000,-2},{-2,9001,-3}},3,{0,2},16,128);ASSERT_OK(plan);
+  auto options=Options();auto view=RdfYBModel::Instance().NewQueryReadContext();ASSERT_OK(view);
+  bool written=false;Rows rows;
+  ASSERT_OK(Run(*plan,options,**view,true,&rows,[&](size_t,const auto&)->Status {
+    if(!written){written=true;RETURN_NOT_OK(RdfYBModel::Instance().WriteTripleToDocDB(1,9001,1003));
+      RETURN_NOT_OK(RdfYBModel::Instance().Flush());}
+    return Status::OK();
+  }));
+  Rows expected;for(uint64_t s=101;s<133;++s)for(uint64_t o:{1001,1002})expected.insert({s,o});
+  ASSERT_TRUE(written);ASSERT_EQ(rows,expected);ASSERT_NO_FATALS(CheckClean(options,**view));
+  auto fresh=RdfYBModel::Instance().NewQueryReadContext();ASSERT_OK(fresh);Rows latest;
+  ASSERT_OK(Run(*plan,options,**fresh,true,&latest));
+  for(uint64_t s=101;s<133;++s)expected.insert({s,1003});ASSERT_EQ(latest,expected);
+}
+
+TEST_F(MdbInterleavedExchangeTest, AdmissionEmptySideAndFailureRecovery) {
+  Seed(8);auto plan=Plan({{-1,9000,-2},{-2,9001,-3}},3,{0,2},16,128);ASSERT_OK(plan);
+  auto options=Options(2);const auto valid=Inputs(*plan);
+  for(int bad=0;bad<3;++bad) {
+    auto pair=valid;
+    if(bad==0)pair[1].tasks.pop_back();
+    if(bad==1)pair[1].physical.set_table_ids(0,"wrong-table");
+    if(bad==2)pair[1].physical.set_memory_bytes(1);
+    auto view=RdfYBModel::Instance().NewQueryReadContext();ASSERT_OK(view);
+    const auto status=GatherFragmentPair(pair,options,**view,[](size_t,const auto&){return Status::OK();});
+    ASSERT_NOK(status);ASSERT_EQ((*view)->stats.remote_fragments,0);
+  }
+  auto empty=valid;empty[0].empty=true;auto view=RdfYBModel::Instance().NewQueryReadContext();ASSERT_OK(view);
+  std::array<size_t,2> counts={0,0};
+  ASSERT_OK(GatherFragmentPair(empty,options,**view,[&](size_t side,const auto&){++counts[side];return Status::OK();}));
+  ASSERT_EQ(counts[0],0);ASSERT_EQ(counts[1],2);ASSERT_EQ((*view)->stats.remote_fragments,4);
+  for(bool cancel:{true,false}) {
+    auto stopped=RdfYBModel::Instance().NewQueryReadContext();ASSERT_OK(stopped);Rows rows;
+    const auto status=Run(*plan,options,**stopped,true,&rows,[&](size_t,const auto&)->Status {
+      if(cancel)(*stopped)->cancelled=true;else (*stopped)->deadline=CoarseMonoClock::Now();
+      return Status::OK();
+    });
+    ASSERT_TRUE(cancel?status.IsAborted():status.IsTimedOut())<<status;ASSERT_TRUE(rows.empty());
+    ASSERT_NO_FATALS(CheckClean(options,**stopped));
+  }
+  const auto wrapper=GetTestPath("late-pair-error");
+  {std::ofstream file(wrapper);file<<"#!/bin/sh\n'"<<workers_.binary<<"' \"$@\"\nexit 23\n";}
+  std::filesystem::permissions(wrapper,std::filesystem::perms::owner_all);
+  auto broken=options;broken.binary=wrapper;auto failed=RdfYBModel::Instance().NewQueryReadContext();ASSERT_OK(failed);Rows rejected;
+  ASSERT_NOK(Run(*plan,broken,**failed,true,&rejected));ASSERT_TRUE(rejected.empty());ASSERT_NO_FATALS(CheckClean(broken,**failed));
+  auto fresh=RdfYBModel::Instance().NewQueryReadContext();ASSERT_OK(fresh);Rows recovered;
+  ASSERT_OK(Run(*plan,options,**fresh,true,&recovered));ASSERT_EQ(recovered.size(),16);ASSERT_NO_FATALS(CheckClean(options,**fresh));
+}
+
+TEST_F(MdbInterleavedExchangeTest, Unique512Comparison){Benchmark("unique");}
+TEST_F(MdbInterleavedExchangeTest, Shared512Comparison){Benchmark("shared");}
+TEST_F(MdbInterleavedExchangeTest, Fanout512Comparison){Benchmark("fanout");}
 }  // namespace
 }  // namespace yb::mdb
