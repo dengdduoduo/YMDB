@@ -4156,7 +4156,7 @@ TEST_F(MdbGlobalTopKTest, ExactReservationZeroLimitAndWindowOverflow) {
 TEST_F(MdbGlobalTopKTest, DistinctGroupingAndLargeWindowsKeepOriginalAdmission) {
   Seed(32);auto small=workers_;small.coordinator_memory_bytes=20000;
   for(const auto& query:std::vector<std::string>{
-      "SELECT DISTINCT ?o"+body+" ORDER BY ?o LIMIT 1",
+      "SELECT DISTINCT ?o"+body+" ORDER BY ?s LIMIT 1",
       "SELECT ?o (COUNT(*) AS ?n)"+body+" GROUP BY ?o ORDER BY DESC(?n) LIMIT 1",
       "SELECT ?o"+body+" LIMIT 1"}) {
     const auto failed=Query(query,small);ASSERT_NE(failed.status,0);ASSERT_TRUE(failed.ordered.empty());
@@ -4267,6 +4267,203 @@ TEST_F(MdbDictionaryRecoveryTest, GlobalTopKCliBudgetTypedRowsAndFailureDiscard)
   ASSERT_EQ(Field(error,"global_topk_retained_rows"),5);ASSERT_LE(Field(error,"global_reserved_bytes"),10000);
   for(auto& arg:args)if(arg.find("--mdb_worker_binary=")==0)arg="--mdb_worker_binary=/bin/false";
   output.clear();error.clear();ASSERT_NOK(Subprocess::Call(args,&output,&error));ASSERT_TRUE(output.empty());
+}
+}  // namespace
+}  // namespace yb::mdb
+
+
+namespace yb::mdb {
+namespace {
+class MdbGlobalDistinctTest : public MdbFragmentIntegrationTest {
+ protected:
+  const std::string body = " WHERE { ?s <urn:p6:9000> ?k . ?k <urn:p6:9001> ?o }";
+};
+
+TEST_F(MdbGlobalDistinctTest, DuplicateInputFitsSmallBudgetAcrossExchangeModes) {
+  Seed(256);
+  const auto text = "SELECT DISTINCT ?o" + body + " ORDER BY DESC(?o) LIMIT 1 OFFSET 1";
+  const auto reference = Query(text, {}); ASSERT_EQ(reference.status, 0);
+  ASSERT_EQ(reference.ordered, (std::vector<std::string>{Iri(1001)}));
+  const auto spill = GetTestPath("distinct-spill"); std::filesystem::create_directory(spill);
+  for (auto mode : {ExchangeMode::None, ExchangeMode::Hash, ExchangeMode::Broadcast}) {
+    auto options = workers_; options.coordinator_memory_bytes = 10000;
+    options.exchange = mode; options.exchange_spill_directory = spill;
+    const auto result = Query(text, options);
+    ASSERT_EQ(result.status, 0) << result.profile;
+    ASSERT_EQ(result.ordered, reference.ordered);
+    ASSERT_EQ(Field(result.profile, "global_input_rows"), 512);
+    ASSERT_EQ(Field(result.profile, "global_distinct_operators"), 1);
+    ASSERT_EQ(Field(result.profile, "global_distinct_retained_rows"), 2);
+    ASSERT_LE(Field(result.profile, "global_reserved_bytes"), 10000);
+    ASSERT_EQ(Field(result.profile, "global_topk_operators"), 0);
+    ASSERT_EQ(Field(result.profile, "remote_coordinator_fallbacks"), 0);
+    ASSERT_TRUE(std::filesystem::is_empty(spill));
+  }
+}
+
+TEST_F(MdbGlobalDistinctTest, ProjectionTupleOrderAndSliceMatchCompleteResults) {
+  Seed(48); auto options = workers_; options.coordinator_memory_bytes = 10000;
+  for (const auto& text : std::vector<std::string>{
+      "SELECT DISTINCT ?o" + body,
+      "SELECT DISTINCT ?o ?k" + body + " ORDER BY ?k DESC(?o)",
+      "SELECT DISTINCT ?k ?o" + body + " ORDER BY ?o ?k LIMIT 1 OFFSET 1",
+      "SELECT DISTINCT ?o" + body + " ORDER BY ?o LIMIT 0",
+      "SELECT DISTINCT ?o" + body + " ORDER BY ?o OFFSET 20"}) {
+    const auto local = Query(text, {}), remote = Query(text, options);
+    ASSERT_EQ(local.status, 0) << text; ASSERT_EQ(remote.status, 0) << text;
+    if (text.find("ORDER BY") == std::string::npos) ASSERT_EQ(remote.values, local.values);
+    else ASSERT_EQ(remote.ordered, local.ordered);
+    ASSERT_EQ(Field(remote.profile, "global_input_rows"), 96);
+    ASSERT_EQ(Field(remote.profile, "global_distinct_retained_rows"), 2);
+  }
+  const auto empty = Query("SELECT DISTINCT ?o WHERE { ?s <urn:distinct:missing> ?o }", options);
+  ASSERT_EQ(empty.status, 0); ASSERT_TRUE(empty.ordered.empty());
+  ASSERT_EQ(Field(empty.profile, "global_input_rows"), 0);
+}
+
+TEST_F(MdbGlobalDistinctTest, ExactBudgetAndIneligibleEnvelopesKeepSafety) {
+  Seed(32); const auto text = "SELECT DISTINCT ?o" + body + " ORDER BY ?o";
+  const auto normal = Query(text, workers_); ASSERT_EQ(normal.status, 0);
+  const auto bytes = Field(normal.profile, "global_reserved_bytes"); ASSERT_GT(bytes, 0);
+  auto options = workers_; options.coordinator_memory_bytes = bytes;
+  const auto exact = Query(text, options); ASSERT_EQ(exact.status, 0);
+  ASSERT_EQ(exact.ordered, normal.ordered);
+  --options.coordinator_memory_bytes;
+  const auto rejected = Query(text, options);
+  ASSERT_NE(rejected.status, 0); ASSERT_TRUE(rejected.ordered.empty());
+  options.coordinator_memory_bytes = 10000;
+  for (const auto& query : std::vector<std::string>{
+      "SELECT DISTINCT ?o" + body + " ORDER BY ?s",
+      "SELECT ?o (COUNT(*) AS ?n)" + body + " GROUP BY ?o ORDER BY ?o",
+      "SELECT DISTINCT (COUNT(*) AS ?n)" + body,
+      "SELECT ?o" + body + " ORDER BY ?o"}) {
+    const auto failed = Query(query, options);
+    ASSERT_NE(failed.status, 0); ASSERT_TRUE(failed.ordered.empty());
+    ASSERT_EQ(Field(failed.profile, "global_distinct_operators"), 0);
+    const auto full = Query(query, workers_); ASSERT_EQ(full.status, 0);
+  }
+  const auto unbound = "SELECT DISTINCT ?missing" + body;
+  RdfYBModel::Instance().SetWorkerOptions(options); FirstBatchTypedOutput unbound_small;
+  ASSERT_NE(YBCMdbExecuteSparqlWithResults(unbound.c_str(), unbound_small.Callbacks(), &unbound_small), 0);
+  ASSERT_TRUE(unbound_small.rows.empty());
+  ASSERT_EQ(Field(YBCMdbGetLastQueryProfile(), "global_distinct_operators"), 0);
+  RdfYBModel::Instance().SetWorkerOptions(workers_); FirstBatchTypedOutput unbound_full;
+  ASSERT_EQ(YBCMdbExecuteSparqlWithResults(unbound.c_str(), unbound_full.Callbacks(), &unbound_full), 0);
+  ASSERT_TRUE(unbound_full.ended); ASSERT_EQ(unbound_full.rows.size(), 1);
+  ASSERT_EQ(unbound_full.rows[0].size(), 1);
+  const auto many = Query("SELECT DISTINCT ?s ?o" + body, options);
+  ASSERT_NE(many.status, 0); ASSERT_TRUE(many.ordered.empty());
+  ASSERT_EQ(Field(many.profile, "global_distinct_operators"), 1);
+  const auto fresh = Query(text, options); ASSERT_EQ(fresh.status, 0);
+  ASSERT_EQ(fresh.ordered, normal.ordered);
+}
+
+TEST_F(MdbGlobalDistinctTest, TypedIdentityAndVariableOrderRemainDistinct) {
+  const std::string xsd = "http://www.w3.org/2001/XMLSchema#";
+  const std::vector<SPARQL::RdfTermIdentity> terms = {
+      RdfIdentity(TripleTermType::URI, "urn:z"), RdfIdentity(TripleTermType::URI, "urn:a"),
+      RdfIdentity(TripleTermType::LITERAL, "2", xsd + "integer"),
+      RdfIdentity(TripleTermType::LITERAL, "02", xsd + "integer"),
+      RdfIdentity(TripleTermType::LITERAL, "2", xsd + "decimal"),
+      RdfIdentity(TripleTermType::LITERAL, "same", "@en"),
+      RdfIdentity(TripleTermType::LITERAL, "same", "@fr"),
+      RdfIdentity(TripleTermType::BLANK, "b", "", "distinct-scope")};
+  RegisterRdfIdentity(9003, RdfIdentity(TripleTermType::URI, Iri(9003)));
+  for (size_t i = 0; i < terms.size(); ++i) {
+    RegisterRdfIdentity(600 + i, terms[i]);
+    for (size_t j = 0; j < 8; ++j) {
+      const auto id = 10000 + i * 8 + j;
+      RegisterRdfIdentity(id, RdfIdentity(TripleTermType::URI, Iri(id)));
+      ASSERT_OK(RdfYBModel::Instance().WriteTripleToDocDB(id, 9003, 600 + i));
+    }
+  }
+  ASSERT_OK(RdfYBModel::Instance().Flush());
+  const char* query = "SELECT DISTINCT ?p ?o WHERE { ?s ?p ?o }";
+  RdfYBModel::Instance().SetWorkerOptions(WorkerOptions{}); FirstBatchTypedOutput local;
+  ASSERT_EQ(YBCMdbExecuteSparqlWithResults(query, local.Callbacks(), &local), 0);
+  auto options = workers_; options.coordinator_memory_bytes = 30000;
+  RdfYBModel::Instance().SetWorkerOptions(options); FirstBatchTypedOutput remote;
+  ASSERT_EQ(YBCMdbExecuteSparqlWithResults(query, remote.Callbacks(), &remote), 0);
+  ASSERT_TRUE(remote.ended); ASSERT_EQ(remote.names, local.names);
+  std::sort(remote.rows.begin(), remote.rows.end()); std::sort(local.rows.begin(), local.rows.end());
+  ASSERT_EQ(remote.rows, local.rows); ASSERT_EQ(remote.rows.size(), terms.size());
+  ASSERT_EQ(Field(YBCMdbGetLastQueryProfile(), "global_input_rows"), 64);
+  ASSERT_EQ(Field(YBCMdbGetLastQueryProfile(), "global_distinct_retained_rows"), terms.size());
+}
+
+TEST_F(MdbGlobalDistinctTest, LateWorkerFailureCancellationAndRecovery) {
+  Seed(128); auto options = workers_; options.coordinator_memory_bytes = 10000;
+  const auto query = "SELECT DISTINCT ?o" + body + " ORDER BY ?o LIMIT 1";
+  const auto wrapper = GetTestPath("distinct-late-error");
+  { std::ofstream file(wrapper); file << "#!/bin/sh\n'" << workers_.binary << "' \"$@\"\nexit 23\n"; }
+  std::filesystem::permissions(wrapper, std::filesystem::perms::owner_all);
+  auto broken = options; broken.binary = wrapper;
+  const auto failed = Query(query, broken);
+  ASSERT_NE(failed.status, 0); ASSERT_TRUE(failed.ordered.empty());
+  ASSERT_GT(Field(failed.profile, "global_input_rows"), 2);
+  for (bool expire : {false, true}) {
+    struct State { bool expire; size_t cells = 0; } state{expire};
+    auto sink = [](const char*, const char*, void* arg) {
+      auto& state = *static_cast<State*>(arg); ++state.cells;
+      auto* view = DocDBReadContextScope::Current();
+      if (state.expire) view->deadline = CoarseMonoClock::Now(); else view->cancelled = true;
+    };
+    RdfYBModel::Instance().SetWorkerOptions(options);
+    ASSERT_NE(YBCMdbExecuteSparql(query.c_str(), sink, &state), 0); ASSERT_EQ(state.cells, 1);
+  }
+  const auto fresh = Query(query, options); ASSERT_EQ(fresh.status, 0);
+  ASSERT_EQ(fresh.ordered, (std::vector<std::string>{Iri(1001)}));
+}
+
+TEST_F(MdbGlobalDistinctTest, RetentionFollowsUniqueRowsAsInputGrows) {
+  uint64_t previous = 0;
+  for (size_t count : {32, 128, 512}) {
+    Seed(count); const auto text = "SELECT DISTINCT ?o" + body + " ORDER BY ?o";
+    auto options = workers_; options.coordinator_memory_bytes = 10000;
+    const auto result = Query(text, options); ASSERT_EQ(result.status, 0);
+    ASSERT_EQ(result.ordered, (std::vector<std::string>{Iri(1001), Iri(1002)}));
+    ASSERT_EQ(Field(result.profile, "global_input_rows"), 2 * count);
+    ASSERT_EQ(Field(result.profile, "global_distinct_retained_rows"), 2);
+    const auto bytes = Field(result.profile, "global_reserved_bytes");
+    if (previous) ASSERT_EQ(bytes, previous); previous = bytes;
+    LOG(INFO) << "DISTINCT_SAMPLE {\"input_rows\":" << 2 * count
+              << ",\"unique_rows\":2,\"correct\":true,\"profile\":" << result.profile << "}";
+  }
+}
+}  // namespace
+}  // namespace yb::mdb
+
+
+namespace yb::mdb {
+namespace {
+TEST_F(MdbDictionaryRecoveryTest, GlobalDistinctCliBudgetTypedRowsAndFailureDiscard) {
+  const auto input = GetTestPath("distinct-cli.nt");
+  {
+    std::ofstream file(input);
+    for (size_t i = 0; i < 128; ++i)
+      file << "<urn:distinct:s" << i << "> <urn:distinct:p1> <urn:distinct:k> .\n";
+    file << "<urn:distinct:k> <urn:distinct:p2> <urn:distinct:o1> .\n"
+            "<urn:distinct:k> <urn:distinct:p2> <urn:distinct:o2> .\n";
+  }
+  auto load = Base(); load.insert(load.end(), {"import", input}); ASSERT_OK(Subprocess::Call(load));
+  auto args = Base(); args.insert(args.end(), {"--mdb_result_format=json", "--mdb_query_profile=true",
+      "--mdb_worker_targets=local,local,local", "--mdb_worker_binary=" + workers_.binary,
+      "--mdb_worker_batch_rows=128", "--mdb_worker_page_rows=16", "--mdb_global_memory_bytes=10000",
+      "query", "SELECT DISTINCT ?o WHERE { ?s <urn:distinct:p1> ?k . ?k <urn:distinct:p2> ?o } ORDER BY DESC(?o) LIMIT 1 OFFSET 1"});
+  std::string output, error; const auto status = Subprocess::Call(args, &output, &error);
+  ASSERT_TRUE(status.ok()) << status << error;
+  rapidjson::Document value; value.Parse(output.c_str()); ASSERT_FALSE(value.HasParseError());
+  ASSERT_EQ(value["head"]["vars"].Size(), 1); ASSERT_STREQ(value["head"]["vars"][0].GetString(), "o");
+  const auto rows = value["results"]["bindings"].GetArray(); ASSERT_EQ(rows.Size(), 1);
+  ASSERT_STREQ(rows[0]["o"]["type"].GetString(), "uri");
+  ASSERT_STREQ(rows[0]["o"]["value"].GetString(), "urn:distinct:o1");
+  ASSERT_EQ(Field(error, "global_input_rows"), 256);
+  ASSERT_EQ(Field(error, "global_distinct_operators"), 1);
+  ASSERT_EQ(Field(error, "global_distinct_retained_rows"), 2);
+  ASSERT_LE(Field(error, "global_reserved_bytes"), 10000);
+  for (auto& arg : args) if (arg.find("--mdb_worker_binary=") == 0)
+    arg = "--mdb_worker_binary=/bin/false";
+  output.clear(); error.clear(); ASSERT_NOK(Subprocess::Call(args, &output, &error)); ASSERT_TRUE(output.empty());
 }
 }  // namespace
 }  // namespace yb::mdb

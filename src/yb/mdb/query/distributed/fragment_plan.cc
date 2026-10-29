@@ -444,6 +444,28 @@ Result<FragmentPlan> FragmentPlan::Build(
         spec.rows < options.coordinator_memory_bytes / spec.row_reservation)
       plan.topk = std::move(spec);
   }
+  // Removing duplicate projected tuples is safe only when every downstream
+  // ordering key depends on that tuple; hidden keys need all representatives.
+  if (select->distinct && !aggregate && !grouped && !having &&
+      std::all_of(select->vars.begin(), select->vars.end(),
+                  [&](auto var) { return bound.count(var.id) != 0; }) &&
+      std::none_of(select->vars_exprs.begin(), select->vars_exprs.end(),
+                   [](const auto& expr) { return bool(expr); }) &&
+      std::all_of(order_variables.begin(), order_variables.end(), [&](auto var) {
+        return std::find(select->vars.begin(), select->vars.end(), var) != select->vars.end();
+      })) {
+    GlobalDistinctSpec spec;
+    for (auto var : select->vars) {
+      const auto column = std::find(physical.projection().begin(), physical.projection().end(), var.id);
+      spec.key_columns.push_back(static_cast<uint32_t>(column - physical.projection().begin()));
+    }
+    // Charge map keys/full representatives, capacity slack, an incoming tuple,
+    // and the unchanged original finalizer's per-retained-row reservation.
+    spec.row_reservation = plan.global_row_reservation + 128 +
+        2 * sizeof(std::vector<::ObjectId>) +
+        2 * sizeof(::ObjectId) * (physical.projection_size() + spec.key_columns.size());
+    plan.distinct = std::move(spec);
+  }
   if (options.exchange != ExchangeMode::None) RETURN_NOT_OK(ValidateExchange(physical, options));
   plan.properties.partitioning = PhysicalProperties::Partitioning::YcqlSubjectHash;
   const auto& anchor_subject = physical.triples(0).terms(0);

@@ -287,3 +287,48 @@ validated rows; global_topk_operators/capacity/retained_rows identify the path,
 and global_reserved_bytes reports peak conservative admission. Hash/Broadcast
 exchange can feed the same collector. DISTINCT/grouped and unbounded global
 operations still have their original full-input limit; external sort is pending.
+
+
+## Projected DISTINCT admission (2026-10-29)
+
+Eligible plain BGP `SELECT DISTINCT` queries retain one full typed representative
+per projected ObjectId tuple before the existing global finalizer. Every selected
+variable must be bound, with no SELECT expressions, GROUP BY, HAVING or aggregates;
+ORDER BY, if present, may only reference projected variables. Hidden sort keys,
+unbound projection and all other envelopes keep their previous admission path.
+Tuple identity uses the same ObjectId vector ordering as `DistinctHash`, not RDF
+numeric value equivalence. ORDER BY and LIMIT/OFFSET still run exactly once in
+the original modifier tree; neither LIMIT nor LIMIT 0 stops input validation.
+Unordered output order, unordered slices and equal-key ordering remain unspecified.
+
+The collector charges the unchanged downstream reservation plus map/key/full-row
+storage and conservative capacity slack. One incoming slot is always admitted;
+a new unique tuple requires another retained slot. Duplicate input does not add
+retained slots. Too many unique tuples still fail within the configured budget;
+there is no spill, truncation or fallback after remote work starts. The extra
+index charge can reach admission earlier on high-uniqueness inputs than the
+former all-row collector at the same nominal budget. Every input's typed
+dictionary identity, all child results and successful worker exits remain
+mandatory before global output. `global_distinct_operators` and
+`global_distinct_retained_rows` identify this path. `global_input_rows` counts all
+admitted input rows, and `global_reserved_bytes` is a conservative logical peak,
+excluding dictionaries, client infrastructure and transport buffers; it is not RSS.
+
+Release validation: 16 exact GTests (7 new, 9 related compatibility) passed using
+one wrapper invocation per case. A pre-change 512-row/two-unique-value query failed
+under 10,000 bytes after 7 rows/9,968 reserved bytes. The same query now succeeds
+through workers, Hash and Broadcast. Growth from 64 to 256 to 1,024 input rows keeps
+two representatives and 4,992 reserved bytes. Tests cover full projected
+tuples, variable order, typed IRI/numeric lexical/datatype/language/blank identity,
+empty/zero/offset output, exact/one-byte-short budgets, hidden/unbound/aggregate
+envelopes, unique-cardinality exhaustion, late worker failure and recovery.
+A fresh-import CLI test checks typed JSON/schema and failed-output discard.
+Conditions: one WSL host, two logical CPUs, three in-process tservers/RF3 and four
+tablets per index. This is not a latency, RSS, physical multi-host or SOTA result.
+No Debug/ASan run; historical allocator root cause remains unconfirmed.
+The first two cases passed before a test-only correction: an unbound projection
+must use typed callbacks because the legacy text callback cannot represent an
+empty solution. Its initial failing run is preserved, not counted as passed.
+The corrected case and remaining thirteen cases passed in the final run; the
+first two unchanged cases were not rerun. Runtime code did not change between
+these runs.

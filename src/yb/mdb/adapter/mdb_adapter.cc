@@ -75,6 +75,7 @@
 #include "yb/mdb/storage/docdb_read_context.h"
 #include "yb/mdb/query/distributed/fragment_gather.h"
 #include "yb/mdb/query/distributed/global_topk.h"
+#include "yb/mdb/query/distributed/global_distinct.h"
 #include "yb/mdb/query/distributed/exchange.h"
 #include "yb/server/hybrid_clock.h"
 #include "yb/util/logging.h"
@@ -534,6 +535,11 @@ int ExecuteSparql(
         ++read_context->stats.global_topk_operators;
         read_context->stats.global_topk_capacity = physical->topk->rows;
       }
+      std::optional<yb::mdb::GlobalDistinct> distinct;
+      if (physical->distinct) {
+        distinct.emplace(*physical->distinct);
+        ++read_context->stats.global_distinct_operators;
+      }
       if (physical->coordinator_finalize) {
         for (auto var : physical->physical.projection()) gathered_vars.emplace_back(var);
       }
@@ -546,9 +552,10 @@ int ExecuteSparql(
               // Bound input plus conservative space for Values, sorting full
               // bindings/keys, DISTINCT trees and COUNT(DISTINCT) sets. This
               // reservation excludes shared dictionaries and client infrastructure.
-              const uint64_t row_bytes = topk ? physical->topk->row_reservation : physical->global_row_reservation;
-              if (topk) {
-                const uint64_t slots = topk->size() + 1;
+              const uint64_t row_bytes = topk ? physical->topk->row_reservation :
+                  distinct ? physical->distinct->row_reservation : physical->global_row_reservation;
+              if (topk || distinct) {
+                const uint64_t slots = (topk ? topk->size() : distinct->size()) + 1;
                 if (slots > worker_options.coordinator_memory_bytes / row_bytes)
                   return STATUS(RuntimeError, "MDB global Gather input budget exceeded");
                 reserved = std::max(reserved, slots * row_bytes);
@@ -559,13 +566,18 @@ int ExecuteSparql(
                 reserved += row_bytes;
               }
               std::vector<ObjectId> candidate;
-              if (topk) candidate.reserve(row.size());
+              if (topk || distinct) candidate.reserve(row.size());
               for (auto id : row) {
                 auto found = g_gmap_to_pack.find(id);
                 if (found == g_gmap_to_pack.end())
                   return STATUS(Corruption, "Missing typed dictionary identity for global input");
-                if (topk) candidate.push_back(found->second);
+                if (topk || distinct) candidate.push_back(found->second);
                 else gathered.push_back(found->second);
+              }
+              if (distinct) {
+                RETURN_NOT_OK(distinct->Add(std::move(candidate), worker_options.coordinator_memory_bytes));
+                reserved = distinct->reserved_bytes();
+                read_context->stats.global_distinct_retained_rows = distinct->size();
               }
               if (topk) {
                 topk->Add(std::move(candidate));
@@ -589,8 +601,9 @@ int ExecuteSparql(
       if (!status.ok()) return 1;
       if (!physical->coordinator_finalize) { sink.End(); return 0; }
       // Gather all child transaction results before exposing global output.
-      // The original modifier tree executes exactly once over the complete bag.
+      // The original modifiers execute once over full input or safe representatives.
       if (topk) gathered = topk->ReleaseRows();
+      if (distinct) gathered = distinct->ReleaseRows();
       *yb::mdb::FragmentPlan::InputSlot(*op) = std::make_unique<OpValues>(
           std::move(gathered_vars), std::move(gathered));
       ++read_context->stats.global_finalize_operators;

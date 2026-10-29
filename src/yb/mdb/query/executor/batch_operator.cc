@@ -122,6 +122,8 @@ std::string BatchQueryStats::ToJson() const {
   MDB_STAT(remote_fragments); MDB_STAT(remote_max_workers); MDB_STAT(remote_batches);
   MDB_STAT(remote_rows); MDB_STAT(remote_response_bytes); MDB_STAT(remote_peak_frame_bytes);
   MDB_STAT(remote_coordinator_fallbacks);
+  MDB_STAT(global_distinct_operators);
+  MDB_STAT(global_distinct_retained_rows);
   MDB_STAT(global_topk_operators);
   MDB_STAT(global_topk_capacity);
   MDB_STAT(global_topk_retained_rows);

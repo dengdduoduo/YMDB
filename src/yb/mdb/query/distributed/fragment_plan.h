@@ -34,6 +34,11 @@ struct GlobalTopKSpec {
   std::vector<bool> ascending;
 };
 
+struct GlobalDistinctSpec {
+  uint64_t row_reservation = 0;
+  std::vector<uint32_t> key_columns;
+};
+
 // Executable storage-ID graph, separate from the parser's process-local Op tree.
 struct FragmentPlan {
   PhysicalProperties properties;
@@ -43,6 +48,7 @@ struct FragmentPlan {
   bool coordinator_finalize = false;
   uint64_t global_row_reservation = 0;
   std::optional<GlobalTopKSpec> topk;
+  std::optional<GlobalDistinctSpec> distinct;
 
   // Called only after Build has accepted the complete coordinator envelope.
   static std::unique_ptr<SPARQL::Op>* InputSlot(SPARQL::Op& root);
