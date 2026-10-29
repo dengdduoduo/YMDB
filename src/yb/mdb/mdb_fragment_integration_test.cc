@@ -5508,3 +5508,59 @@ TEST_F(MdbFragmentIntegrationTest, Stage12QueryOrderAndExplicitStrategiesKeepTyp
   model.SetBatchJoinOptions({});model.SetWorkerOptions({});
 }
 } }  // namespace yb::mdb
+
+
+namespace yb::mdb { namespace {
+class MdbStrategyMatrixTest : public MdbFragmentIntegrationTest {
+ protected:
+  void RunMatrix(const std::string& shape,size_t n) {
+    using Term=FirstBatchTypedOutput::Term;using Row=std::vector<Term>;
+    std::multiset<Row> expected;
+    const size_t keys=shape=="unique"?n:shape=="shared"?1:16;
+    const size_t fanout=shape=="unique"?1:shape=="shared"?2:16;
+    for(size_t i=0;i<n;++i){
+      Write(100+i,9000,10000+i%keys);
+      for(size_t j=0;j<fanout;++j)expected.insert(Row{
+        Term{YBC_MDB_IRI,Iri(100+i),"",""},Term{YBC_MDB_IRI,Iri(200000+(i%keys)*fanout+j),"",""}});
+    }
+    for(size_t k=0;k<keys;++k)for(size_t j=0;j<fanout;++j)Write(10000+k,9001,200000+k*fanout+j);
+    ASSERT_OK(RdfYBModel::Instance().Flush());
+    auto& model=RdfYBModel::Instance();model.SetStreamingPageRows(16);model.SetBatchJoinOptions({});
+    const std::vector<std::string> queries={
+      "SELECT ?s ?o WHERE { ?s <urn:p6:9000> ?k . ?k <urn:p6:9001> ?o }",
+      "SELECT ?s ?o WHERE { ?k <urn:p6:9001> ?o . ?s <urn:p6:9000> ?k }"};
+    const auto spill=GetTestPath("strategy-matrix-spill");std::filesystem::create_directory(spill);
+    // Rotate the eight cells between rounds. Initial observations stay separate.
+    for(int sample=-1;sample<3;++sample)for(int offset=0;offset<8;++offset){
+      const int cell=(offset+(sample+1)*3)%8,order=cell/4,mode=cell%4;
+      auto options=workers_;options.page_rows=16;options.batch_rows=128;
+      options.exchange_spill_directory=spill;
+      if(mode==0)options={};
+      else options.exchange=mode==1?ExchangeMode::None:mode==2?ExchangeMode::Hash:ExchangeMode::Broadcast;
+      model.SetWorkerOptions(options);FirstBatchTypedOutput output;
+      const auto started=WallMicros();const auto status=YBCMdbExecuteSparqlWithResults(queries[order].c_str(),output.Callbacks(),&output);
+      const auto elapsed=WallMicros()-started;const std::string profile=YBCMdbGetLastQueryProfile();
+      ASSERT_EQ(status,0)<<profile;ASSERT_TRUE(output.ended);ASSERT_EQ(output.kind,YBC_MDB_BINDINGS);
+      ASSERT_EQ(output.names,(std::vector<std::string>{"s","o"}));
+      ASSERT_EQ(std::multiset<Row>(output.rows.begin(),output.rows.end()),expected);
+      ASSERT_EQ(Field(profile,"remote_coordinator_fallbacks"),0);
+      if(mode==0)ASSERT_EQ(Field(profile,"remote_fragments"),0);
+      else {ASSERT_EQ(Field(profile,"remote_fragments"),mode==1?4:8);ASSERT_LE(Field(profile,"remote_max_workers"),options.max_workers);}
+      if(mode>=2){ASSERT_EQ(Field(profile,"exchange_operators"),1);ASSERT_LE(Field(profile,"exchange_peak_reserved_bytes"),options.exchange_memory_bytes);}
+      ASSERT_TRUE(std::filesystem::is_empty(spill));
+      LOG(INFO)<<"STRATEGY_MATRIX_SAMPLE {\"shape\":\""<<shape<<"\",\"n\":"<<n
+        <<",\"seed_left_rows\":"<<n<<",\"seed_right_rows\":"<<keys*fanout
+        <<",\"order\":"<<order<<",\"mode\":"<<mode<<",\"sample\":"<<sample
+        <<",\"elapsed_us\":"<<elapsed<<",\"rows\":"<<output.rows.size()
+        <<",\"correct\":true,\"profile\":"<<profile<<"}";
+    }
+    model.SetWorkerOptions({});
+  }
+};
+TEST_F(MdbStrategyMatrixTest, Unique128){RunMatrix("unique",128);}
+TEST_F(MdbStrategyMatrixTest, Unique512){RunMatrix("unique",512);}
+TEST_F(MdbStrategyMatrixTest, Shared128){RunMatrix("shared",128);}
+TEST_F(MdbStrategyMatrixTest, Shared512){RunMatrix("shared",512);}
+TEST_F(MdbStrategyMatrixTest, Fanout128){RunMatrix("fanout",128);}
+TEST_F(MdbStrategyMatrixTest, Fanout512){RunMatrix("fanout",512);}
+} }  // namespace yb::mdb

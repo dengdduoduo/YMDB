@@ -643,3 +643,25 @@ option. FragmentPlan currently collects triples in logical-tree order; the local
 greedy optimizer is not a distributed exchange/locality cost selector. Defaults
 remain Index and exchange None. Multi-scale/selectivity/locality evidence is
 required before any automatic distributed strategy rule is introduced.
+
+
+## Two-scale explicit strategy matrix (2026-10-29)
+
+MdbStrategyMatrixTest runs unique/shared/fanout at 128/512 outer subjects, both
+textual triple orders and coordinator Index/worker Index/Hash/Broadcast paths.
+An independent typed two-column multiset oracle includes all duplicates. Six
+exact Release tests pass: 192 complete observations, 48 initial plus 144 repeats
+(three per cell). Cells rotate between rounds; validation is outside timing.
+Page16/batch128, three worker limit, unchanged budgets/defaults and local RF3
+storage apply. Raw read/flush counts are not wire RPC counts. Input cardinalities
+recorded as seed truth are not planner estimates; distributed estimate fields
+are not populated by the inspected FragmentPlan::Build. Missing estimates do
+not mean zero rows. Hash build estimates do not describe distributed exchange.
+
+These small single-host samples do not justify always scanning the smaller side
+first or always choosing the fewest-read exchange. Startup/task count, indexed
+probe reuse and repeated pages affect cost. Strategy changes require query-view
+statistics, distinct join-key estimates and budget/locality evidence; absent or
+incomplete statistics should retain existing behavior. No runtime/default change
+is made by this matrix. Raw samples and three-repeat ranges are required when
+interpreting medians; no SOTA, physical scaling, RSS or significance claim.
