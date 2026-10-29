@@ -764,3 +764,26 @@ not the historical distributed_join_advisory.applied flag. An unordered query
 still has no stable arrival order guarantee; ordered modifiers execute normally.
 Local policies and defaults remain unchanged. This is a trial, not a universally
 beneficial automatic optimizer; same-binary on/off tests retain regressions too.
+
+
+## Bounded local scale and concurrent clients (2026-10-29)
+
+Opt-in MdbLocalScaleTest uses MDB_STAGE9_DATASETS and MDB_STAGE9_REPEATS to
+reuse the complete typed-result oracle for unique 4096/16384 and fanout 8192.
+The local acceptance run covers 32768 input triples at most and 131072 output
+rows, four explicit execution paths, and separate fresh-process CLI checks.
+This remains a small single-host scale ladder, not production large-graph or
+physical multi-node scalability evidence. Two measured repeats after the first
+observation do not establish tail latency or a general performance threshold.
+
+MdbConcurrentQueryTest starts two independent CLI query processes, gates both
+at worker startup to establish overlap, and verifies complete projected typed
+bags including language tags. Three waves of normal reads and three waves with
+one EOF-then-nonzero worker check peer isolation, failed stdout discard, child
+reaping and a fresh successful query. Timings include the barrier and startup;
+they are not throughput benchmarks. Test threads never invoke the shared adapter
+concurrently. No runtime default, budget, wire or storage format changes.
+
+Five exact Release tests pass. Storage leader changes, tablet split/rebalance,
+network partitions, long-running pressure, transparent retry/rescheduling and
+real multi-host locality/scaling remain separate acceptance work.

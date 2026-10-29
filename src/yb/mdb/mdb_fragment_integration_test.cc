@@ -43,6 +43,7 @@
 #include "yb/mdb/query/distributed/tablet_router.h"
 #include "yb/mdb/query/distributed/fragment_gather.h"
 #include "yb/mdb/query/distributed/exchange.h"
+#include "yb/util/backoff_waiter.h"
 #include "yb/util/flags.h"
 #include "yb/util/mem_tracker.h"
 #include "yb/util/subprocess.h"
@@ -5809,3 +5810,131 @@ TEST_F(MdbWorkerProbeTest, SampleOrderThenCommitAndGatherKeepsIdenticalReadView)
   expected.insert({102,4001});actual.clear();ASSERT_OK(ReadView(*plan,**fresh,&actual,&reads));ASSERT_EQ(actual,expected);
 }
 } }  // namespace yb::mdb
+
+namespace yb::mdb {
+namespace {
+// Opt-in acceptance: larger persisted graphs reuse the independently generated
+// complete-result oracle and keep initialization separate from adapter timing.
+class MdbLocalScaleTest : public MdbStage9BaselineTest {};
+TEST_F(MdbLocalScaleTest, Unique4096) { RunBaseline("unique", 4096); }
+TEST_F(MdbLocalScaleTest, Unique16384) { RunBaseline("unique", 16384); }
+TEST_F(MdbLocalScaleTest, Fanout8192) { RunBaseline("fanout", 8192); }
+
+class MdbConcurrentQueryTest : public MdbDictionaryRecoveryTest {
+ protected:
+  void RunPair(bool fail_one) {
+    constexpr size_t kRows = 1024;
+    const auto input = GetTestPath("concurrent-read.nt");
+    {
+      std::ofstream file(input);
+      for (size_t i = 0; i < kRows; ++i) {
+        file << "<urn:concurrent:s" << i << "> <urn:concurrent:p> <urn:concurrent:k> .\n";
+      }
+      file << "<urn:concurrent:k> <urn:concurrent:q> \"hello\"@en .\n"
+              "<urn:concurrent:k> <urn:concurrent:q> \"bonjour\"@fr .\n";
+    }
+    auto load = Base(); load.insert(load.end(), {"import", input});
+    ASSERT_OK(Subprocess::Call(load));
+    const std::string query = "SELECT ?o ?s WHERE { ?s <urn:concurrent:p> ?k . "
+                              "?k <urn:concurrent:q> ?o }";
+    using Row = std::tuple<std::string, std::string, std::string>;
+    std::multiset<Row> expected;
+    for (size_t i = 0; i < kRows; ++i) {
+      expected.emplace("hello", "en", "urn:concurrent:s" + std::to_string(i));
+      expected.emplace("bonjour", "fr", "urn:concurrent:s" + std::to_string(i));
+    }
+    auto check = [&](const std::string& out) {
+      rapidjson::Document result; result.Parse(out.c_str());
+      ASSERT_FALSE(result.HasParseError());
+      ASSERT_EQ(result["head"]["vars"].Size(), 2);
+      ASSERT_STREQ(result["head"]["vars"][0].GetString(), "o");
+      ASSERT_STREQ(result["head"]["vars"][1].GetString(), "s");
+      std::multiset<Row> actual;
+      for (const auto& row : result["results"]["bindings"].GetArray()) {
+        ASSERT_EQ(row.MemberCount(), 2);
+        ASSERT_STREQ(row["o"]["type"].GetString(), "literal");
+        ASSERT_STREQ(row["s"]["type"].GetString(), "uri");
+        ASSERT_TRUE(row["o"].HasMember("xml:lang"));
+        ASSERT_FALSE(row["o"].HasMember("datatype"));
+        actual.emplace(row["o"]["value"].GetString(), row["o"]["xml:lang"].GetString(),
+                       row["s"]["value"].GetString());
+      }
+      ASSERT_EQ(actual, expected);
+    };
+    auto args = [&](const std::string& binary) {
+      auto command = Base();
+      command.insert(command.end(), {"--mdb_result_format=json", "--mdb_query_profile=true",
+        "--mdb_worker_targets=local,local,local", "--mdb_worker_binary=" + binary,
+        "--mdb_worker_max_processes=2", "--mdb_worker_page_rows=16",
+        "--mdb_worker_batch_rows=128", "query", query});
+      return command;
+    };
+    // Three waves catch cleanup/reinitialization failures. A worker barrier
+    // proves two independent query processes are active before either can read.
+    for (int wave = 0; wave < 3; ++wave) {
+      const auto gate = GetTestPath("gate-" + std::to_string(wave));
+      std::vector<std::string> ready, binaries;
+      for (int client = 0; client < 2; ++client) {
+        ready.push_back(GetTestPath("ready-" + std::to_string(wave) + "-" + std::to_string(client)));
+        binaries.push_back(ready.back() + ".sh");
+        std::ofstream wrapper(binaries.back());
+        wrapper << "#!/bin/sh\nprintf '%s\\n' \"$$\" >> '" << ready.back() << "'\n"
+                << "n=0; while [ ! -f '" << gate << "' ]; do n=$((n+1)); "
+                   "[ \"$n\" -lt 3000 ] || exit 88; sleep 0.01; done\n";
+        if (fail_one && client == 0) {
+          wrapper << "'" << workers_.binary << "' \"$@\"\nrc=$?\n"
+                     "[ \"$rc\" -eq 0 ] || exit \"$rc\"\nexit 23\n";
+        } else wrapper << "exec '" << workers_.binary << "' \"$@\"\n";
+        wrapper.close();
+        std::filesystem::permissions(binaries.back(), std::filesystem::perms::owner_all);
+      }
+      std::array<Status, 2> status;
+      std::array<std::string, 2> out, error;
+      std::array<uint64_t, 2> elapsed{};
+      TestThreadHolder queries;
+      const auto started = WallMicros();
+      for (int client = 0; client < 2; ++client) queries.AddThreadFunctor([&, client] {
+        const auto begin = WallMicros();
+        status[client] = Subprocess::Call(args(binaries[client]), &out[client], &error[client]);
+        elapsed[client] = WallMicros() - begin;
+      });
+      const auto overlap = WaitFor([&] {
+        return std::filesystem::exists(ready[0]) && std::filesystem::exists(ready[1]);
+      }, MonoDelta::FromSeconds(30), "both query workers ready");
+      { std::ofstream release(gate); release << "go"; }
+      queries.JoinAll();
+      const auto pair_us = WallMicros() - started;
+      ASSERT_OK(overlap);
+      for (int client = 0; client < 2; ++client) {
+        if (fail_one && client == 0) {
+          ASSERT_FALSE(status[client].ok());
+          ASSERT_TRUE(out[client].empty()) << "Failed query published partial stdout";
+          ASSERT_NE(error[client].find("non-zero exit status"), std::string::npos) << error[client];
+        } else {
+          ASSERT_TRUE(status[client].ok()) << status[client] << error[client];
+          ASSERT_NO_FATALS(check(out[client]));
+        }
+        std::ifstream pids(ready[client]); pid_t pid;
+        while (pids >> pid) { errno = 0; ASSERT_EQ(kill(pid, 0), -1); ASSERT_EQ(errno, ESRCH); }
+        const auto marker = error[client].find("MDB_QUERY_PROFILE ");
+        if (marker != std::string::npos) {
+          const auto begin = marker + std::string("MDB_QUERY_PROFILE ").size();
+          LOG(INFO) << "STAGE13_PROFILE " << error[client].substr(begin, error[client].find('\n', begin)-begin);
+        }
+      }
+      LOG(INFO) << "STAGE13_CONCURRENT {\"wave\":" << wave
+                << ",\"injected_failure\":" << (fail_one ? "true" : "false")
+                << ",\"clients\":2,\"rows_per_success\":" << expected.size()
+                << ",\"worker_overlap_verified\":true,\"elapsed_includes_barrier\":true,\"wall_us\":" << pair_us
+                << ",\"client_us\":[" << elapsed[0] << ',' << elapsed[1] << "]}";
+    }
+    std::string out, error;
+    const auto recovered = Subprocess::Call(args(workers_.binary), &out, &error);
+    ASSERT_TRUE(recovered.ok()) << recovered << error;
+    ASSERT_NO_FATALS(check(out));
+  }
+};
+TEST_F(MdbConcurrentQueryTest, IndependentProcessesKeepCompleteTypedBags) { RunPair(false); }
+TEST_F(MdbConcurrentQueryTest, FailedWorkerDoesNotPoisonPeerOrRecovery) { RunPair(true); }
+}  // namespace
+}  // namespace yb::mdb
