@@ -260,3 +260,30 @@ child-plan metadata; buffered frames and worker reservations still depend on
 the aggregate active count, not twice that count. EOF cleanup, sinks and local
 join consumers remain synchronous. Current small local comparisons have mixed
 timing results; independent progress is validated, not universal speedup.
+
+
+## Finite global ORDER BY windows (2026-10-29)
+
+For a plain, non-DISTINCT/non-aggregate BGP SELECT with bound-variable ORDER BY
+and finite LIMIT, the coordinator can retain only the best LIMIT+OFFSET full
+typed bindings. A worst-first heap uses the existing compare_for_order and
+ASC/DESC key sequence. Hidden variables and duplicate rows remain in bindings.
+The original ORDER BY and slice run afterward, so OFFSET applies exactly once.
+Equal-key order remains unspecified, as in the ordinary sort.
+
+Eligibility excludes groups, HAVING, SELECT expressions, unbound sort keys and
+overflowing windows. LIMIT 0 uses a zero-row window but still validates the full
+input. The heap is selected only if K+1 conservative row slots fit the existing
+coordinator budget; otherwise the original full-materialization admission stays
+in place. Row charge is global_row_reservation plus twice the typed row payload
+and twice the vector descriptor, including capacity slack. One incoming-candidate
+slot is charged while the K-row heap is full. This is retained-operator accounting,
+not process RSS: dictionaries, parsed plans, client/RPC and transport are separate.
+
+Every fragment still drains and must pass its final child-result/zero-exit
+checks, even after the heap is full or LIMIT is zero. No worker-local pruning,
+early output or cancellation bypass is introduced. global_input_rows counts all
+validated rows; global_topk_operators/capacity/retained_rows identify the path,
+and global_reserved_bytes reports peak conservative admission. Hash/Broadcast
+exchange can feed the same collector. DISTINCT/grouped and unbounded global
+operations still have their original full-input limit; external sort is pending.

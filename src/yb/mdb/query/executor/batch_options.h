@@ -67,6 +67,9 @@ struct BatchQueryStats {
   uint64_t remote_response_bytes = 0;
   uint64_t remote_peak_frame_bytes = 0;
   uint64_t remote_coordinator_fallbacks = 0;
+  uint64_t global_topk_operators = 0;
+  uint64_t global_topk_capacity = 0;
+  uint64_t global_topk_retained_rows = 0;
   uint64_t global_input_rows = 0;
   uint64_t global_reserved_bytes = 0;
   uint64_t global_finalize_operators = 0;

@@ -4093,3 +4093,180 @@ TEST_F(MdbInterleavedExchangeTest, Shared512Comparison){Benchmark("shared");}
 TEST_F(MdbInterleavedExchangeTest, Fanout512Comparison){Benchmark("fanout");}
 }  // namespace
 }  // namespace yb::mdb
+
+
+namespace yb::mdb {
+namespace {
+class MdbGlobalTopKTest : public MdbFragmentIntegrationTest {
+ protected:
+  const std::string body=" WHERE { ?s <urn:p6:9000> ?k . ?k <urn:p6:9001> ?o }";
+};
+
+TEST_F(MdbGlobalTopKTest, OrderedSliceFitsSmallBudgetAndPreservesHiddenColumns) {
+  Seed(256);
+  const auto query="SELECT ?s ?o"+body+" ORDER BY DESC(?o) ?s LIMIT 5 OFFSET 7";
+  const auto reference=Query(query,{});ASSERT_EQ(reference.status,0);
+  const auto spill=GetTestPath("topk-spill");std::filesystem::create_directory(spill);
+  for(auto mode:{ExchangeMode::None,ExchangeMode::Hash,ExchangeMode::Broadcast}) {
+    auto options=workers_;options.coordinator_memory_bytes=20000;
+    options.exchange=mode;options.exchange_spill_directory=spill;
+    const auto result=Query(query,options);
+    ASSERT_EQ(result.status,0)<<result.profile;ASSERT_EQ(result.ordered,reference.ordered);
+    ASSERT_EQ(Field(result.profile,"global_input_rows"),512);
+    ASSERT_EQ(Field(result.profile,"global_topk_operators"),1);
+    ASSERT_EQ(Field(result.profile,"global_topk_capacity"),12);
+    ASSERT_EQ(Field(result.profile,"global_topk_retained_rows"),12);
+    ASSERT_LE(Field(result.profile,"global_reserved_bytes"),20000);
+    ASSERT_EQ(Field(result.profile,"remote_coordinator_fallbacks"),0);
+    ASSERT_TRUE(std::filesystem::is_empty(spill));
+  }
+  for(const auto& text:std::vector<std::string>{
+      "SELECT ?o"+body+" ORDER BY ?s DESC(?o) LIMIT 7 OFFSET 9",
+      "SELECT ?o ?s"+body+" ORDER BY DESC(?s) ?o LIMIT 5 OFFSET 2",
+      "SELECT ?o"+body+" ORDER BY ?o LIMIT 8 OFFSET 3"}) {
+    const auto local=Query(text,{}),remote=Query(text,workers_);
+    ASSERT_EQ(local.status,0);ASSERT_EQ(remote.status,0);ASSERT_EQ(remote.ordered,local.ordered);
+    ASSERT_EQ(Field(remote.profile,"global_topk_operators"),1);
+  }
+}
+
+TEST_F(MdbGlobalTopKTest, ExactReservationZeroLimitAndWindowOverflow) {
+  Seed(32);
+  const auto query="SELECT ?s ?o"+body+" ORDER BY ?o ?s LIMIT 3 OFFSET 2";
+  const auto normal=Query(query,workers_);ASSERT_EQ(normal.status,0);
+  const auto reservation=Field(normal.profile,"global_reserved_bytes");ASSERT_GT(reservation,0);
+  auto options=workers_;options.coordinator_memory_bytes=reservation;
+  const auto exact=Query(query,options);ASSERT_EQ(exact.status,0);ASSERT_EQ(exact.ordered,normal.ordered);
+  --options.coordinator_memory_bytes;
+  const auto rejected=Query(query,options);ASSERT_NE(rejected.status,0);ASSERT_TRUE(rejected.ordered.empty());
+  options.coordinator_memory_bytes=4096;
+  const auto zero=Query("SELECT ?s ?o"+body+" ORDER BY ?o LIMIT 0 OFFSET 18446744073709551615",options);
+  ASSERT_EQ(zero.status,0);ASSERT_TRUE(zero.ordered.empty());
+  ASSERT_EQ(Field(zero.profile,"global_input_rows"),64);
+  ASSERT_EQ(Field(zero.profile,"global_topk_capacity"),0);
+  ASSERT_EQ(Field(zero.profile,"global_topk_retained_rows"),0);
+  ASSERT_EQ(Field(zero.profile,"remote_fragments"),4);
+  const auto overflow=Query("SELECT ?s"+body+" ORDER BY ?s LIMIT 2 OFFSET 18446744073709551615",workers_);
+  ASSERT_EQ(overflow.status,0);ASSERT_TRUE(overflow.ordered.empty());
+  ASSERT_EQ(Field(overflow.profile,"global_topk_operators"),0);
+  const auto empty=Query("SELECT ?s WHERE { ?s <urn:topk:missing> ?o } ORDER BY ?s LIMIT 0",workers_);
+  ASSERT_EQ(empty.status,0);ASSERT_TRUE(empty.ordered.empty());
+}
+
+TEST_F(MdbGlobalTopKTest, DistinctGroupingAndLargeWindowsKeepOriginalAdmission) {
+  Seed(32);auto small=workers_;small.coordinator_memory_bytes=20000;
+  for(const auto& query:std::vector<std::string>{
+      "SELECT DISTINCT ?o"+body+" ORDER BY ?o LIMIT 1",
+      "SELECT ?o (COUNT(*) AS ?n)"+body+" GROUP BY ?o ORDER BY DESC(?n) LIMIT 1",
+      "SELECT ?o"+body+" LIMIT 1"}) {
+    const auto failed=Query(query,small);ASSERT_NE(failed.status,0);ASSERT_TRUE(failed.ordered.empty());
+    ASSERT_EQ(Field(failed.profile,"global_topk_operators"),0);
+    const auto full=Query(query,workers_);ASSERT_EQ(full.status,0);
+    ASSERT_EQ(Field(full.profile,"global_topk_operators"),0);
+  }
+  const auto large=Query("SELECT ?o"+body+" ORDER BY ?o LIMIT 1000000",small);
+  ASSERT_NE(large.status,0);ASSERT_EQ(Field(large.profile,"global_topk_operators"),0);
+  const auto recovered=Query("SELECT ?s"+body+" ORDER BY ?s LIMIT 3",small);
+  ASSERT_EQ(recovered.status,0);ASSERT_EQ(recovered.ordered.size(),3);
+}
+
+TEST_F(MdbGlobalTopKTest, TypedKeysAndOutputVariableOrderMatchFullSort) {
+  const std::string xsd="http://www.w3.org/2001/XMLSchema#";
+  const std::vector<SPARQL::RdfTermIdentity> terms={
+      RdfIdentity(TripleTermType::URI,"urn:z"),RdfIdentity(TripleTermType::URI,"urn:a"),
+      RdfIdentity(TripleTermType::LITERAL,"10",xsd+"integer"),
+      RdfIdentity(TripleTermType::LITERAL,"2",xsd+"integer"),
+      RdfIdentity(TripleTermType::LITERAL,"-4",xsd+"integer"),
+      RdfIdentity(TripleTermType::LITERAL,"same","@en"),
+      RdfIdentity(TripleTermType::LITERAL,"same","@fr"),
+      RdfIdentity(TripleTermType::BLANK,"b","","topk-scope")};
+  RegisterRdfIdentity(9003,RdfIdentity(TripleTermType::URI,Iri(9003)));
+  for(size_t i=0;i<terms.size();++i) {
+    RegisterRdfIdentity(600+i,terms[i]);RegisterRdfIdentity(500+i,RdfIdentity(TripleTermType::URI,Iri(500+i)));
+    ASSERT_OK(RdfYBModel::Instance().WriteTripleToDocDB(500+i,9003,600+i));
+  }
+  ASSERT_OK(RdfYBModel::Instance().Flush());
+  const char* query="SELECT ?o ?s WHERE { ?s <urn:p6:9003> ?o } ORDER BY ?o ?s LIMIT 5 OFFSET 1";
+  RdfYBModel::Instance().SetWorkerOptions(WorkerOptions{});FirstBatchTypedOutput local;
+  ASSERT_EQ(YBCMdbExecuteSparqlWithResults(query,local.Callbacks(),&local),0);
+  auto options=workers_;options.coordinator_memory_bytes=10000;
+  RdfYBModel::Instance().SetWorkerOptions(options);FirstBatchTypedOutput remote;
+  ASSERT_EQ(YBCMdbExecuteSparqlWithResults(query,remote.Callbacks(),&remote),0);
+  ASSERT_TRUE(remote.ended);ASSERT_EQ(remote.names,local.names);ASSERT_EQ(remote.rows,local.rows);
+  ASSERT_EQ(Field(YBCMdbGetLastQueryProfile(),"global_topk_operators"),1);
+}
+
+TEST_F(MdbGlobalTopKTest, LateFailureAndCancellationStillFailWithoutEarlySuccess) {
+  Seed(128);auto options=workers_;options.coordinator_memory_bytes=20000;
+  const auto query="SELECT ?s ?o"+body+" ORDER BY ?s ?o LIMIT 3";
+  const auto wrapper=GetTestPath("topk-late-error");
+  {std::ofstream file(wrapper);file<<"#!/bin/sh\n'"<<workers_.binary<<"' \"$@\"\nexit 23\n";}
+  std::filesystem::permissions(wrapper,std::filesystem::perms::owner_all);
+  auto bad=options;bad.binary=wrapper;
+  const auto failed=Query(query,bad);ASSERT_NE(failed.status,0);ASSERT_TRUE(failed.ordered.empty());
+  ASSERT_GE(Field(failed.profile,"global_input_rows"),3);
+  for(bool expire:{false,true}) {
+    struct State{bool expire;size_t cells=0;}state{expire};
+    auto sink=[](const char*,const char*,void* arg){auto& state=*static_cast<State*>(arg);++state.cells;
+      auto* view=DocDBReadContextScope::Current();if(state.expire)view->deadline=CoarseMonoClock::Now();else view->cancelled=true;};
+    RdfYBModel::Instance().SetWorkerOptions(options);
+    ASSERT_NE(YBCMdbExecuteSparql(query.c_str(),sink,&state),0);ASSERT_EQ(state.cells,2);
+  }
+  const auto fresh=Query(query,options);ASSERT_EQ(fresh.status,0);ASSERT_EQ(fresh.ordered.size(),6);
+}
+
+TEST_F(MdbGlobalTopKTest, RetentionFollowsWindowAsInputGrows) {
+  uint64_t previous=0;
+  for(size_t count:{32,128,512}) {
+    Seed(count);
+    const auto ordered="SELECT ?s ?o"+body+" ORDER BY ?o ?s";
+    const auto full=Query(ordered,workers_);ASSERT_EQ(full.status,0);
+    auto limited=workers_;limited.coordinator_memory_bytes=20000;
+    const auto top=Query(ordered+" LIMIT 5 OFFSET 7",limited);ASSERT_EQ(top.status,0);
+    const std::vector<std::string> expected(full.ordered.begin()+14,full.ordered.begin()+24);
+    ASSERT_EQ(top.ordered,expected);ASSERT_EQ(Field(top.profile,"global_input_rows"),2*count);
+    ASSERT_EQ(Field(top.profile,"global_topk_retained_rows"),12);
+    const auto reserved=Field(top.profile,"global_reserved_bytes");if(previous)ASSERT_EQ(reserved,previous);previous=reserved;
+    LOG(INFO)<<"TOPK_SAMPLE {\"input_rows\":"<<2*count<<",\"retained_rows\":12,\"correct\":true,\"topk_profile\":"
+        <<top.profile<<",\"full_profile\":"<<full.profile<<"}";
+  }
+}
+}  // namespace
+}  // namespace yb::mdb
+
+
+namespace yb::mdb {
+namespace {
+TEST_F(MdbDictionaryRecoveryTest, GlobalTopKCliBudgetTypedRowsAndFailureDiscard) {
+  const auto input=GetTestPath("topk-cli.nt");std::vector<std::string> subjects;
+  {
+    std::ofstream file(input);
+    for(size_t i=0;i<128;++i) {
+      const auto subject="urn:topk:s"+std::to_string(i);subjects.push_back(subject);
+      file<<'<'<<subject<<"> <urn:topk:p1> <urn:topk:k> .\n";
+    }
+    file<<"<urn:topk:k> <urn:topk:p2> <urn:topk:o1> .\n"
+          "<urn:topk:k> <urn:topk:p2> <urn:topk:o2> .\n";
+  }
+  auto load=Base();load.insert(load.end(),{"import",input});ASSERT_OK(Subprocess::Call(load));
+  std::sort(subjects.begin(),subjects.end());
+  auto args=Base();args.insert(args.end(),{"--mdb_result_format=json","--mdb_query_profile=true",
+      "--mdb_worker_targets=local,local,local","--mdb_worker_binary="+workers_.binary,
+      "--mdb_worker_batch_rows=128","--mdb_worker_page_rows=16","--mdb_global_memory_bytes=10000",
+      "query","SELECT ?s ?o WHERE { ?s <urn:topk:p1> ?k . ?k <urn:topk:p2> ?o } ORDER BY ?o ?s LIMIT 3 OFFSET 2"});
+  std::string output,error;const auto status=Subprocess::Call(args,&output,&error);ASSERT_TRUE(status.ok())<<status<<error;
+  rapidjson::Document value;value.Parse(output.c_str());ASSERT_FALSE(value.HasParseError());
+  ASSERT_EQ(value["head"]["vars"].Size(),2);ASSERT_STREQ(value["head"]["vars"][0].GetString(),"s");
+  ASSERT_STREQ(value["head"]["vars"][1].GetString(),"o");
+  const auto rows=value["results"]["bindings"].GetArray();ASSERT_EQ(rows.Size(),3);
+  for(size_t i=0;i<3;++i) {
+    ASSERT_STREQ(rows[i]["s"]["type"].GetString(),"uri");ASSERT_STREQ(rows[i]["o"]["type"].GetString(),"uri");
+    ASSERT_EQ(rows[i]["s"]["value"].GetString(),subjects[i+2]);ASSERT_STREQ(rows[i]["o"]["value"].GetString(),"urn:topk:o1");
+  }
+  ASSERT_EQ(Field(error,"global_input_rows"),256);ASSERT_EQ(Field(error,"global_topk_operators"),1);
+  ASSERT_EQ(Field(error,"global_topk_retained_rows"),5);ASSERT_LE(Field(error,"global_reserved_bytes"),10000);
+  for(auto& arg:args)if(arg.find("--mdb_worker_binary=")==0)arg="--mdb_worker_binary=/bin/false";
+  output.clear();error.clear();ASSERT_NOK(Subprocess::Call(args,&output,&error));ASSERT_TRUE(output.empty());
+}
+}  // namespace
+}  // namespace yb::mdb

@@ -141,3 +141,29 @@ global modifiers, SSH and CLI behavior. This is one WSL host, not multi-machine
 scaling or a SOTA/tail-latency result. Timing gains are mixed; no general speedup
 or statistical no-regression claim. Profile readers should use exchange_input_us;
 legacy serial side timers are zero on the interleaved adapter path.
+
+
+## Finite global ORDER BY window follow-up (2026-10-29)
+
+Sixteen distinct related Release GTests passed (seven new, nine compatibility).
+A pre-change query requesting LIMIT 5 OFFSET 7 failed under a 20,000-byte
+coordinator result budget because it retained all 512 rows. The scoped heap
+path now returns the full-sort reference result in worker/Hash/Broadcast modes.
+Three growth pairs retain a fixed window while the full input grows:
+
+| Input rows | Retained rows | Top-K peak reservation bytes | Full-sort reservation bytes |
+|---|---:|---:|---:|
+|64|12|19968|92160|
+|256|12|19968|368640|
+|1024|12|19968|1474560|
+
+These are logical reservations, not measured RSS or a latency speedup study.
+The full-sort oracle omits LIMIT, and its ordered result is sliced independently.
+Tests cover hidden keys, ASC/DESC, projected duplicates, typed numeric/IRI/lang/
+blank identities and output variable order, exact budget/one-byte-short, zero
+LIMIT with large OFFSET, overflow/large-window fallback, excluded DISTINCT and
+groups, late worker exit, cancellation, recovery and real CLI JSON/failed-output
+discard. Related global aggregates, modifiers, budgets and exchange tests pass.
+All input and child-result checks still run before final output. Existing
+OrderByWithLimit placeholder behavior is not used by this collector; the normal
+finalizer remains responsible for ordering and slicing retained candidates.
