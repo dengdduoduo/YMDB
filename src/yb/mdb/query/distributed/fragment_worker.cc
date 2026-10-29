@@ -3,7 +3,9 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstdlib>
+#include <cstring>
 #include <unistd.h>
 
 #include "yb/client/client.h"
@@ -26,6 +28,21 @@
 namespace yb::mdb {
 namespace {
 
+// Clock reads are skipped entirely when diagnostics are disabled.
+class PhaseTimer {
+ public:
+  explicit PhaseTimer(uint64_t* value) : value_(value) {
+    if (value_) start_ = std::chrono::steady_clock::now();
+  }
+  ~PhaseTimer() {
+    if (value_) *value_ += std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now() - start_).count();
+  }
+ private:
+  uint64_t* value_;
+  std::chrono::steady_clock::time_point start_;
+};
+
 class Worker {
  public:
   ~Worker() {
@@ -40,28 +57,38 @@ class Worker {
   }
 
   Status Open(const FragmentOpenPB& open) {
+    PhaseTimer open_timer(Phase(&open_us_));
     RETURN_NOT_OK(ValidateFragmentOpen(open));
     open_ = open;
     deadline_ = CoarseMonoClock::Now() + MonoDelta::FromMilliseconds(open.timeout_ms());
-    clock_ = make_scoped_refptr<server::HybridClock>();
-    RETURN_NOT_OK(clock_->Init());
-    client_ = VERIFY_RESULT(client::YBClientBuilder()
-        .add_master_server_addr(open.master_addresses())
-        .default_admin_operation_timeout(MonoDelta::FromMilliseconds(open.timeout_ms()))
-        .default_rpc_timeout(MonoDelta::FromMilliseconds(open.timeout_ms()))
-        .Build(static_cast<rpc::Messenger*>(nullptr), clock_));
-    for (int perm = 0; perm < 6; ++perm) {
-      RETURN_NOT_OK(tables_[perm].Open(client::YBTableName(
-          YQL_DATABASE_CQL, open.keyspace(), RdfYBModel::kTableNames[perm]), client_.get()));
-      if (tables_[perm].table()->id() != open.table_ids(perm))
-        return STATUS(Corruption, "MDB table generation changed before worker open");
+    {
+      PhaseTimer client_timer(Phase(&client_us_));
+      clock_ = make_scoped_refptr<server::HybridClock>();
+      RETURN_NOT_OK(clock_->Init());
+      client_ = VERIFY_RESULT(client::YBClientBuilder()
+          .add_master_server_addr(open.master_addresses())
+          .default_admin_operation_timeout(MonoDelta::FromMilliseconds(open.timeout_ms()))
+          .default_rpc_timeout(MonoDelta::FromMilliseconds(open.timeout_ms()))
+          .Build(static_cast<rpc::Messenger*>(nullptr), clock_));
     }
-    manager_ = std::make_shared<client::TransactionManager>(
-        client_.get(), scoped_refptr<server::Clock>(client_->Clock()), client::LocalTabletFilter());
-    auto data = VERIFY_RESULT(client::ChildTransactionData::FromPB(open.transaction()));
-    transaction_ = MakeManagedTransaction(manager_, std::move(data));
-    session_ = client_->NewSession(MonoDelta::FromMilliseconds(open.timeout_ms()));
-    session_->SetTransaction(transaction_);
+    {
+      PhaseTimer tables_timer(Phase(&tables_us_));
+      for (int perm = 0; perm < 6; ++perm) {
+        RETURN_NOT_OK(tables_[perm].Open(client::YBTableName(
+            YQL_DATABASE_CQL, open.keyspace(), RdfYBModel::kTableNames[perm]), client_.get()));
+        if (tables_[perm].table()->id() != open.table_ids(perm))
+          return STATUS(Corruption, "MDB table generation changed before worker open");
+      }
+    }
+    {
+      PhaseTimer transaction_timer(Phase(&transaction_us_));
+      manager_ = std::make_shared<client::TransactionManager>(
+          client_.get(), scoped_refptr<server::Clock>(client_->Clock()), client::LocalTabletFilter());
+      auto data = VERIFY_RESULT(client::ChildTransactionData::FromPB(open.transaction()));
+      transaction_ = MakeManagedTransaction(manager_, std::move(data));
+      session_ = client_->NewSession(MonoDelta::FromMilliseconds(open.timeout_ms()));
+      session_->SetTransaction(transaction_);
+    }
     const auto spare = open.memory_bytes() - FragmentBufferedReservation(open);
     const uint64_t per_probe = sizeof(Prefetch) + 8192 + uint64_t(open.page_rows()) * 256 +
         uint64_t(open.variable_count()) * 16;
@@ -82,6 +109,12 @@ class Worker {
   }
 
   Status Next(FragmentResponsePB* response) {
+    PhaseTimer timer(Phase(&next_us_));
+    if (phase_enabled_) ++next_calls_;
+    return NextImpl(response);
+  }
+
+  Status NextImpl(FragmentResponsePB* response) {
     uint32_t rows = 0;
     // A work quantum permits empty nonterminal responses without monopolizing Gather.
     for (size_t work = 0; work < 4096 && rows < open_.batch_rows(); ++work) {
@@ -111,7 +144,7 @@ class Worker {
           continue;
         }
         const auto before = level.cursor.rpc_calls();
-        level.batch = VERIFY_RESULT(level.cursor.NextBatch());
+        level.batch = VERIFY_RESULT([&] { PhaseTimer timer(Phase(&scan_us_)); return level.cursor.NextBatch(); }());
         ++level.generation;
         ++level.pages;
         level.reusable = depth_ != 0 && level.pages == 1 && level.batch.eof;
@@ -139,6 +172,18 @@ class Worker {
     return Status::OK();
   }
 
+  uint64_t* Phase(uint64_t* value) { return phase_enabled_ ? value : nullptr; }
+  uint64_t* WritePhase() { return Phase(&write_us_); }
+  void LogPhases(uint32_t fragment, bool success) const {
+    if (!phase_enabled_) return;
+    LOG(INFO) << "MDB_WORKER_PHASE {\"pid\":" << getpid() << ",\"fragment\":" << fragment
+              << ",\"success\":" << (success ? "true" : "false")
+              << ",\"open_us\":" << open_us_ << ",\"client_us\":" << client_us_
+              << ",\"tables_us\":" << tables_us_ << ",\"transaction_us\":" << transaction_us_
+              << ",\"next_us\":" << next_us_ << ",\"scan_api_us\":" << scan_us_
+              << ",\"writes_before_eof_us\":" << write_us_ << ",\"next_calls\":" << next_calls_
+              << ",\"reads\":" << read_operations_ << ",\"flush_rounds\":" << read_flush_rounds_ << "}";
+  }
   CoarseTimePoint deadline() const { return deadline_; }
   void LogIo(const std::string& query, uint32_t fragment) const {
     LOG(INFO) << "MDB_WORKER_IO {\"query_id\":\"" << query << "\",\"fragment\":" << fragment
@@ -252,7 +297,8 @@ class Worker {
       }
       std::vector<DocDBScanCursor*> cursors;
       for (auto& probe : prefetch_) cursors.push_back(&probe.cursor);
-      auto pages = DocDBScanCursor::NextBatches(cursors);
+      auto pages = [&] { PhaseTimer timer(Phase(&scan_us_));
+        return DocDBScanCursor::NextBatches(cursors); }();
       uint64_t operations = 0;
       for (auto* cursor : cursors) operations += cursor->rpc_calls();
       read_operations_ += operations;
@@ -327,6 +373,12 @@ class Worker {
   size_t prefetch_limit_ = 0, prefetch_begin_ = 0, prefetch_end_ = 0;
   uint64_t prefetch_generation_ = 0;
   size_t depth_ = 0;
+  const bool phase_enabled_ = [] {
+    const auto* value = std::getenv("MDB_WORKER_PHASE_PROFILE");
+    return value && std::strcmp(value, "1") == 0;
+  }();
+  uint64_t open_us_ = 0, client_us_ = 0, tables_us_ = 0, transaction_us_ = 0;
+  uint64_t next_us_ = 0, scan_us_ = 0, write_us_ = 0, next_calls_ = 0;
   uint64_t read_operations_ = 0;
   uint64_t read_flush_rounds_ = 0;
   uint64_t max_read_in_flight_ = 0;
@@ -382,7 +434,13 @@ Status RunFragmentWorker(int input_fd, int output_fd) {
     // Gather can reap a process immediately after EOF; emit opt-in diagnostics first.
     if (response.eof() && status.ok() && std::getenv("MDB_WORKER_IO_PROFILE"))
       worker.LogIo(request.query_id(), request.fragment_id());
-    RETURN_NOT_OK(WriteFragmentFrame(output_fd, response, deadline));
+    // Emit before EOF can cause Gather to reap the worker. The final write
+    // and shutdown are consequently outside this diagnostic's write total.
+    if (response.eof()) worker.LogPhases(request.fragment_id(), status.ok());
+    {
+      PhaseTimer timer(worker.WritePhase());
+      RETURN_NOT_OK(WriteFragmentFrame(output_fd, response, deadline));
+    }
     if (response.eof()) return status;
     ++sequence;
   }

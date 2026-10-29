@@ -606,3 +606,26 @@ clients and transport; no RSS/latency, physical multi-host, SOTA or new ASan cla
 Item 11 remains incomplete: external/unbounded operations, SUM/AVG and actual
 worker-to-worker consumers are separate work. Existing allocator/cleanup limits
 and paused persistent pools remain.
+
+
+## Optional worker boundary timing (2026-10-29)
+
+Set MDB_WORKER_PHASE_PROFILE=1 in the worker environment to emit one
+MDB_WORKER_PHASE JSON record to stderr before terminal EOF. Unset/other values
+disable clock reads and output. SSH does not automatically forward this variable.
+OPEN covers validation/buffers plus nested clock/client creation, six table opens
+and child transaction/session preparation. NEXT includes nested scan_api time
+(cursor preparation/flush/response decode together), binding/projection and child
+finalization. Its remainder is not pure join CPU. writes_before_eof includes
+serialization/pipe backpressure for earlier responses, excluding the final EOF
+write and shutdown; abrupt kill/disconnect need not produce a record. A success
+field describes handler status and never substitutes for Gather's exit check.
+
+No wire, strategy, credit, snapshot, prefetch capacity or memory budget changes.
+Only fixed-size worker diagnostic metadata is added. Nine exact Release tests
+pass (three new plus six relevant regressions), including diagnostic on/off bag
+and read equivalence in workers/Hash/Broadcast, late nonzero exit, minimum budget,
+snapshot, cancellation and recovery with profiling enabled. A same-binary 512
+subject test alternates off/on, checks all 1,024 output values on every query,
+and reports first plus five repeated samples per setting. This is diagnostic
+overhead evidence on a small local workload, not a speedup or RSS guarantee.

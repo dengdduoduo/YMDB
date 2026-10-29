@@ -5411,3 +5411,66 @@ TEST_F(MdbDictionaryRecoveryTest, ExtremaHavingCliHiddenSchemaAndFailureDiscard)
   output.clear();error.clear();ASSERT_NOK(Subprocess::Call(args,&output,&error));ASSERT_TRUE(output.empty());
 }
 } }  // namespace yb::mdb
+
+
+namespace yb::mdb { namespace {
+class MdbWorkerPhaseTest : public MdbFragmentIntegrationTest {
+ protected:
+  WorkerOptions Options(const std::string& label, bool enabled) {
+    auto options=workers_; const auto script=GetTestPath(label); const auto log=GetTestPath(label+".log");
+    std::ofstream file(script); file<<"#!/bin/sh\nexport MDB_WORKER_PHASE_PROFILE="<<(enabled ? "1" : "0")
+      <<"\nexec '"<<workers_.binary<<"' \"$@\" 2>> '"<<log<<"'\n";file.close();
+    std::filesystem::permissions(script,std::filesystem::perms::owner_all);options.binary=script;return options;
+  }
+  size_t Check(const std::string& label, bool enabled) {
+    std::ifstream file(GetTestPath(label+".log"));std::string line;size_t count=0;
+    while(std::getline(file,line)) { const auto pos=line.find("MDB_WORKER_PHASE ");if(pos==std::string::npos)continue;
+      ++count;rapidjson::Document value;value.Parse(line.substr(pos+17).c_str());
+      EXPECT_FALSE(value.HasParseError());if(value.HasParseError())continue;
+      EXPECT_TRUE(value["success"].GetBool());
+      EXPECT_GE(value["open_us"].GetUint64(),value["client_us"].GetUint64()+value["tables_us"].GetUint64()+value["transaction_us"].GetUint64());
+      EXPECT_GE(value["next_us"].GetUint64(),value["scan_api_us"].GetUint64());EXPECT_GT(value["next_calls"].GetUint64(),0);
+    }
+    EXPECT_EQ(count>0,enabled);return count;
+  }
+};
+TEST_F(MdbWorkerPhaseTest, ToggleKeepsBagReadsAndExchangeSemantics) {
+  Seed(64); const std::string text="SELECT ?o WHERE { ?s <urn:p6:9000> ?k . ?k <urn:p6:9001> ?o }";
+  const auto local=Query(text,{});ASSERT_EQ(local.status,0);const auto spill=GetTestPath("phase-spill");std::filesystem::create_directory(spill);
+  for(auto mode:{ExchangeMode::None,ExchangeMode::Hash,ExchangeMode::Broadcast}) {
+    uint64_t reads=0;
+    for(bool enabled:{false,true}) {const auto label="phase-"+std::to_string(static_cast<int>(mode))+std::to_string(enabled);
+      auto options=Options(label,enabled);options.exchange=mode;options.exchange_spill_directory=spill;
+      const auto result=Query(text,options);ASSERT_EQ(result.status,0);ASSERT_EQ(result.values,local.values);
+      ASSERT_EQ(Field(result.profile,"global_input_rows"),0);ASSERT_EQ(Field(result.profile,"remote_coordinator_fallbacks"),0);
+      const auto actual=Check(label,enabled);if(enabled){ASSERT_EQ(actual,Field(result.profile,"remote_fragments"));ASSERT_EQ(Field(result.profile,"remote_read_operations"),reads);}
+      else reads=Field(result.profile,"remote_read_operations");ASSERT_TRUE(std::filesystem::is_empty(spill));
+    }
+  }
+}
+
+TEST_F(MdbWorkerPhaseTest, AlternatingDiagnosticCostAt512) {
+  Seed(512);const std::string text="SELECT ?o WHERE { ?s <urn:p6:9000> ?k . ?k <urn:p6:9001> ?o }";
+  const auto expected=Query(text,{});ASSERT_EQ(expected.status,0);
+  auto off=Options("phase-bench-off",false),on=Options("phase-bench-on",true);
+  uint64_t expected_reads=0;
+  for(int sample=-1;sample<5;++sample)for(int order=0;order<2;++order){
+    const bool enabled=(order+(sample+1)%2)%2;const auto started=WallMicros();
+    const auto result=Query(text,enabled?on:off);const auto elapsed=WallMicros()-started;
+    ASSERT_EQ(result.status,0);ASSERT_EQ(result.values,expected.values);
+    const auto reads=Field(result.profile,"remote_read_operations");if(expected_reads)ASSERT_EQ(reads,expected_reads);expected_reads=reads;
+    LOG(INFO)<<"WORKER_PHASE_SAMPLE {\"enabled\":"<<(enabled?"true":"false")
+      <<",\"sample\":"<<sample<<",\"elapsed_us\":"<<elapsed<<",\"rows\":1024,\"correct\":true}";
+  }
+  ASSERT_EQ(Check("phase-bench-off",false),0);ASSERT_EQ(Check("phase-bench-on",true),24);
+}
+
+TEST_F(MdbWorkerPhaseTest, LateFailureCannotBecomeSuccessAndRecovery) {
+  Seed(32);auto options=Options("phase-recover",true);const auto script=GetTestPath("phase-late-exit");
+  {std::ofstream file(script);file<<"#!/bin/sh\nexport MDB_WORKER_PHASE_PROFILE=1\n'"<<workers_.binary<<"' \"$@\"\nexit 23\n";}
+  std::filesystem::permissions(script,std::filesystem::perms::owner_all);auto broken=options;broken.binary=script;
+  const std::string text="SELECT (COUNT(*) AS ?n) WHERE { ?s <urn:p6:9000> ?k . ?k <urn:p6:9001> ?o }";
+  for(const auto& query:{text,text+" LIMIT 0"}){const auto bad=Query(query,broken);ASSERT_NE(bad.status,0);ASSERT_TRUE(bad.ordered.empty());}
+  const auto recovered=Query(text,options);ASSERT_EQ(recovered.status,0);ASSERT_EQ(recovered.ordered,(std::vector<std::string>{"64"}));ASSERT_GT(Check("phase-recover",true),0);
+}
+} }  // namespace yb::mdb
