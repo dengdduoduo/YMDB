@@ -629,3 +629,17 @@ snapshot, cancellation and recovery with profiling enabled. A same-binary 512
 subject test alternates off/on, checks all 1,024 output values on every query,
 and reports first plus five repeated samples per setting. This is diagnostic
 overhead evidence on a small local workload, not a speedup or RSS guarantee.
+
+
+## Strategy entry guard (2026-10-29)
+
+Stage12QueryOrderAndExplicitStrategiesKeepTypedBag checks a two-triple shared-key
+graph with 128 subjects and 256 typed two-column results. Both textual triple
+orders run with local Index/Hash/Auto and explicit workers/Hash/Broadcast exchange;
+all twelve cells retain complete bags, variable order and no coordinator fallback.
+This is a correctness/selection observation, not a repeated timing benchmark.
+Local JoinPolicy chooses a local join; exchange is a separate explicit worker
+option. FragmentPlan currently collects triples in logical-tree order; the local
+greedy optimizer is not a distributed exchange/locality cost selector. Defaults
+remain Index and exchange None. Multi-scale/selectivity/locality evidence is
+required before any automatic distributed strategy rule is introduced.

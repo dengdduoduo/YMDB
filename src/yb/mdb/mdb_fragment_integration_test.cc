@@ -5474,3 +5474,37 @@ TEST_F(MdbWorkerPhaseTest, LateFailureCannotBecomeSuccessAndRecovery) {
   const auto recovered=Query(text,options);ASSERT_EQ(recovered.status,0);ASSERT_EQ(recovered.ordered,(std::vector<std::string>{"64"}));ASSERT_GT(Check("phase-recover",true),0);
 }
 } }  // namespace yb::mdb
+
+
+namespace yb::mdb { namespace {
+TEST_F(MdbFragmentIntegrationTest, Stage12QueryOrderAndExplicitStrategiesKeepTypedBag) {
+  Seed(128);auto& model=RdfYBModel::Instance();
+  const std::vector<std::string> texts={
+    "SELECT ?s ?o WHERE { ?s <urn:p6:9000> ?k . ?k <urn:p6:9001> ?o }",
+    "SELECT ?s ?o WHERE { ?k <urn:p6:9001> ?o . ?s <urn:p6:9000> ?k }"};
+  model.SetWorkerOptions({});model.SetBatchJoinOptions({});FirstBatchTypedOutput expected;
+  ASSERT_EQ(YBCMdbExecuteSparqlWithResults(texts[0].c_str(),expected.Callbacks(),&expected),0);
+  ASSERT_EQ(expected.rows.size(),256);ASSERT_EQ(expected.names,(std::vector<std::string>{"s","o"}));
+  using Row=decltype(expected.rows)::value_type;const std::multiset<Row> bag(expected.rows.begin(),expected.rows.end());
+  const auto spill=GetTestPath("stage12-entry-spill");std::filesystem::create_directory(spill);
+  for(size_t order=0;order<texts.size();++order)for(int strategy=0;strategy<6;++strategy){
+    BatchJoinOptions join;auto worker=workers_;
+    if(strategy<3){worker={};join.policy=static_cast<JoinPolicy>(strategy);}
+    else {worker.page_rows=16;worker.batch_rows=128;worker.exchange_spill_directory=spill;
+      worker.exchange=strategy==3?ExchangeMode::None:strategy==4?ExchangeMode::Hash:ExchangeMode::Broadcast;}
+    model.SetBatchJoinOptions(join);model.SetWorkerOptions(worker);FirstBatchTypedOutput actual;
+    const auto started=WallMicros();const auto status=YBCMdbExecuteSparqlWithResults(texts[order].c_str(),actual.Callbacks(),&actual);
+    const auto elapsed=WallMicros()-started;const std::string profile=YBCMdbGetLastQueryProfile();
+    ASSERT_EQ(status,0)<<profile;ASSERT_TRUE(actual.ended);ASSERT_EQ(actual.names,expected.names);
+    ASSERT_EQ(std::multiset<Row>(actual.rows.begin(),actual.rows.end()),bag);
+    ASSERT_EQ(Field(profile,"remote_coordinator_fallbacks"),0);
+    if(strategy<3)ASSERT_EQ(Field(profile,"remote_fragments"),0);
+    else {ASSERT_GT(Field(profile,"remote_fragments"),0);ASSERT_LE(Field(profile,"remote_max_workers"),worker.max_workers);}
+    if(strategy>=4)ASSERT_EQ(Field(profile,"exchange_operators"),1);
+    ASSERT_TRUE(std::filesystem::is_empty(spill));
+    LOG(INFO)<<"STAGE12_ENTRY_SAMPLE {\"order\":"<<order<<",\"strategy\":"<<strategy
+      <<",\"elapsed_us\":"<<elapsed<<",\"correct\":true,\"profile\":"<<profile<<"}";
+  }
+  model.SetBatchJoinOptions({});model.SetWorkerOptions({});
+}
+} }  // namespace yb::mdb
