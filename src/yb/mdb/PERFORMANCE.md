@@ -717,3 +717,23 @@ results and compares the per-predicate shared-key estimates to known cardinality
 within 10 percent (absolute tolerance at least one). Unit guards cover endpoint
 selection, duplicates, capacity, saturation and incomplete/missing sketches.
 No new speed/RSS, physical multi-host or SOTA claim is made.
+
+
+## Decomposed cost inputs and counterexamples (2026-10-29)
+
+The two-pattern advisory adds cost_inputs: historical ideal scan page minima
+ceil(predicate_rows/page_rows), actual anchor task count and the two-input task
+count. Zero/missing page size or unavailable counts produce null. Overflow-safe
+integer division supports uint64 counts. These are rows/pages/tasks, not latency
+scores or guaranteed bounds against a later data view; filters, terminal pages,
+tablet allocation, protocol and initialization add work. Output cardinality,
+key overlap and cache hits remain explicitly unknown. No choice is applied.
+
+Nine exact Release tests pass, including a cost boundary test and an independent
+typed-result counterexample with both orders and workers/Hash/Broadcast. Equal
+64-row inputs with approximately eight keys produce 3,256, 120 or zero output
+rows when hot keys align, shift, or are disjoint. Identical marginal counts/NDVs
+therefore cannot justify an output estimate or a universal strategy threshold.
+The previous six-graph read/flush observations are compared offline with real
+ANALYZE endpoint estimates; no repeated performance claim or runtime default
+change is introduced. Historical freshness remains unverified.

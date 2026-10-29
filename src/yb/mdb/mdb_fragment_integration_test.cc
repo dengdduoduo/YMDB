@@ -5570,7 +5570,7 @@ namespace yb::mdb { namespace {
 TEST_F(MdbFragmentIntegrationTest, Stage12AdvisoryGuardsMissingPartialAndUnsupportedInputs) {
   FragmentOpenPB input;
   for(int side=0;side<2;++side){auto* t=input.add_triples();t->add_terms()->set_variable(side);t->add_terms()->set_constant(9000+side);t->add_terms()->set_variable(side+1);}
-  auto read=[&](const QueryStatistics* stats){rapidjson::Document d;const auto text=FragmentPlan::DescribeJoinStatistics(input,stats);d.Parse(text.c_str());EXPECT_FALSE(d.HasParseError());EXPECT_LT(text.size(),1024);return d;};
+  auto read=[&](const QueryStatistics* stats){rapidjson::Document d;const auto text=FragmentPlan::DescribeJoinStatistics(input,stats);d.Parse(text.c_str());EXPECT_FALSE(d.HasParseError());EXPECT_LT(text.size(),2048);return d;};
   auto missing=read(nullptr);ASSERT_STREQ(missing["reason"].GetString(),"missing_statistics");ASSERT_TRUE(missing["historical_predicate_rows"][0].IsNull());
   QueryStatistics stats;stats.version=1;stats.predicates[9000]=32;stats.predicates[9001]=2;
   auto full=read(&stats);ASSERT_TRUE(full["eligible"].GetBool());ASSERT_FALSE(full["applied"].GetBool());ASSERT_FALSE(full["freshness_verified"].GetBool());
@@ -5654,5 +5654,49 @@ TEST_F(MdbFragmentIntegrationTest, Stage12PredicateKeyAdviceSelectsCorrectEndpoi
   stats.predicate_keys.erase(9001);auto missing=describe();ASSERT_FALSE(missing["join_key_statistics_available"].GetBool());
   ASSERT_TRUE(missing["historical_join_key_distinct_estimate"][1].IsNull());ASSERT_FALSE(missing["applied"].GetBool());ASSERT_FALSE(missing["freshness_verified"].GetBool());
   stats.predicates_complete=false;auto partial=describe();ASSERT_TRUE(partial["historical_join_key_distinct_estimate"][0].IsNull());
+}
+} }  // namespace yb::mdb
+
+
+namespace yb::mdb { namespace {
+TEST_F(MdbFragmentIntegrationTest, Stage12CostInputsNeverInventOverlapOrLatency) {
+  FragmentOpenPB input;input.set_page_rows(16);
+  for(int side=0;side<2;++side){auto* t=input.add_triples();t->add_terms()->set_variable(side);t->add_terms()->set_constant(9000+side);t->add_terms()->set_variable(side+1);}
+  QueryStatistics stats;stats.version=1;for(uint64_t i=0;i<33;++i)stats.Add(100+i,9000,1);stats.Add(1,9001,2);
+  auto parse=[&](const QueryStatistics* p,size_t tasks){rapidjson::Document d;d.Parse(FragmentPlan::DescribeJoinStatistics(input,p,tasks).c_str());EXPECT_FALSE(d.HasParseError());return d;};
+  auto d=parse(&stats,4);const auto& cost=d["cost_inputs"];
+  ASSERT_EQ(cost["scan_page_min_from_history"][0].GetUint64(),3);ASSERT_EQ(cost["scan_page_min_from_history"][1].GetUint64(),1);
+  ASSERT_EQ(cost["index_task_count"].GetUint64(),4);ASSERT_EQ(cost["exchange_task_count"].GetUint64(),8);
+  ASSERT_TRUE(cost["join_output_estimate"].IsNull());ASSERT_FALSE(cost["key_overlap_known"].GetBool());ASSERT_FALSE(cost["cache_hits_known"].GetBool());ASSERT_FALSE(d["applied"].GetBool());
+  input.set_page_rows(0);ASSERT_TRUE(parse(&stats,0)["cost_inputs"]["scan_page_min_from_history"][0].IsNull());
+  input.set_page_rows(16);ASSERT_TRUE(parse(nullptr,4)["cost_inputs"]["scan_page_min_from_history"][0].IsNull());
+  stats.predicates_complete=false;ASSERT_TRUE(parse(&stats,4)["cost_inputs"]["scan_page_min_from_history"][0].IsNull());
+  stats.predicates_complete=true;stats.predicates[9000]=std::numeric_limits<uint64_t>::max();
+  ASSERT_EQ(parse(&stats,4)["cost_inputs"]["scan_page_min_from_history"][0].GetUint64(),uint64_t{1}<<60);
+}
+TEST_F(MdbFragmentIntegrationTest, Stage12SameMarginalsDoNotPredictDisjointOrSkewedJoin) {
+  auto& model=RdfYBModel::Instance();model.SetStreamingPageRows(16);
+  for(int scenario=0;scenario<3;++scenario){
+    const uint64_t base=1000000*(scenario+1),p1=base+9000,p2=p1+1;
+    using Term=FirstBatchTypedOutput::Term;using Row=std::vector<Term>;std::multiset<Row> expected;
+    std::vector<uint64_t> left,right;
+    for(size_t i=0;i<64;++i){left.push_back(i<57?0:i-56);right.push_back(scenario==0?left.back():scenario==1?(left.back()+1)%8:left.back()+8);
+      Write(base+100+i,p1,base+10000+left.back());Write(base+10000+right.back(),p2,base+200000+i);}
+    for(size_t i=0;i<64;++i)for(size_t j=0;j<64;++j)if(left[i]==right[j])expected.insert(Row{Term{YBC_MDB_IRI,Iri(base+100+i),"",""},Term{YBC_MDB_IRI,Iri(base+200000+j),"",""}});
+    ASSERT_EQ(expected.size(),scenario==0?3256:scenario==1?120:0);
+    ASSERT_OK(model.Flush());ASSERT_OK(model.AnalyzeStatistics());
+    const auto spill=GetTestPath("cost-counterexample-spill");std::filesystem::create_directories(spill);
+    const auto a="?s <"+Iri(p1)+"> ?k",b="?k <"+Iri(p2)+"> ?o";
+    for(int order:{0,1})for(auto mode:{ExchangeMode::None,ExchangeMode::Hash,ExchangeMode::Broadcast}){
+      auto options=workers_;options.page_rows=16;options.batch_rows=128;options.exchange=mode;options.exchange_spill_directory=spill;model.SetWorkerOptions(options);
+      const auto text="SELECT ?s ?o WHERE { "+(order?b:a)+" . "+(order?a:b)+" }";
+      FirstBatchTypedOutput output;ASSERT_EQ(YBCMdbExecuteSparqlWithResults(text.c_str(),output.Callbacks(),&output),0);
+      ASSERT_TRUE(output.ended);ASSERT_EQ(output.names,(std::vector<std::string>{"s","o"}));ASSERT_EQ(std::multiset<Row>(output.rows.begin(),output.rows.end()),expected);
+      rapidjson::Document profile;profile.Parse(YBCMdbGetLastQueryProfile());ASSERT_FALSE(profile.HasParseError());const auto& advice=profile["distributed_join_advisory"];
+      for(int side=0;side<2;++side){ASSERT_EQ(advice["historical_predicate_rows"][side].GetUint64(),64);ASSERT_NEAR(advice["historical_join_key_distinct_estimate"][side].GetDouble(),8,1);}
+      ASSERT_FALSE(advice["applied"].GetBool());ASSERT_TRUE(advice["cost_inputs"]["join_output_estimate"].IsNull());ASSERT_FALSE(advice["freshness_verified"].GetBool());ASSERT_TRUE(std::filesystem::is_empty(spill));
+      LOG(INFO)<<"COST_COUNTEREXAMPLE {\"scenario\":"<<scenario<<",\"order\":"<<order<<",\"rows\":"<<expected.size()<<",\"profile\":"<<YBCMdbGetLastQueryProfile()<<"}";
+    }
+  }
 }
 } }  // namespace yb::mdb

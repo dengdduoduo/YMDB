@@ -628,13 +628,13 @@ Result<FragmentPlan> FragmentPlan::Build(
   RETURN_NOT_OK(ValidateCoverage(plan.tasks));
   const auto* context = DocDBReadContextScope::Current();
   plan.join_statistics_advisory = DescribeJoinStatistics(
-      physical, context ? context->statistics.get() : nullptr);
+      physical, context ? context->statistics.get() : nullptr, plan.tasks.size());
   return plan;
 }
 
 
 std::string FragmentPlan::DescribeJoinStatistics(
-    const FragmentOpenPB& input, const QueryStatistics* statistics) {
+    const FragmentOpenPB& input, const QueryStatistics* statistics, size_t anchor_tasks) {
   bool eligible = input.triples_size() == 2;
   std::array<std::set<uint32_t>, 2> variables;
   if (eligible) for (int side = 0; side < 2; ++side) {
@@ -693,7 +693,23 @@ std::string FragmentPlan::DescribeJoinStatistics(
     if (distinct[side] <= 0) { out << "null"; continue; }
     out << statistics->predicates.at(input.triples(side).terms(1).constant()) / distinct[side];
   }
-  out << "]}";
+  out << "],\"cost_inputs\":{\"units\":\"rows_pages_tasks_not_latency\""
+      << ",\"join_output_estimate\":null,\"key_overlap_known\":false"
+      << ",\"cache_hits_known\":false,\"page_rows\":" << input.page_rows()
+      << ",\"scan_page_min_from_history\":[";
+  for (int side = 0; side < 2; ++side) {
+    if (side) out << ',';
+    if (!eligible || !complete || !input.page_rows()) { out << "null"; continue; }
+    const auto found = statistics->predicates.find(input.triples(side).terms(1).constant());
+    const uint64_t rows = found == statistics->predicates.end() ? 0 : found->second;
+    out << rows / input.page_rows() + (rows % input.page_rows() != 0);
+  }
+  out << "],\"index_task_count\":";
+  if (eligible && anchor_tasks) out << anchor_tasks; else out << "null";
+  out << ",\"exchange_task_count\":";
+  if (eligible && anchor_tasks <= 4096 && anchor_tasks) out << anchor_tasks * 2;
+  else out << "null";
+  out << "}}";
   return out.str();
 }
 

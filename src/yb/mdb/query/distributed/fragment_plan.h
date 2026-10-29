@@ -79,7 +79,7 @@ struct FragmentPlan {
   static Result<FragmentPlan> Build(const SPARQL::Op& root, RdfYBModel& model,
                                     const WorkerOptions& options);
   static std::string DescribeJoinStatistics(const FragmentOpenPB& input,
-                                             const QueryStatistics* statistics);
+                                             const QueryStatistics* statistics, size_t anchor_tasks = 0);
   static Status ValidateCoverage(const std::vector<TabletInfo>& tasks);
   static Status FinalizeCount(SPARQL::Op& root, const GlobalCountSpec& spec,
                               std::vector<::ObjectId> rows);
