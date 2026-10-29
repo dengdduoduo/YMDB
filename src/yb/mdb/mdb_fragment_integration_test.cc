@@ -2,6 +2,7 @@
 #include <gtest/gtest.h>
 #include <arpa/inet.h>
 #include "yb/mdb/query/distributed/fragment_transport.h"
+#include "yb/mdb/query/distributed/global_count.h"
 #include <limits>
 #include "yb/mdb/import/persistent_id_map.h"
 #include "yb/util/test_thread_holder.h"
@@ -355,7 +356,7 @@ TEST_F(MdbFragmentIntegrationTest, GlobalOrderedCountGroupsAndSlice) {
 
 TEST_F(MdbFragmentIntegrationTest, GlobalOrderedGroupBudgetFailureAndRecovery) {
   SeedOrderedGroups();
-  const std::string query = "SELECT ?o (COUNT(*) AS ?n) WHERE { ?s <urn:p6:9000> ?k . "
+  const std::string query = "SELECT ?o (COUNT(DISTINCT ?s) AS ?n) WHERE { ?s <urn:p6:9000> ?k . "
       "?k <urn:p6:9001> ?o } GROUP BY ?o ORDER BY DESC(?n) ?o LIMIT 1";
   const auto success = Query(query, workers_);
   ASSERT_EQ(success.status, 0);
@@ -4157,7 +4158,7 @@ TEST_F(MdbGlobalTopKTest, DistinctGroupingAndLargeWindowsKeepOriginalAdmission) 
   Seed(32);auto small=workers_;small.coordinator_memory_bytes=20000;
   for(const auto& query:std::vector<std::string>{
       "SELECT DISTINCT ?o"+body+" ORDER BY ?s LIMIT 1",
-      "SELECT ?o (COUNT(*) AS ?n)"+body+" GROUP BY ?o ORDER BY DESC(?n) LIMIT 1",
+      "SELECT ?o (COUNT(DISTINCT ?s) AS ?n)"+body+" GROUP BY ?o ORDER BY DESC(?n) LIMIT 1",
       "SELECT ?o"+body+" LIMIT 1"}) {
     const auto failed=Query(query,small);ASSERT_NE(failed.status,0);ASSERT_TRUE(failed.ordered.empty());
     ASSERT_EQ(Field(failed.profile,"global_topk_operators"),0);
@@ -4334,8 +4335,8 @@ TEST_F(MdbGlobalDistinctTest, ExactBudgetAndIneligibleEnvelopesKeepSafety) {
   options.coordinator_memory_bytes = 10000;
   for (const auto& query : std::vector<std::string>{
       "SELECT DISTINCT ?o" + body + " ORDER BY ?s",
-      "SELECT ?o (COUNT(*) AS ?n)" + body + " GROUP BY ?o ORDER BY ?o",
-      "SELECT DISTINCT (COUNT(*) AS ?n)" + body,
+      "SELECT ?o (COUNT(DISTINCT ?s) AS ?n)" + body + " GROUP BY ?o ORDER BY ?o",
+      "SELECT DISTINCT (COUNT(DISTINCT ?s) AS ?n)" + body,
       "SELECT ?o" + body + " ORDER BY ?o"}) {
     const auto failed = Query(query, options);
     ASSERT_NE(failed.status, 0); ASSERT_TRUE(failed.ordered.empty());
@@ -4463,6 +4464,223 @@ TEST_F(MdbDictionaryRecoveryTest, GlobalDistinctCliBudgetTypedRowsAndFailureDisc
   ASSERT_LE(Field(error, "global_reserved_bytes"), 10000);
   for (auto& arg : args) if (arg.find("--mdb_worker_binary=") == 0)
     arg = "--mdb_worker_binary=/bin/false";
+  output.clear(); error.clear(); ASSERT_NOK(Subprocess::Call(args, &output, &error)); ASSERT_TRUE(output.empty());
+}
+}  // namespace
+}  // namespace yb::mdb
+
+
+namespace yb::mdb {
+namespace {
+class MdbGlobalCountTest : public MdbFragmentIntegrationTest {
+ protected:
+  const std::string body = " WHERE { ?s <urn:p6:9000> ?k . ?k <urn:p6:9001> ?o }";
+};
+
+TEST_F(MdbGlobalCountTest, FewGroupsFitSmallBudgetAcrossExchangeModes) {
+  Seed(256);
+  const auto text = "SELECT ?o (COUNT(*) AS ?n) (COUNT(?s) AS ?bound) (COUNT(?missing) AS ?zero)" +
+      body + " GROUP BY ?o ORDER BY DESC(?n) ?o";
+  const auto reference = Query(text, {}); ASSERT_EQ(reference.status, 0);
+  ASSERT_EQ(reference.ordered, (std::vector<std::string>{Iri(1001), "256", "256", "0", Iri(1002), "256", "256", "0"}));
+  const auto spill = GetTestPath("count-spill"); std::filesystem::create_directory(spill);
+  for (auto mode : {ExchangeMode::None, ExchangeMode::Hash, ExchangeMode::Broadcast}) {
+    auto options = workers_; options.coordinator_memory_bytes = 10000;
+    options.exchange = mode; options.exchange_spill_directory = spill;
+    const auto result = Query(text, options); ASSERT_EQ(result.status, 0) << result.profile;
+    ASSERT_EQ(result.ordered, reference.ordered);
+    ASSERT_EQ(Field(result.profile, "global_input_rows"), 512);
+    ASSERT_EQ(Field(result.profile, "global_count_operators"), 1);
+    ASSERT_EQ(Field(result.profile, "global_count_groups"), 2);
+    ASSERT_EQ(Field(result.profile, "global_distinct_operators"), 0);
+    ASSERT_EQ(Field(result.profile, "global_topk_operators"), 0);
+    ASSERT_EQ(Field(result.profile, "remote_coordinator_fallbacks"), 0);
+    ASSERT_LE(Field(result.profile, "global_reserved_bytes"), 10000);
+    ASSERT_TRUE(std::filesystem::is_empty(spill));
+  }
+}
+
+TEST_F(MdbGlobalCountTest, GroupProjectionDistinctOrderingAndSlice) {
+  SeedOrderedGroups(); auto options = workers_; options.coordinator_memory_bytes = 20000;
+  const auto grouped = body + " GROUP BY ?o";
+  const std::vector<std::pair<std::string, std::vector<std::string>>> cases = {
+      {"SELECT ?o (COUNT(*) AS ?n)" + grouped + " ORDER BY DESC(?n) ?o LIMIT 2 OFFSET 1", {Iri(1002), "8", Iri(1004), "8"}},
+      {"SELECT (COUNT(?s) AS ?n)" + grouped + " ORDER BY DESC(?n) ?o", {"32", "8", "8", "2"}},
+      {"SELECT DISTINCT (COUNT(*) AS ?n)" + grouped + " ORDER BY ?n LIMIT 1 OFFSET 1", {"8"}},
+      {"SELECT ?o ?k (COUNT(*) AS ?n)" + body + " GROUP BY ?k ?o ORDER BY ?k ?o", {Iri(1001), Iri(1), "32", Iri(1002), Iri(2), "8", Iri(1003), Iri(3), "2", Iri(1004), Iri(4), "8"}},
+      {"SELECT ?o (COUNT(*) AS ?n)" + grouped + " ORDER BY ?n LIMIT 0", {}},
+      {"SELECT (COUNT(*) AS ?n)" + body + " ORDER BY ?n OFFSET 2", {}}
+  };
+  for (const auto& item : cases) {
+    SCOPED_TRACE(item.first); const auto local = Query(item.first, {}), remote = Query(item.first, options);
+    ASSERT_EQ(local.status, 0); ASSERT_EQ(remote.status, 0) << remote.profile;
+    ASSERT_EQ(remote.ordered, item.second); ASSERT_EQ(remote.ordered, local.ordered);
+    ASSERT_EQ(Field(remote.profile, "global_count_operators"), 1);
+    ASSERT_EQ(Field(remote.profile, "global_input_rows"), 50);
+  }
+}
+
+TEST_F(MdbGlobalCountTest, EmptyUngroupedAndUnboundGroupSemantics) {
+  Seed(32); auto options = workers_; options.coordinator_memory_bytes = 10000;
+  const std::string missing = " WHERE { ?s <urn:count:missing> ?o }";
+  for (const auto& item : std::vector<std::pair<std::string, std::vector<std::string>>>{
+      {"SELECT (COUNT(*) AS ?n)" + missing, {"0"}},
+      {"SELECT (COUNT(?o) AS ?n)" + missing, {"0"}},
+      {"SELECT (COUNT(*) AS ?n)" + missing + " GROUP BY ?o", {}},
+      {"SELECT (COUNT(*) AS ?n)" + missing + " GROUP BY ?missing", {}},
+      {"SELECT (COUNT(?missing) AS ?n)" + body, {"0"}},
+      {"SELECT (COUNT(*) AS ?n)" + body + " GROUP BY ?missing", {"64"}},
+      {"SELECT (COUNT(*) AS ?n)" + body + " LIMIT 0", {}}}) {
+    SCOPED_TRACE(item.first); const auto result = Query(item.first, options), local = Query(item.first, {});
+    ASSERT_EQ(result.status, 0); ASSERT_EQ(local.status, 0);
+    ASSERT_EQ(result.ordered, item.second); ASSERT_EQ(result.ordered, local.ordered);
+    ASSERT_EQ(Field(result.profile, "global_count_operators"), 1);
+  }
+  const auto text = "SELECT ?missing (COUNT(*) AS ?n)" + body + " GROUP BY ?missing";
+  RdfYBModel::Instance().SetWorkerOptions(options); FirstBatchTypedOutput typed;
+  ASSERT_EQ(YBCMdbExecuteSparqlWithResults(text.c_str(), typed.Callbacks(), &typed), 0);
+  ASSERT_TRUE(typed.ended); ASSERT_EQ(typed.rows.size(), 1); ASSERT_EQ(typed.rows[0].size(), 2);
+  ASSERT_EQ(std::get<0>(typed.rows[0][0]), YBC_MDB_UNBOUND);
+  ASSERT_EQ(std::get<1>(typed.rows[0][1]), "64");
+}
+
+TEST_F(MdbGlobalCountTest, ExactBudgetManyGroupsAndIneligibleEnvelopes) {
+  Seed(32); const auto text = "SELECT ?o (COUNT(*) AS ?n)" + body + " GROUP BY ?o ORDER BY ?o";
+  const auto normal = Query(text, workers_); ASSERT_EQ(normal.status, 0);
+  const auto bytes = Field(normal.profile, "global_reserved_bytes"); ASSERT_GT(bytes, 0);
+  auto options = workers_; options.coordinator_memory_bytes = bytes;
+  const auto exact = Query(text, options); ASSERT_EQ(exact.status, 0); ASSERT_EQ(exact.ordered, normal.ordered);
+  --options.coordinator_memory_bytes;
+  const auto failed = Query(text, options); ASSERT_NE(failed.status, 0); ASSERT_TRUE(failed.ordered.empty());
+  options.coordinator_memory_bytes = 10000;
+  const auto many = Query("SELECT ?s (COUNT(*) AS ?n)" + body + " GROUP BY ?s", options);
+  ASSERT_NE(many.status, 0); ASSERT_TRUE(many.ordered.empty());
+  ASSERT_EQ(Field(many.profile, "global_count_operators"), 1);
+  for (const auto& query : std::vector<std::string>{
+      "SELECT (COUNT(DISTINCT ?s) AS ?n)" + body,
+      "SELECT (COUNT(DISTINCT *) AS ?n)" + body,
+      "SELECT ?o (COUNT(*) AS ?n)" + body + " GROUP BY ?o HAVING (COUNT(*) > 0)",
+      "SELECT (COUNT(*) AS ?n) (SUM(?s) AS ?sum)" + body,
+      "SELECT ((COUNT(*) + 1) AS ?n)" + body,
+      "SELECT ?o" + body + " GROUP BY ?o"}) {
+    SCOPED_TRACE(query); const auto rejected = Query(query, options);
+    ASSERT_NE(rejected.status, 0); ASSERT_TRUE(rejected.ordered.empty());
+    ASSERT_EQ(Field(rejected.profile, "global_count_operators"), 0);
+    const auto full = Query(query, workers_); ASSERT_EQ(full.status, 0);
+  }
+  const auto recovered = Query(text, options); ASSERT_EQ(recovered.status, 0);
+  ASSERT_EQ(recovered.ordered, normal.ordered);
+}
+
+TEST_F(MdbGlobalCountTest, TypedGroupIdentityAndColumnOrder) {
+  const std::string xsd = "http://www.w3.org/2001/XMLSchema#";
+  const std::vector<SPARQL::RdfTermIdentity> terms = {
+      RdfIdentity(TripleTermType::URI, "urn:z"), RdfIdentity(TripleTermType::URI, "urn:a"),
+      RdfIdentity(TripleTermType::LITERAL, "2", xsd + "integer"),
+      RdfIdentity(TripleTermType::LITERAL, "02", xsd + "integer"),
+      RdfIdentity(TripleTermType::LITERAL, "2", xsd + "decimal"),
+      RdfIdentity(TripleTermType::LITERAL, "same", "@en"), RdfIdentity(TripleTermType::LITERAL, "same", "@fr"),
+      RdfIdentity(TripleTermType::BLANK, "b", "", "count-scope")};
+  RegisterRdfIdentity(9003, RdfIdentity(TripleTermType::URI, Iri(9003)));
+  for (size_t i = 0; i < terms.size(); ++i) {
+    RegisterRdfIdentity(600 + i, terms[i]);
+    for (size_t j = 0; j < 8; ++j) {
+      const auto id = 10000 + i * 8 + j; RegisterRdfIdentity(id, RdfIdentity(TripleTermType::URI, Iri(id)));
+      ASSERT_OK(RdfYBModel::Instance().WriteTripleToDocDB(id, 9003, 600 + i));
+    }
+  }
+  ASSERT_OK(RdfYBModel::Instance().Flush());
+  const char* query = "SELECT (COUNT(*) AS ?n) ?o WHERE { ?s <urn:p6:9003> ?o } GROUP BY ?o";
+  RdfYBModel::Instance().SetWorkerOptions(WorkerOptions{}); FirstBatchTypedOutput local;
+  ASSERT_EQ(YBCMdbExecuteSparqlWithResults(query, local.Callbacks(), &local), 0);
+  auto options = workers_; options.coordinator_memory_bytes = 30000;
+  RdfYBModel::Instance().SetWorkerOptions(options); FirstBatchTypedOutput remote;
+  ASSERT_EQ(YBCMdbExecuteSparqlWithResults(query, remote.Callbacks(), &remote), 0);
+  ASSERT_TRUE(remote.ended); ASSERT_EQ(remote.names, local.names); ASSERT_EQ(remote.rows.size(), terms.size());
+  std::sort(remote.rows.begin(), remote.rows.end()); std::sort(local.rows.begin(), local.rows.end());
+  ASSERT_EQ(remote.rows, local.rows);
+  for (const auto& row : remote.rows) ASSERT_EQ(std::get<1>(row[0]), "8");
+  ASSERT_EQ(Field(YBCMdbGetLastQueryProfile(), "global_count_groups"), terms.size());
+}
+
+TEST_F(MdbGlobalCountTest, LateWorkerFailureZeroLimitCancellationAndRecovery) {
+  Seed(128); auto options = workers_; options.coordinator_memory_bytes = 10000;
+  const auto text = "SELECT ?o (COUNT(*) AS ?n)" + body + " GROUP BY ?o ORDER BY ?o LIMIT 1";
+  const auto wrapper = GetTestPath("count-late-error");
+  { std::ofstream file(wrapper); file << "#!/bin/sh\n'" << workers_.binary << "' \"$@\"\nexit 23\n"; }
+  std::filesystem::permissions(wrapper, std::filesystem::perms::owner_all);
+  auto broken = options; broken.binary = wrapper;
+  for (const auto& query : {text, "SELECT (COUNT(*) AS ?n)" + body + " LIMIT 0"}) {
+    const auto failed = Query(query, broken); ASSERT_NE(failed.status, 0); ASSERT_TRUE(failed.ordered.empty());
+    ASSERT_GT(Field(failed.profile, "global_input_rows"), 2);
+  }
+  for (bool expire : {false, true}) {
+    struct State { bool expire; size_t cells = 0; } state{expire};
+    auto sink = [](const char*, const char*, void* arg) {
+      auto& state = *static_cast<State*>(arg); ++state.cells; auto* view = DocDBReadContextScope::Current();
+      if (state.expire) view->deadline = CoarseMonoClock::Now(); else view->cancelled = true;
+    };
+    RdfYBModel::Instance().SetWorkerOptions(options);
+    ASSERT_NE(YBCMdbExecuteSparql(text.c_str(), sink, &state), 0); ASSERT_EQ(state.cells, 2);
+  }
+  const auto fresh = Query(text, options); ASSERT_EQ(fresh.status, 0);
+  ASSERT_EQ(fresh.ordered, (std::vector<std::string>{Iri(1001), "128"}));
+}
+
+TEST_F(MdbGlobalCountTest, StateFollowsGroupsAsInputGrows) {
+  uint64_t previous = 0;
+  for (size_t count : {32, 128, 512}) {
+    Seed(count); const auto text = "SELECT ?o (COUNT(*) AS ?n)" + body + " GROUP BY ?o ORDER BY ?o";
+    auto options = workers_; options.coordinator_memory_bytes = 10000;
+    const auto result = Query(text, options), local = Query(text, {}); ASSERT_EQ(result.status, 0); ASSERT_EQ(local.status, 0);
+    ASSERT_EQ(result.ordered, (std::vector<std::string>{Iri(1001), std::to_string(count), Iri(1002), std::to_string(count)}));
+    ASSERT_EQ(result.ordered, local.ordered); ASSERT_EQ(Field(result.profile, "global_input_rows"), 2 * count);
+    ASSERT_EQ(Field(result.profile, "global_count_groups"), 2);
+    const auto bytes = Field(result.profile, "global_reserved_bytes"); if (previous) ASSERT_EQ(bytes, previous); previous = bytes;
+    LOG(INFO) << "COUNT_SAMPLE {\"input_rows\":" << 2 * count << ",\"groups\":2,\"correct\":true,\"profile\":" << result.profile << "}";
+  }
+}
+}  // namespace
+}  // namespace yb::mdb
+
+
+TEST(MdbGlobalCountBoundaryTest, SignedCountLimitRejectsBeforeMutation) {
+  uint64_t value = static_cast<uint64_t>(std::numeric_limits<int64_t>::max()) - 1;
+  ASSERT_OK(yb::mdb::GlobalCount::Increment(&value));
+  ASSERT_EQ(value, static_cast<uint64_t>(std::numeric_limits<int64_t>::max()));
+  ASSERT_NOK(yb::mdb::GlobalCount::Increment(&value));
+  ASSERT_EQ(value, static_cast<uint64_t>(std::numeric_limits<int64_t>::max()));
+}
+
+
+namespace yb::mdb {
+namespace {
+TEST_F(MdbDictionaryRecoveryTest, GlobalCountCliBudgetTypedRowsAndFailureDiscard) {
+  const auto input = GetTestPath("count-cli.nt");
+  {
+    std::ofstream file(input);
+    for (size_t i = 0; i < 128; ++i)
+      file << "<urn:count:s" << i << "> <urn:count:p1> <urn:count:k> .\n";
+    file << "<urn:count:k> <urn:count:p2> <urn:count:o1> .\n"
+            "<urn:count:k> <urn:count:p2> <urn:count:o2> .\n";
+  }
+  auto load = Base(); load.insert(load.end(), {"import", input}); ASSERT_OK(Subprocess::Call(load));
+  auto args = Base(); args.insert(args.end(), {"--mdb_result_format=json", "--mdb_query_profile=true",
+      "--mdb_worker_targets=local,local,local", "--mdb_worker_binary=" + workers_.binary,
+      "--mdb_worker_batch_rows=128", "--mdb_worker_page_rows=16", "--mdb_global_memory_bytes=10000",
+      "query", "SELECT ?o (COUNT(*) AS ?n) WHERE { ?s <urn:count:p1> ?k . ?k <urn:count:p2> ?o } GROUP BY ?o ORDER BY DESC(?n) ?o LIMIT 1 OFFSET 1"});
+  std::string output, error; const auto status = Subprocess::Call(args, &output, &error);
+  ASSERT_TRUE(status.ok()) << status << error;
+  rapidjson::Document value; value.Parse(output.c_str()); ASSERT_FALSE(value.HasParseError());
+  ASSERT_EQ(value["head"]["vars"].Size(), 2);
+  ASSERT_STREQ(value["head"]["vars"][0].GetString(), "o"); ASSERT_STREQ(value["head"]["vars"][1].GetString(), "n");
+  const auto rows = value["results"]["bindings"].GetArray(); ASSERT_EQ(rows.Size(), 1);
+  ASSERT_STREQ(rows[0]["o"]["type"].GetString(), "uri"); ASSERT_STREQ(rows[0]["o"]["value"].GetString(), "urn:count:o2");
+  ASSERT_STREQ(rows[0]["n"]["type"].GetString(), "literal"); ASSERT_STREQ(rows[0]["n"]["value"].GetString(), "128");
+  ASSERT_STREQ(rows[0]["n"]["datatype"].GetString(), "http://www.w3.org/2001/XMLSchema#integer");
+  ASSERT_EQ(Field(error, "global_input_rows"), 256); ASSERT_EQ(Field(error, "global_count_operators"), 1);
+  ASSERT_EQ(Field(error, "global_count_groups"), 2); ASSERT_LE(Field(error, "global_reserved_bytes"), 10000);
+  for (auto& arg : args) if (arg.find("--mdb_worker_binary=") == 0) arg = "--mdb_worker_binary=/bin/false";
   output.clear(); error.clear(); ASSERT_NOK(Subprocess::Call(args, &output, &error)); ASSERT_TRUE(output.empty());
 }
 }  // namespace

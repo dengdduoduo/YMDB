@@ -466,6 +466,48 @@ Result<FragmentPlan> FragmentPlan::Build(
         2 * sizeof(::ObjectId) * (physical.projection_size() + spec.key_columns.size());
     plan.distinct = std::move(spec);
   }
+  // Only direct, non-DISTINCT counts may replace the original aggregate tree.
+  // HAVING and computed extensions must still receive the complete input bag.
+  if (aggregate && !having) {
+    GlobalCountSpec spec;
+    spec.grouped = grouped;
+    bool eligible = true;
+    const SPARQL::Op* envelope = select->op.get();
+    if (auto* order = dynamic_cast<const SPARQL::OpOrderBy*>(envelope)) envelope = order->op.get();
+    if (grouped) {
+      auto* group = dynamic_cast<const SPARQL::OpGroupBy*>(envelope);
+      eligible = group && group->op.get() == input;
+    } else eligible = envelope == input;
+    auto column = [&](VarId var) -> int32_t {
+      const auto found = std::find(physical.projection().begin(), physical.projection().end(), var.id);
+      return found == physical.projection().end() ? -1 : found - physical.projection().begin();
+    };
+    for (auto var : group_variables) {
+      spec.group_variables.push_back(var.id);
+      spec.group_columns.push_back(column(var));
+    }
+    for (size_t i = 0; i < select->vars_exprs.size(); ++i) {
+      const auto* expr = select->vars_exprs[i].get();
+      if (!expr) continue;
+      int32_t arg = -1;
+      if (auto* all = dynamic_cast<const SPARQL::ExprAggCountAll*>(expr)) {
+        if (all->distinct) { eligible = false; break; }
+        arg = -2;
+      } else if (auto* count = dynamic_cast<const SPARQL::ExprAggCount*>(expr)) {
+        const auto* var = dynamic_cast<const SPARQL::ExprVar*>(count->expr.get());
+        if (count->distinct || !var) { eligible = false; break; }
+        arg = column(var->var);
+      } else { eligible = false; break; }
+      spec.count_variables.push_back(select->vars[i].id);
+      spec.count_columns.push_back(arg);
+    }
+    // Map keys/counters, incoming key and final Values/order/distinct storage.
+    spec.row_reservation = plan.global_row_reservation + 256 +
+        4 * sizeof(std::vector<::ObjectId>) +
+        2 * sizeof(::ObjectId) * (physical.projection_size() +
+            spec.group_variables.size() + spec.count_variables.size());
+    if (eligible && !spec.count_variables.empty()) plan.count = std::move(spec);
+  }
   if (options.exchange != ExchangeMode::None) RETURN_NOT_OK(ValidateExchange(physical, options));
   plan.properties.partitioning = PhysicalProperties::Partitioning::YcqlSubjectHash;
   const auto& anchor_subject = physical.triples(0).terms(0);

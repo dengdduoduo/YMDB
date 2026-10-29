@@ -76,6 +76,7 @@
 #include "yb/mdb/query/distributed/fragment_gather.h"
 #include "yb/mdb/query/distributed/global_topk.h"
 #include "yb/mdb/query/distributed/global_distinct.h"
+#include "yb/mdb/query/distributed/global_count.h"
 #include "yb/mdb/query/distributed/exchange.h"
 #include "yb/server/hybrid_clock.h"
 #include "yb/util/logging.h"
@@ -540,6 +541,16 @@ int ExecuteSparql(
         distinct.emplace(*physical->distinct);
         ++read_context->stats.global_distinct_operators;
       }
+      std::optional<yb::mdb::GlobalCount> count;
+      if (physical->count) {
+        count.emplace(*physical->count);
+        const auto initialized = count->Initialize(worker_options.coordinator_memory_bytes);
+        if (!initialized.ok()) { LOG(WARNING) << initialized; return 1; }
+        ++read_context->stats.global_count_operators;
+        read_context->stats.global_count_groups = count->size();
+        reserved = count->reserved_bytes();
+        read_context->stats.global_reserved_bytes = reserved;
+      }
       if (physical->coordinator_finalize) {
         for (auto var : physical->physical.projection()) gathered_vars.emplace_back(var);
       }
@@ -554,7 +565,9 @@ int ExecuteSparql(
               // reservation excludes shared dictionaries and client infrastructure.
               const uint64_t row_bytes = topk ? physical->topk->row_reservation :
                   distinct ? physical->distinct->row_reservation : physical->global_row_reservation;
-              if (topk || distinct) {
+              if (count) {
+                RETURN_NOT_OK(count->AdmitCandidate(worker_options.coordinator_memory_bytes));
+              } else if (topk || distinct) {
                 const uint64_t slots = (topk ? topk->size() : distinct->size()) + 1;
                 if (slots > worker_options.coordinator_memory_bytes / row_bytes)
                   return STATUS(RuntimeError, "MDB global Gather input budget exceeded");
@@ -566,13 +579,18 @@ int ExecuteSparql(
                 reserved += row_bytes;
               }
               std::vector<ObjectId> candidate;
-              if (topk || distinct) candidate.reserve(row.size());
+              if (topk || distinct || count) candidate.reserve(row.size());
               for (auto id : row) {
                 auto found = g_gmap_to_pack.find(id);
                 if (found == g_gmap_to_pack.end())
                   return STATUS(Corruption, "Missing typed dictionary identity for global input");
-                if (topk || distinct) candidate.push_back(found->second);
+                if (topk || distinct || count) candidate.push_back(found->second);
                 else gathered.push_back(found->second);
+              }
+              if (count) {
+                RETURN_NOT_OK(count->Add(candidate, worker_options.coordinator_memory_bytes));
+                reserved = count->reserved_bytes();
+                read_context->stats.global_count_groups = count->size();
               }
               if (distinct) {
                 RETURN_NOT_OK(distinct->Add(std::move(candidate), worker_options.coordinator_memory_bytes));
@@ -604,8 +622,21 @@ int ExecuteSparql(
       // The original modifiers execute once over full input or safe representatives.
       if (topk) gathered = topk->ReleaseRows();
       if (distinct) gathered = distinct->ReleaseRows();
-      *yb::mdb::FragmentPlan::InputSlot(*op) = std::make_unique<OpValues>(
-          std::move(gathered_vars), std::move(gathered));
+      if (count) {
+        gathered_vars.clear();
+        for (auto var : physical->count->group_variables) gathered_vars.emplace_back(var);
+        for (auto var : physical->count->count_variables) gathered_vars.emplace_back(var);
+        auto values = std::make_unique<OpValues>(std::move(gathered_vars), count->ReleaseRows());
+        auto& root = dynamic_cast<OpSelect&>(*op);
+        // Counts are already final. Preserve only the existing global modifiers.
+        if (auto* order = dynamic_cast<OpOrderBy*>(root.op.get())) order->op = std::move(values);
+        else root.op = std::move(values);
+        root.vars_exprs.clear();
+        root.vars_exprs.resize(root.vars.size());
+      } else {
+        *yb::mdb::FragmentPlan::InputSlot(*op) = std::make_unique<OpValues>(
+            std::move(gathered_vars), std::move(gathered));
+      }
       ++read_context->stats.global_finalize_operators;
     }
   }

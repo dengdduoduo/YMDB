@@ -212,3 +212,50 @@ empty solution. Its initial failing run is preserved, not counted as passed.
 The corrected case and remaining thirteen cases passed in the final run; the
 first two unchanged cases were not rerun. Runtime code did not change between
 these runs.
+
+
+## Incremental global counts (2026-10-29)
+
+Plain BGP SELECTs with only direct non-distinct `COUNT(*)` or `COUNT(variable)`
+aggregates now retain typed group-key tuples and uint64 counters instead of all
+input bindings. Group keys use the same ObjectId identity as the original
+internal group sort/aggregation, including unbound keys. COUNT of an unbound
+variable is zero. An empty implicit aggregate returns one zero-count binding;
+an empty explicit group returns no bindings. Count increments reject values
+beyond INT64_MAX before mutation, matching the signed result representation.
+
+After every input dictionary identity, child result and worker zero exit has
+succeeded, finalized group keys/count aliases replace the count/group tree.
+The existing SELECT projection, ORDER BY, DISTINCT and LIMIT/OFFSET then run once;
+hidden group ordering keys remain available and LIMIT 0 still drains workers.
+HAVING, COUNT(DISTINCT ...), numeric aggregates, computed SELECT expressions,
+GROUP BY expressions and non-count grouping keep their previous paths. Only
+the validated optional ORDER BY / optional GROUP BY / BGP envelope is rewritten.
+There is no worker-local partial aggregation, network or storage format change.
+
+Admission charges conservative map/key/counter, incoming typed row/key, finalized
+Values/order/distinct storage and fixed-size generated count terms per retained
+group. New groups require an additional retained slot; the implicit empty group
+is admitted before gathering. Excess group cardinality fails without output or
+post-start fallback. `global_count_operators` and `global_count_groups` identify
+this path; `global_input_rows` still counts the complete admitted multiset.
+`global_reserved_bytes` reports peak logical reservation, excluding shared
+dictionaries, client/RPC infrastructure and transport buffers; it is not RSS.
+High group cardinality can reach the same nominal budget earlier because of map
+overhead. Unordered output/slices and equal ORDER BY keys have no stable order.
+
+Release evidence: 19 exact GTests (9 new, 10 related compatibility), one wrapper
+invocation per case. Pre-change, a 512-row/two-group query failed after five rows
+and 9,760 reserved bytes under 10,000 bytes; workers, Hash and Broadcast now return
+the expected complete counts under the same limit. Growth from 64 to 256 to 1,024
+inputs retains two groups and 5,952 reserved bytes while exact counts grow.
+Tests check typed key identity/column order, multiple keys/count aliases, bound
+and missing arguments, empty groups, hidden ordering keys, DISTINCT over counts,
+exact/one-byte-short budgets, too many groups, excluded envelopes, signed-count
+overflow, late nonzero worker exits (also LIMIT 0), cancellation/timeout at output,
+recovery, and fresh-import CLI JSON/schema/pagination with failed-output discard.
+Conditions: one WSL host, two logical CPUs, three in-process tservers/RF3, four
+tablets per index; CAPI page1/batch2, CLI page16/batch128. No new latency, peak RSS,
+Debug/ASan, physical multi-host or SOTA result. Historical allocator root cause
+and remote cleanup limitations remain. General HAVING/value aggregation and
+external sorting/aggregation are not implemented by this milestone.

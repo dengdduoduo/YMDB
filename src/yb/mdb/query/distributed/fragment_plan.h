@@ -39,6 +39,16 @@ struct GlobalDistinctSpec {
   std::vector<uint32_t> key_columns;
 };
 
+struct GlobalCountSpec {
+  bool grouped = false;
+  uint64_t row_reservation = 0;
+  std::vector<uint32_t> group_variables;
+  std::vector<int32_t> group_columns;
+  std::vector<uint32_t> count_variables;
+  // -2 means COUNT(*), -1 is an unbound argument, otherwise an input column.
+  std::vector<int32_t> count_columns;
+};
+
 // Executable storage-ID graph, separate from the parser's process-local Op tree.
 struct FragmentPlan {
   PhysicalProperties properties;
@@ -49,6 +59,7 @@ struct FragmentPlan {
   uint64_t global_row_reservation = 0;
   std::optional<GlobalTopKSpec> topk;
   std::optional<GlobalDistinctSpec> distinct;
+  std::optional<GlobalCountSpec> count;
 
   // Called only after Build has accepted the complete coordinator envelope.
   static std::unique_ptr<SPARQL::Op>* InputSlot(SPARQL::Op& root);
