@@ -412,3 +412,41 @@ Debug or ASan acceptance. Historical allocator/remote cleanup limitations remain
 Unbounded global sorts, numeric/external aggregation and worker-to-worker
 consumers remain outside this milestone. The old all-input exclusion case now
 uses unbounded OFFSET rather than finite LIMIT to retain its budget assertion.
+
+
+## Incremental direct MIN/MAX (2026-10-29)
+
+The existing grouped state carrier accepts direct MIN(variable)/MAX(variable)
+SELECT aggregates without HAVING, optionally mixed with supported COUNTs and
+variable COUNT DISTINCT. It retains one winning typed ObjectId per extremum slot
+and uses the original compare_for_order/null handling. DISTINCT on MIN/MAX is
+idempotent and does not allocate a set. Equal comparison keys retain the first
+arrival; ties do not acquire a stable representative across worker schedules.
+Missing arguments and empty groups retain the existing unbound result behavior.
+Values are passed unchanged to the final projection/order/distinct/slice, after
+all inputs/dictionaries/child results and worker exits have succeeded.
+
+Each group reserves the previous conservative downstream state plus extrema
+vector/candidate capacity. Existing count and distinct-set admission still share
+the same budget; too many groups fail without truncation or fallback after launch.
+global_extrema_operators and global_extrema_slots identify the path; the existing
+global_count_groups/operations metrics also cover the reused grouped carrier.
+SUM/AVG, computed SELECT extensions, full-tuple distinct counts, and any HAVING
+with selected extrema retain their previous paths. No changes to storage/wire,
+flags, default join/exchange strategy, worker-local aggregation or boolean logic.
+
+Release evidence: 16 exact GTests (6 new, 10 compatibility), one wrapper call per
+case. Before the change, 512-input MIN/MAX plus COUNT query failed at 10,000 bytes
+after three rows/8,832 reserved bytes; workers/Hash/Broadcast now return complete
+correct results under the same limit. Input 64/256/1,024 retains one group/two
+extrema slots and 6,352 peak logical bytes. Numeric winner identity across
+integer/decimal/double, missing/empty groups, grouped final modifiers, exact and
+one-byte-short budgets, excluded paths, late failure/LIMIT 0, cancellation and
+recovery pass. A fresh-import CLI checks typed IRI winners/schema/failure discard.
+Existing numeric, count, HAVING, DISTINCT, windows and exchange regressions pass.
+
+Conditions: one WSL host, two logical CPUs, three in-process tservers/RF3, four
+tablets per index; CAPI page1/batch2, CLI page16/batch128. Logical reservations
+exclude shared dictionaries/client/RPC/transport buffers, not RSS or measured
+latency. No new Debug/ASan, physical multi-host or SOTA evidence. Historical
+allocator root cause and remote cleanup limitations remain unresolved.

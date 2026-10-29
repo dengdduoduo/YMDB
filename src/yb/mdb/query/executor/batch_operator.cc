@@ -127,6 +127,8 @@ std::string BatchQueryStats::ToJson() const {
   MDB_STAT(global_count_distinct_operators);
   MDB_STAT(global_count_distinct_sets);
   MDB_STAT(global_count_distinct_entries);
+  MDB_STAT(global_extrema_operators);
+  MDB_STAT(global_extrema_slots);
   MDB_STAT(global_count_operators);
   MDB_STAT(global_count_groups);
   MDB_STAT(global_distinct_operators);

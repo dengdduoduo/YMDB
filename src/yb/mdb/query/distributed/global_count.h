@@ -8,6 +8,7 @@
 #include <utility>
 #include <vector>
 
+#include "graph_models/rdf_model/comparisons.h"
 #include "graph_models/rdf_model/conversions.h"
 #include "yb/mdb/query/distributed/fragment_plan.h"
 
@@ -57,6 +58,16 @@ class GlobalCount {
     if (is_new) found = groups_.emplace_hint(found, std::move(key), Group(spec_));
     auto& group = found->second;
     for (size_t i = 0; i < spec_.count_columns.size(); ++i) {
+      if (spec_.extrema_directions[i]) {
+        const auto column = spec_.count_columns[i];
+        if (column < 0 || row[column].is_null()) continue;
+        auto& selected = group.extrema[i];
+        const auto value = row[column];
+        const auto order = selected.is_null() ? 0 : SPARQL::Comparisons::compare_for_order(value, selected);
+        if (selected.is_null() || (spec_.extrema_directions[i] < 0 ? order < 0 : order > 0))
+          selected = value;
+        continue;
+      }
       if (spec_.count_set_slots[i] != -1) continue;
       const auto column = spec_.count_columns[i];
       if (column == -2 || (column >= 0 && !row[column].is_null()))
@@ -80,6 +91,10 @@ class GlobalCount {
     for (const auto& group : groups_) {
       result.insert(result.end(), group.first.begin(), group.first.end());
       for (size_t i = 0; i < spec_.count_columns.size(); ++i) {
+        if (spec_.extrema_directions[i]) {
+          result.push_back(group.second.extrema[i]);
+          continue;
+        }
         const auto slot = spec_.count_set_slots[i];
         const uint64_t count = slot >= 0 ? group.second.seen[slot].size() : group.second.counts[i];
         result.push_back(SPARQL::Conversions::pack_int(static_cast<int64_t>(count)));
@@ -92,9 +107,11 @@ class GlobalCount {
  private:
   struct Group {
     explicit Group(const GlobalCountSpec& spec)
-        : counts(spec.count_columns.size(), 0), seen(spec.distinct_columns.size()) {}
+        : counts(spec.count_columns.size(), 0), seen(spec.distinct_columns.size()),
+          extrema(spec.has_extrema ? spec.count_columns.size() : 0, ::ObjectId::get_null()) {}
     std::vector<uint64_t> counts;
     std::vector<std::set<::ObjectId>> seen;
+    std::vector<::ObjectId> extrema;
   };
 
   Status Check(uint64_t slots, uint64_t entries, uint64_t budget) const {

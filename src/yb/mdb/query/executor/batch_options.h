@@ -72,6 +72,8 @@ struct BatchQueryStats {
   uint64_t global_count_distinct_operators = 0;
   uint64_t global_count_distinct_sets = 0;
   uint64_t global_count_distinct_entries = 0;
+  uint64_t global_extrema_operators = 0;
+  uint64_t global_extrema_slots = 0;
   uint64_t global_count_operators = 0;
   uint64_t global_count_groups = 0;
   uint64_t global_distinct_operators = 0;

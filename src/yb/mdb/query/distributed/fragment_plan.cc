@@ -500,7 +500,7 @@ Result<FragmentPlan> FragmentPlan::Build(
         2 * sizeof(::ObjectId) * (physical.projection_size() + spec.key_columns.size());
     plan.distinct = std::move(spec);
   }
-  // Computed SELECT extensions, full-tuple DISTINCT and value aggregates retain the old path.
+  // Direct extrema and counts use bounded state; unsupported expressions retain input.
   if (aggregate) {
     GlobalCountSpec spec;
     spec.grouped = grouped;
@@ -530,6 +530,7 @@ Result<FragmentPlan> FragmentPlan::Build(
       if (!expr) continue;
       int32_t arg = -1;
       bool distinct = false;
+      int8_t direction = 0;
       if (auto* all = dynamic_cast<const SPARQL::ExprAggCountAll*>(expr)) {
         if (all->distinct) { eligible = false; break; }
         arg = -2;
@@ -538,11 +539,23 @@ Result<FragmentPlan> FragmentPlan::Build(
         if (!var) { eligible = false; break; }
         distinct = count->distinct;
         arg = column(var->var);
+      } else if (dynamic_cast<const SPARQL::ExprAggMin*>(expr) ||
+                 dynamic_cast<const SPARQL::ExprAggMax*>(expr)) {
+        const auto* minimum = dynamic_cast<const SPARQL::ExprAggMin*>(expr);
+        const auto* argument = minimum ? minimum->expr.get() :
+            static_cast<const SPARQL::ExprAggMax*>(expr)->expr.get();
+        const auto* var = dynamic_cast<const SPARQL::ExprVar*>(argument);
+        if (!var) { eligible = false; break; }
+        direction = minimum ? -1 : 1;
+        arg = column(var->var);
+        spec.has_extrema = true;
       } else { eligible = false; break; }
+      spec.extrema_directions.push_back(direction);
       spec.count_variables.push_back(select->vars[i].id);
       spec.count_columns.push_back(arg);
       distinct_counts.push_back(distinct);
     }
+    if (spec.has_extrema && having) eligible = false;
     if (eligible && having) {
       for (const auto& predicate : having->exprs) {
         auto rewritten = RewriteCountPredicate(*predicate, [&](const SPARQL::Expr& expr)
@@ -562,6 +575,7 @@ Result<FragmentPlan> FragmentPlan::Build(
           // Reserve identities without changing the query context or parser tree.
           const uint32_t var = get_query_ctx().get_var_size() + spec.having_variables.size();
           spec.having_variables.push_back(var);
+          spec.extrema_directions.push_back(0);
           spec.count_variables.push_back(var);
           spec.count_columns.push_back(arg);
           distinct_counts.push_back(distinct);
@@ -591,7 +605,8 @@ Result<FragmentPlan> FragmentPlan::Build(
         4 * sizeof(std::vector<::ObjectId>) +
         2 * sizeof(::ObjectId) * (physical.projection_size() +
             spec.group_variables.size() + spec.count_variables.size()) +
-        128 * spec.distinct_columns.size();
+        128 * spec.distinct_columns.size() + (spec.has_extrema ?
+            sizeof(std::vector<::ObjectId>) + 2 * sizeof(::ObjectId) * spec.count_columns.size() : 0);
     if (eligible && !spec.count_variables.empty()) plan.count = std::move(spec);
   }
   if (options.exchange != ExchangeMode::None) RETURN_NOT_OK(ValidateExchange(physical, options));

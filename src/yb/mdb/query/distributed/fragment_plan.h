@@ -49,6 +49,9 @@ struct GlobalCountSpec {
   std::vector<uint32_t> count_variables;
   // -2 means COUNT(*), -1 is an unbound argument, otherwise an input column.
   std::vector<int32_t> count_columns;
+  bool has_extrema = false;
+  // Zero is COUNT; negative is MIN, positive is MAX.
+  std::vector<int8_t> extrema_directions;
   bool has_distinct = false;
   uint64_t distinct_entry_reservation = 128;
   std::vector<int32_t> distinct_columns;
