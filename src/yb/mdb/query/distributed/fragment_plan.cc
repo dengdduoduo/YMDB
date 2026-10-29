@@ -150,24 +150,26 @@ Status ValidateHaving(const SPARQL::Expr& expr, const std::set<VarId>& group_var
   return STATUS(NotSupported, "HAVING expression remains at coordinator");
 }
 
-using CountRewrite = std::function<std::unique_ptr<SPARQL::Expr>(const SPARQL::Expr&)>;
+using AggregateRewrite = std::function<std::unique_ptr<SPARQL::Expr>(const SPARQL::Expr&)>;
 
 // Preserve existing expression evaluation; only aggregate leaves change.
-std::unique_ptr<SPARQL::Expr> RewriteCountPredicate(
-    const SPARQL::Expr& expr, const CountRewrite& rewrite) {
+std::unique_ptr<SPARQL::Expr> RewriteAggregatePredicate(
+    const SPARQL::Expr& expr, const AggregateRewrite& rewrite) {
   if (dynamic_cast<const SPARQL::ExprAggCount*>(&expr) ||
-      dynamic_cast<const SPARQL::ExprAggCountAll*>(&expr)) return rewrite(expr);
+      dynamic_cast<const SPARQL::ExprAggCountAll*>(&expr) ||
+      dynamic_cast<const SPARQL::ExprAggMin*>(&expr) ||
+      dynamic_cast<const SPARQL::ExprAggMax*>(&expr)) return rewrite(expr);
   auto result = expr.clone();
   if (dynamic_cast<SPARQL::ExprTerm*>(result.get()) ||
       dynamic_cast<SPARQL::ExprVar*>(result.get())) return result;
   if (auto* negation = dynamic_cast<SPARQL::ExprNot*>(result.get())) {
-    negation->expr = RewriteCountPredicate(*negation->expr, rewrite);
+    negation->expr = RewriteAggregatePredicate(*negation->expr, rewrite);
     return negation->expr ? std::move(result) : nullptr;
   }
   auto binary = [&](auto* node) {
     if (!node) return false;
-    node->lhs = RewriteCountPredicate(*node->lhs, rewrite);
-    node->rhs = RewriteCountPredicate(*node->rhs, rewrite);
+    node->lhs = RewriteAggregatePredicate(*node->lhs, rewrite);
+    node->rhs = RewriteAggregatePredicate(*node->rhs, rewrite);
     return bool(node->lhs) && bool(node->rhs);
   };
   if (binary(dynamic_cast<SPARQL::ExprAnd*>(result.get())) ||
@@ -524,58 +526,56 @@ Result<FragmentPlan> FragmentPlan::Build(
       spec.group_variables.push_back(var.id);
       spec.group_columns.push_back(column(var));
     }
+    auto bind_aggregate = [&](const SPARQL::Expr& expr, int32_t* arg,
+                              bool* distinct, int8_t* direction) {
+      *distinct = false;
+      *direction = 0;
+      if (auto* all = dynamic_cast<const SPARQL::ExprAggCountAll*>(&expr)) {
+        *arg = -2;
+        return !all->distinct;
+      }
+      const SPARQL::Expr* argument = nullptr;
+      if (auto* count = dynamic_cast<const SPARQL::ExprAggCount*>(&expr)) {
+        *distinct = count->distinct;
+        argument = count->expr.get();
+      } else if (auto* minimum = dynamic_cast<const SPARQL::ExprAggMin*>(&expr)) {
+        *direction = -1;
+        argument = minimum->expr.get();
+      } else if (auto* maximum = dynamic_cast<const SPARQL::ExprAggMax*>(&expr)) {
+        *direction = 1;
+        argument = maximum->expr.get();
+      }
+      const auto* var = dynamic_cast<const SPARQL::ExprVar*>(argument);
+      if (!var) return false;
+      *arg = column(var->var);
+      spec.has_extrema = spec.has_extrema || *direction != 0;
+      return true;
+    };
     std::vector<bool> distinct_counts;
     for (size_t i = 0; i < select->vars_exprs.size(); ++i) {
       const auto* expr = select->vars_exprs[i].get();
       if (!expr) continue;
-      int32_t arg = -1;
-      bool distinct = false;
-      int8_t direction = 0;
-      if (auto* all = dynamic_cast<const SPARQL::ExprAggCountAll*>(expr)) {
-        if (all->distinct) { eligible = false; break; }
-        arg = -2;
-      } else if (auto* count = dynamic_cast<const SPARQL::ExprAggCount*>(expr)) {
-        const auto* var = dynamic_cast<const SPARQL::ExprVar*>(count->expr.get());
-        if (!var) { eligible = false; break; }
-        distinct = count->distinct;
-        arg = column(var->var);
-      } else if (dynamic_cast<const SPARQL::ExprAggMin*>(expr) ||
-                 dynamic_cast<const SPARQL::ExprAggMax*>(expr)) {
-        const auto* minimum = dynamic_cast<const SPARQL::ExprAggMin*>(expr);
-        const auto* argument = minimum ? minimum->expr.get() :
-            static_cast<const SPARQL::ExprAggMax*>(expr)->expr.get();
-        const auto* var = dynamic_cast<const SPARQL::ExprVar*>(argument);
-        if (!var) { eligible = false; break; }
-        direction = minimum ? -1 : 1;
-        arg = column(var->var);
-        spec.has_extrema = true;
-      } else { eligible = false; break; }
+      int32_t arg;
+      bool distinct;
+      int8_t direction;
+      if (!bind_aggregate(*expr, &arg, &distinct, &direction)) { eligible = false; break; }
       spec.extrema_directions.push_back(direction);
       spec.count_variables.push_back(select->vars[i].id);
       spec.count_columns.push_back(arg);
       distinct_counts.push_back(distinct);
     }
-    if (spec.has_extrema && having) eligible = false;
     if (eligible && having) {
       for (const auto& predicate : having->exprs) {
-        auto rewritten = RewriteCountPredicate(*predicate, [&](const SPARQL::Expr& expr)
+        auto rewritten = RewriteAggregatePredicate(*predicate, [&](const SPARQL::Expr& expr)
             -> std::unique_ptr<SPARQL::Expr> {
           int32_t arg;
-          bool distinct = false;
-          if (auto* all = dynamic_cast<const SPARQL::ExprAggCountAll*>(&expr)) {
-            if (all->distinct) return nullptr;
-            arg = -2;
-          } else {
-            const auto& count = static_cast<const SPARQL::ExprAggCount&>(expr);
-            const auto* var = dynamic_cast<const SPARQL::ExprVar*>(count.expr.get());
-            if (!var) return nullptr;
-            distinct = count.distinct;
-            arg = column(var->var);
-          }
+          bool distinct;
+          int8_t direction;
+          if (!bind_aggregate(expr, &arg, &distinct, &direction)) return nullptr;
           // Reserve identities without changing the query context or parser tree.
           const uint32_t var = get_query_ctx().get_var_size() + spec.having_variables.size();
           spec.having_variables.push_back(var);
-          spec.extrema_directions.push_back(0);
+          spec.extrema_directions.push_back(direction);
           spec.count_variables.push_back(var);
           spec.count_columns.push_back(arg);
           distinct_counts.push_back(distinct);
@@ -635,22 +635,22 @@ Status FragmentPlan::FinalizeCount(
   size_t hidden = 0;
   if (spec.having) {
     const auto* having = dynamic_cast<const SPARQL::OpHaving*>(slot->get());
-    if (!having) return STATUS(Corruption, "Missing incremental COUNT HAVING envelope");
+    if (!having) return STATUS(Corruption, "Missing incremental aggregate HAVING envelope");
     for (const auto& predicate : having->exprs) {
-      auto rewritten = RewriteCountPredicate(*predicate, [&](const SPARQL::Expr&)
+      auto rewritten = RewriteAggregatePredicate(*predicate, [&](const SPARQL::Expr&)
           -> std::unique_ptr<SPARQL::Expr> {
         if (hidden == spec.having_variables.size()) return nullptr;
         return std::make_unique<SPARQL::ExprVar>(VarId(spec.having_variables[hidden++]));
       });
-      if (!rewritten) return STATUS(Corruption, "Incremental COUNT HAVING rewrite mismatch");
+      if (!rewritten) return STATUS(Corruption, "Incremental aggregate HAVING rewrite mismatch");
       predicates.push_back(std::move(rewritten));
     }
   }
   if (hidden != spec.having_variables.size())
-    return STATUS(Corruption, "Incremental COUNT HAVING slot mismatch");
+    return STATUS(Corruption, "Incremental aggregate HAVING slot mismatch");
   for (auto var : spec.having_variables) {
     if (get_query_ctx().get_var_size() != var || get_query_ctx().get_internal_var().id != var)
-      return STATUS(Corruption, "Incremental COUNT private variable mismatch");
+      return STATUS(Corruption, "Incremental aggregate private variable mismatch");
   }
   std::vector<VarId> vars;
   for (auto var : spec.group_variables) vars.emplace_back(var);

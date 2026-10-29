@@ -5204,7 +5204,7 @@ TEST_F(MdbExtremaTest, GroupModifiersBudgetAndExcludedPaths) {
   const auto many=Query("SELECT ?s (MIN(?o) AS ?lo)"+body+" GROUP BY ?s",options);ASSERT_NE(many.status,0);ASSERT_TRUE(many.ordered.empty());
   for(const auto& text:std::vector<std::string>{
       "SELECT (MIN(?o) AS ?lo) (SUM(?s) AS ?sum)"+body,
-      "SELECT (MIN(?o) AS ?lo)"+body+" HAVING (COUNT(*) > 0)",
+      "SELECT (MIN(?o) AS ?lo)"+body+" HAVING (SUM(?s) > 0)",
       "SELECT (MIN(?o) AS ?lo) ((COUNT(*)+1) AS ?n)"+body}) {
     const auto small=Query(text,options);ASSERT_NE(small.status,0);ASSERT_TRUE(small.ordered.empty());ASSERT_EQ(Field(small.profile,"global_extrema_operators"),0);
     ASSERT_EQ(Query(text,workers_).status,0);
@@ -5266,6 +5266,147 @@ TEST_F(MdbDictionaryRecoveryTest, ExtremaCliTypedIdentityAndFailureDiscard) {
   const auto rows=value["results"]["bindings"].GetArray();ASSERT_EQ(rows.Size(),1);ASSERT_STREQ(rows[0]["lo"]["type"].GetString(),"uri");
   ASSERT_STREQ(rows[0]["lo"]["value"].GetString(),"urn:ex:a");ASSERT_STREQ(rows[0]["hi"]["type"].GetString(),"uri");ASSERT_STREQ(rows[0]["hi"]["value"].GetString(),"urn:ex:z");
   ASSERT_EQ(Field(error,"global_input_rows"),256);ASSERT_EQ(Field(error,"global_extrema_slots"),2);
+  for(auto& arg:args)if(arg.find("--mdb_worker_binary=")==0)arg="--mdb_worker_binary=/bin/false";
+  output.clear();error.clear();ASSERT_NOK(Subprocess::Call(args,&output,&error));ASSERT_TRUE(output.empty());
+}
+} }  // namespace yb::mdb
+
+
+namespace yb::mdb { namespace {
+class MdbExtremaHavingTest : public MdbFragmentIntegrationTest {
+ protected:
+  const std::string body = " WHERE { ?s <urn:p6:9000> ?k . ?k <urn:p6:9001> ?o }";
+};
+TEST_F(MdbExtremaHavingTest, CompleteExtremaAcrossExchangeModes) {
+  Seed(256);
+  const auto text = "SELECT (MIN(?o) AS ?lo) (MAX(?o) AS ?hi) (COUNT(*) AS ?n)" + body +
+      " HAVING ((COUNT(*) = 512) && (MIN(?o) != MAX(?o)))";
+  const auto local = Query(text, {}); ASSERT_EQ(local.status, 0);
+  ASSERT_EQ(local.ordered, (std::vector<std::string>{Iri(1001), Iri(1002), "512"}));
+  const auto spill = GetTestPath("extrema-having-spill"); std::filesystem::create_directory(spill);
+  for (auto mode : {ExchangeMode::None, ExchangeMode::Hash, ExchangeMode::Broadcast}) {
+    auto options = workers_; options.exchange = mode; options.exchange_spill_directory = spill;
+    options.coordinator_memory_bytes = 20000;
+    const auto result = Query(text, options); ASSERT_EQ(result.status, 0) << result.profile;
+    ASSERT_EQ(result.ordered, local.ordered); ASSERT_EQ(Field(result.profile, "global_input_rows"), 512);
+    ASSERT_EQ(Field(result.profile, "global_extrema_operators"), 1);
+    ASSERT_EQ(Field(result.profile, "global_extrema_slots"), 4);
+    ASSERT_EQ(Field(result.profile, "global_count_having_hidden_counts"), 3);
+    ASSERT_EQ(Field(result.profile, "remote_coordinator_fallbacks"), 0);
+    ASSERT_LE(Field(result.profile, "global_reserved_bytes"), 20000);
+    ASSERT_TRUE(std::filesystem::is_empty(spill));
+  }
+}
+TEST_F(MdbExtremaHavingTest, HiddenOnlyModifiersEmptyAndScope) {
+  SeedOrderedGroups(); auto options = workers_;
+  const std::vector<std::string> texts = {
+    "SELECT ?o" + body + " GROUP BY ?o HAVING (MIN(?s) = MAX(?s)) ORDER BY ?o",
+    "SELECT ?o (MIN(?s) AS ?lo)" + body + " GROUP BY ?o HAVING (COUNT(*) >= 8) ORDER BY ?lo ?o LIMIT 1 OFFSET 1",
+    "SELECT DISTINCT (MIN(?o) AS ?lo)" + body + " GROUP BY ?s HAVING (MIN(?o) != MAX(?o)) ORDER BY ?lo LIMIT 1",
+    "SELECT ?o" + body + " GROUP BY ?o ?missing HAVING ((MIN(?missing) = MAX(?missing)) || (COUNT(*) > 8)) ORDER BY ?o",
+    "SELECT ?o" + body + " GROUP BY ?o HAVING (!(MIN(?missing))) ORDER BY ?o",
+    "SELECT (MIN(?o) AS ?lo)" + body + " HAVING (MIN(?o))",
+    "SELECT (MIN(?o) AS ?lo) WHERE { ?s <urn:eh:absent> ?o } HAVING (COUNT(*) = 0)",
+    "SELECT (MIN(?o) AS ?lo) WHERE { ?s <urn:eh:absent> ?o } GROUP BY ?o HAVING (COUNT(*) = 0)",
+    "SELECT (MIN(?o) AS ?lo)" + body + " HAVING (MIN(?missing) = MAX(?missing))",
+    "SELECT (MIN(?o) AS ?lo)" + body + " HAVING (COUNT(*) > 0) LIMIT 0"};
+  for (const auto& text : texts) {
+    SCOPED_TRACE(text);
+    RdfYBModel::Instance().SetWorkerOptions({}); FirstBatchTypedOutput local;
+    ASSERT_EQ(YBCMdbExecuteSparqlWithResults(text.c_str(), local.Callbacks(), &local), 0);
+    RdfYBModel::Instance().SetWorkerOptions(options); FirstBatchTypedOutput remote;
+    ASSERT_EQ(YBCMdbExecuteSparqlWithResults(text.c_str(), remote.Callbacks(), &remote), 0);
+    ASSERT_TRUE(remote.ended); ASSERT_EQ(remote.names, local.names); ASSERT_EQ(remote.rows, local.rows);
+    ASSERT_EQ(Field(YBCMdbGetLastQueryProfile(), "global_extrema_operators"), 1);
+    ASSERT_EQ(Field(YBCMdbGetLastQueryProfile(), "global_count_having_operators"), 1);
+  }
+  auto invalid_options = options; invalid_options.binary = "/bin/false";
+  const auto invalid = Query("SELECT ?o (MIN(?s) AS ?lo)" + body + " GROUP BY ?o HAVING (?lo = ?lo)", invalid_options);
+  ASSERT_NE(invalid.status, 0); ASSERT_TRUE(invalid.ordered.empty());
+  ASSERT_EQ(Field(invalid.profile, "remote_fragments"), 0);
+}
+TEST_F(MdbExtremaHavingTest, NumericTypedWinnersAndBooleanRules) {
+  const std::string xsd = "http://www.w3.org/2001/XMLSchema#";
+  RegisterRdfIdentity(9004, RdfIdentity(TripleTermType::URI, Iri(9004)));
+  const std::vector<std::pair<std::string, std::string>> terms = {{"10","integer"},{"2.5","decimal"},{"-4","integer"},{"5.75","double"}};
+  for (size_t i = 0; i < terms.size(); ++i) {
+    RegisterRdfIdentity(600+i, RdfIdentity(TripleTermType::LITERAL, terms[i].first, xsd+terms[i].second));
+    for (size_t j=0;j<16;++j) { const auto id=10000+i*16+j;
+      RegisterRdfIdentity(id, RdfIdentity(TripleTermType::URI, Iri(id)));
+      ASSERT_OK(RdfYBModel::Instance().WriteTripleToDocDB(id, 9004, 600+i)); }
+  }
+  ASSERT_OK(RdfYBModel::Instance().Flush()); auto options=workers_; options.coordinator_memory_bytes=30000;
+  for (const auto& predicate : std::vector<std::string>{
+      "((MIN(?v) < 0) && (MAX(?v) >= 10))", "(MIN(DISTINCT ?v) < MAX(DISTINCT ?v))",
+      "(MIN(?v))", "(!(MIN(?missing)))", "((MIN(?missing) = MIN(?missing)) || (COUNT(DISTINCT ?v) = 4))"}) {
+    const auto text="SELECT (MAX(?v) AS ?hi) (MIN(?v) AS ?lo) WHERE { ?s <urn:p6:9004> ?v } HAVING "+predicate;
+    SCOPED_TRACE(text); RdfYBModel::Instance().SetWorkerOptions({}); FirstBatchTypedOutput local;
+    ASSERT_EQ(YBCMdbExecuteSparqlWithResults(text.c_str(),local.Callbacks(),&local),0);
+    RdfYBModel::Instance().SetWorkerOptions(options); FirstBatchTypedOutput remote;
+    ASSERT_EQ(YBCMdbExecuteSparqlWithResults(text.c_str(),remote.Callbacks(),&remote),0);
+    ASSERT_TRUE(remote.ended); ASSERT_EQ(remote.names,local.names); ASSERT_EQ(remote.rows,local.rows);
+    ASSERT_EQ(Field(YBCMdbGetLastQueryProfile(),"global_extrema_operators"),1);
+  }
+}
+TEST_F(MdbExtremaHavingTest, JointBudgetAndUnsupportedAggregates) {
+  Seed(64); const auto text="SELECT ?o (MIN(?s) AS ?lo)"+body+" GROUP BY ?o HAVING (MIN(?s) <= MAX(?s)) ORDER BY ?lo ?o";
+  const auto normal=Query(text,workers_); ASSERT_EQ(normal.status,0);
+  auto options=workers_; options.coordinator_memory_bytes=Field(normal.profile,"global_reserved_bytes");
+  const auto exact=Query(text,options); ASSERT_EQ(exact.status,0); ASSERT_EQ(exact.ordered,normal.ordered);
+  --options.coordinator_memory_bytes; const auto failed=Query(text,options); ASSERT_NE(failed.status,0); ASSERT_TRUE(failed.ordered.empty());
+  options.coordinator_memory_bytes=10000;
+  const auto many=Query("SELECT ?s"+body+" GROUP BY ?s HAVING (MIN(?o) != MAX(?o))",options);
+  ASSERT_NE(many.status,0); ASSERT_TRUE(many.ordered.empty()); ASSERT_EQ(Field(many.profile,"global_extrema_operators"),1);
+  for (const auto& query : std::vector<std::string>{
+      "SELECT (MIN(?o) AS ?lo)"+body+" HAVING (SUM(?s) > 0)",
+      "SELECT (MIN(?o) AS ?lo)"+body+" HAVING (COUNT(DISTINCT *) > 0)",
+      "SELECT ((COUNT(*)+1) AS ?n)"+body+" HAVING (MIN(?o) != MAX(?o))"}) {
+    const auto small=Query(query,options); ASSERT_NE(small.status,0); ASSERT_TRUE(small.ordered.empty());
+    ASSERT_EQ(Field(small.profile,"global_extrema_operators"),0); ASSERT_EQ(Query(query,workers_).status,0);
+  }
+  ASSERT_EQ(Query(text,workers_).status,0);
+}
+TEST_F(MdbExtremaHavingTest, FilteredOrZeroOutputChecksLateFailure) {
+  Seed(128); auto options=workers_; options.coordinator_memory_bytes=20000;
+  const auto wrapper=GetTestPath("extrema-having-late-error");
+  { std::ofstream file(wrapper); file<<"#!/bin/sh\n'"<<workers_.binary<<"' \"$@\"\nexit 23\n"; }
+  std::filesystem::permissions(wrapper,std::filesystem::perms::owner_all); auto broken=options; broken.binary=wrapper;
+  for (const auto& suffix : {std::string(" HAVING (MIN(?o) = MAX(?o))"),std::string(" HAVING (MIN(?o) != MAX(?o)) LIMIT 0")}) {
+    const auto result=Query("SELECT (MIN(?o) AS ?lo)"+body+suffix,broken);
+    ASSERT_NE(result.status,0); ASSERT_TRUE(result.ordered.empty()); ASSERT_GT(Field(result.profile,"global_input_rows"),2);
+  }
+  const auto text="SELECT (MIN(?o) AS ?lo)"+body+" HAVING (MIN(?o) != MAX(?o))";
+  for (bool expire : {false,true}) { struct State { bool expire; size_t cells=0; } state{expire};
+    auto sink=[](const char*,const char*,void* arg){auto& state=*static_cast<State*>(arg);++state.cells;auto* view=DocDBReadContextScope::Current();if(state.expire)view->deadline=CoarseMonoClock::Now();else view->cancelled=true;};
+    RdfYBModel::Instance().SetWorkerOptions(options); ASSERT_NE(YBCMdbExecuteSparql(text.c_str(),sink,&state),0); ASSERT_EQ(state.cells,1);
+  }
+  const auto fresh=Query(text,options); ASSERT_EQ(fresh.status,0); ASSERT_EQ(fresh.ordered,(std::vector<std::string>{Iri(1001)}));
+}
+TEST_F(MdbExtremaHavingTest, RetentionFollowsGroupsWithHiddenExtrema) {
+  uint64_t previous=0;
+  for (size_t count : {32,128,512}) { Seed(count); auto options=workers_; options.coordinator_memory_bytes=20000;
+    const auto text="SELECT (COUNT(*) AS ?n)"+body+" HAVING (MIN(?o) != MAX(?o))";
+    const auto result=Query(text,options); ASSERT_EQ(result.status,0); ASSERT_EQ(result.ordered,(std::vector<std::string>{std::to_string(2*count)}));
+    ASSERT_EQ(Field(result.profile,"global_input_rows"),2*count); ASSERT_EQ(Field(result.profile,"global_count_groups"),1);
+    ASSERT_EQ(Field(result.profile,"global_extrema_slots"),2); ASSERT_EQ(Field(result.profile,"global_count_having_hidden_counts"),2);
+    const auto bytes=Field(result.profile,"global_reserved_bytes"); if(previous)ASSERT_EQ(bytes,previous);previous=bytes;
+    LOG(INFO)<<"EXTREMA_HAVING_SAMPLE {\"input_rows\":"<<2*count<<",\"profile\":"<<result.profile<<"}";
+  }
+}
+TEST_F(MdbDictionaryRecoveryTest, ExtremaHavingCliHiddenSchemaAndFailureDiscard) {
+  const auto input=GetTestPath("extrema-having-cli.nt"); { std::ofstream file(input);
+    for(size_t i=0;i<128;++i)file<<"<urn:eh:s"<<i<<"> <urn:eh:p1> <urn:eh:k> .\n";
+    file<<"<urn:eh:k> <urn:eh:p2> <urn:eh:a> .\n<urn:eh:k> <urn:eh:p2> <urn:eh:z> .\n"; }
+  auto load=Base();load.insert(load.end(),{"import",input});ASSERT_OK(Subprocess::Call(load));
+  auto args=Base();args.insert(args.end(),{"--mdb_result_format=json","--mdb_query_profile=true","--mdb_worker_targets=local,local,local",
+      "--mdb_worker_binary="+workers_.binary,"--mdb_worker_batch_rows=128","--mdb_worker_page_rows=16","--mdb_global_memory_bytes=20000",
+      "query","SELECT (MIN(?o) AS ?lo) (COUNT(*) AS ?n) WHERE { ?s <urn:eh:p1> ?k . ?k <urn:eh:p2> ?o } HAVING (MIN(?o) != MAX(?o))"});
+  std::string output,error; ASSERT_OK(Subprocess::Call(args,&output,&error)); rapidjson::Document value;value.Parse(output.c_str());ASSERT_FALSE(value.HasParseError());
+  ASSERT_EQ(value["head"]["vars"].Size(),2);ASSERT_STREQ(value["head"]["vars"][0].GetString(),"lo");ASSERT_STREQ(value["head"]["vars"][1].GetString(),"n");
+  const auto rows=value["results"]["bindings"].GetArray();ASSERT_EQ(rows.Size(),1);ASSERT_EQ(rows[0].MemberCount(),2);
+  ASSERT_STREQ(rows[0]["lo"]["type"].GetString(),"uri");ASSERT_STREQ(rows[0]["lo"]["value"].GetString(),"urn:eh:a");
+  ASSERT_STREQ(rows[0]["n"]["value"].GetString(),"256");ASSERT_STREQ(rows[0]["n"]["datatype"].GetString(),"http://www.w3.org/2001/XMLSchema#integer");
+  ASSERT_EQ(Field(error,"global_input_rows"),256);ASSERT_EQ(Field(error,"global_count_having_hidden_counts"),2);
   for(auto& arg:args)if(arg.find("--mdb_worker_binary=")==0)arg="--mdb_worker_binary=/bin/false";
   output.clear();error.clear();ASSERT_NOK(Subprocess::Call(args,&output,&error));ASSERT_TRUE(output.empty());
 }

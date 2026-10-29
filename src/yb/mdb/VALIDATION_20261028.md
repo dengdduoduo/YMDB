@@ -450,3 +450,39 @@ tablets per index; CAPI page1/batch2, CLI page16/batch128. Logical reservations
 exclude shared dictionaries/client/RPC/transport buffers, not RSS or measured
 latency. No new Debug/ASan, physical multi-host or SOTA evidence. Historical
 allocator root cause and remote cleanup limitations remain unresolved.
+
+
+## Incremental extrema in HAVING (2026-10-29)
+
+The existing bounded HAVING predicate grammar now rewrites direct variable
+MIN/MAX leaves to private grouped slots, alongside supported COUNT variants.
+Selected extrema can also use grouped state with COUNT-only HAVING. Both use
+the same aggregate binding and final rewrite; no new predicate or literal
+grammar is enabled. Typed winners, missing/empty groups, original HAVING RDF
+boolean evaluation, alias scope and final ORDER/DISTINCT/projection/Slice remain.
+Planning does not register private variables. Complete input/dictionary/child
+success and worker zero exit are required before finalization, including filtered
+or LIMIT 0 output. Private extrema are charged with all other grouped state.
+
+SUM/AVG, computed SELECT and full-tuple COUNT DISTINCT retain existing paths.
+The legacy global_count_having_hidden_counts metric counts all private aggregate
+slots on this shared carrier; global_extrema_slots includes selected and hidden
+extrema. There is no worker-local aggregation or wire/storage/default change.
+
+Release: 17 exact tests (7 new, 10 compatibility), one yb_build.sh call per case.
+The original 512-input query exhausted 20,000 bytes after four rows (18,688
+reserved); workers/Hash/Broadcast now return the complete expected result.
+Hidden-extrema growth 64/256/1,024 inputs holds one group/two hidden extrema and
+7,056 peak logical reserved bytes. Tests cover typed numeric winners,
+boolean/null/empty semantics, alias scope, final modifiers, exact/one-byte-short
+budgets, high group counts, unsupported paths, late failure/cancel/timeout and
+recovery. Fresh-import CLI verifies public schema/types and failed output discard.
+The former direct-extrema HAVING exclusion uses SUM HAVING to preserve its
+full-input-budget purpose. Equal comparison keys still select first arrival.
+
+One WSL host/two logical CPUs, three in-process tservers/RF3, four tablets/index;
+CAPI page1/batch2, CLI page16/batch128. Logical reservation excludes dictionaries,
+clients and transport; no RSS/latency, physical multi-host, SOTA or new ASan claim.
+Item 11 remains incomplete: external/unbounded operations, SUM/AVG and actual
+worker-to-worker consumers are separate work. Existing allocator/cleanup limits
+and paused persistent pools remain.
