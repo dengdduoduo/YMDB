@@ -547,6 +547,10 @@ int ExecuteSparql(
         const auto initialized = count->Initialize(worker_options.coordinator_memory_bytes);
         if (!initialized.ok()) { LOG(WARNING) << initialized; return 1; }
         ++read_context->stats.global_count_operators;
+        if (physical->count->has_distinct) {
+          ++read_context->stats.global_count_distinct_operators;
+          read_context->stats.global_count_distinct_sets = physical->count->distinct_columns.size();
+        }
         if (physical->count->having) {
           ++read_context->stats.global_count_having_operators;
           read_context->stats.global_count_having_hidden_counts = physical->count->having_variables.size();
@@ -595,6 +599,7 @@ int ExecuteSparql(
                 RETURN_NOT_OK(count->Add(candidate, worker_options.coordinator_memory_bytes));
                 reserved = count->reserved_bytes();
                 read_context->stats.global_count_groups = count->size();
+                read_context->stats.global_count_distinct_entries = count->distinct_entries();
               }
               if (distinct) {
                 RETURN_NOT_OK(distinct->Add(std::move(candidate), worker_options.coordinator_memory_bytes));

@@ -499,7 +499,7 @@ Result<FragmentPlan> FragmentPlan::Build(
         2 * sizeof(::ObjectId) * (physical.projection_size() + spec.key_columns.size());
     plan.distinct = std::move(spec);
   }
-  // Computed SELECT extensions and distinct/value aggregates retain the old path.
+  // Computed SELECT extensions, full-tuple DISTINCT and value aggregates retain the old path.
   if (aggregate) {
     GlobalCountSpec spec;
     spec.grouped = grouped;
@@ -523,33 +523,39 @@ Result<FragmentPlan> FragmentPlan::Build(
       spec.group_variables.push_back(var.id);
       spec.group_columns.push_back(column(var));
     }
+    std::vector<bool> distinct_counts;
     for (size_t i = 0; i < select->vars_exprs.size(); ++i) {
       const auto* expr = select->vars_exprs[i].get();
       if (!expr) continue;
       int32_t arg = -1;
+      bool distinct = false;
       if (auto* all = dynamic_cast<const SPARQL::ExprAggCountAll*>(expr)) {
         if (all->distinct) { eligible = false; break; }
         arg = -2;
       } else if (auto* count = dynamic_cast<const SPARQL::ExprAggCount*>(expr)) {
         const auto* var = dynamic_cast<const SPARQL::ExprVar*>(count->expr.get());
-        if (count->distinct || !var) { eligible = false; break; }
+        if (!var) { eligible = false; break; }
+        distinct = count->distinct;
         arg = column(var->var);
       } else { eligible = false; break; }
       spec.count_variables.push_back(select->vars[i].id);
       spec.count_columns.push_back(arg);
+      distinct_counts.push_back(distinct);
     }
     if (eligible && having) {
       for (const auto& predicate : having->exprs) {
         auto rewritten = RewriteCountPredicate(*predicate, [&](const SPARQL::Expr& expr)
             -> std::unique_ptr<SPARQL::Expr> {
           int32_t arg;
+          bool distinct = false;
           if (auto* all = dynamic_cast<const SPARQL::ExprAggCountAll*>(&expr)) {
             if (all->distinct) return nullptr;
             arg = -2;
           } else {
             const auto& count = static_cast<const SPARQL::ExprAggCount&>(expr);
             const auto* var = dynamic_cast<const SPARQL::ExprVar*>(count.expr.get());
-            if (count.distinct || !var) return nullptr;
+            if (!var) return nullptr;
+            distinct = count.distinct;
             arg = column(var->var);
           }
           // Reserve identities without changing the query context or parser tree.
@@ -557,16 +563,34 @@ Result<FragmentPlan> FragmentPlan::Build(
           spec.having_variables.push_back(var);
           spec.count_variables.push_back(var);
           spec.count_columns.push_back(arg);
+          distinct_counts.push_back(distinct);
           return std::make_unique<SPARQL::ExprVar>(VarId(var));
         });
         if (!rewritten) { eligible = false; break; }
       }
     }
+    // Only identical bound arguments within one group share a typed identity set.
+    // Missing DISTINCT arguments remain zero without allocating an empty set.
+    for (size_t i = 0; i < distinct_counts.size(); ++i) {
+      spec.has_distinct = spec.has_distinct || distinct_counts[i];
+      int32_t slot = -1;
+      if (distinct_counts[i]) {
+        slot = -2;
+        const auto arg = spec.count_columns[i];
+        if (arg >= 0) {
+          auto found = std::find(spec.distinct_columns.begin(), spec.distinct_columns.end(), arg);
+          slot = found - spec.distinct_columns.begin();
+          if (found == spec.distinct_columns.end()) spec.distinct_columns.push_back(arg);
+        }
+      }
+      spec.count_set_slots.push_back(slot);
+    }
     // Map keys/counters, incoming key and final Values/order/distinct storage.
     spec.row_reservation = plan.global_row_reservation + 256 +
         4 * sizeof(std::vector<::ObjectId>) +
         2 * sizeof(::ObjectId) * (physical.projection_size() +
-            spec.group_variables.size() + spec.count_variables.size());
+            spec.group_variables.size() + spec.count_variables.size()) +
+        128 * spec.distinct_columns.size();
     if (eligible && !spec.count_variables.empty()) plan.count = std::move(spec);
   }
   if (options.exchange != ExchangeMode::None) RETURN_NOT_OK(ValidateExchange(physical, options));

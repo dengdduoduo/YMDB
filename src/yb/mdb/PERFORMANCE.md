@@ -442,3 +442,54 @@ It was corrected to preserve OpHaving over the finalized Values, thereby using
 the original HAVING RDF conversion. The first run (one pass, one failure) is
 preserved separately and is not included in the final 19 passes. Runtime code
 changed for this correction, so all 19 cases were rerun on the corrected binary.
+
+
+## Bounded variable DISTINCT counts (2026-10-29)
+
+The incremental count path now also accepts direct COUNT(DISTINCT variable) in
+SELECT and the existing restricted HAVING predicates. Each group owns a typed
+ObjectId set per distinct bound argument column. Repeated counts of the same
+argument, including private HAVING counters, share that set within the group.
+Different groups and different argument columns never share sets. Unbound
+arguments return zero without allocating a set; null values are not inserted.
+Identity matches AggCountDistinct rather than RDF numeric value equivalence.
+Ordinary counts still count the complete multiset alongside the distinct sets.
+
+COUNT(DISTINCT *) remains on its original full-solution-tuple path, including
+queries that mix it with variable DISTINCT counts. Computed SELECT expressions,
+numeric aggregates and unsupported envelopes retain previous behavior. The
+existing final HAVING node, alias scope, ORDER/DISTINCT/slice and complete child
+validation remain unchanged. No early success for LIMIT 0 or fully filtered output.
+
+Empty-set metadata adds 128 conservative bytes per configured argument set to
+each group slot. Every unique (group, argument, ObjectId) entry charges another
+128 bytes. Group/candidate slots and all entries share coordinator_memory_bytes;
+all new group and set nodes are admitted together before allocation. Duplicates
+do not add entries. Excess groups or unique values fail explicitly, without
+truncation, unbudgeted fallback or spill. Reservations are logical conservative
+estimates, excluding shared dictionaries, client/RPC and transport buffers, not
+RSS. High uniqueness may exhaust the same nominal budget earlier due to indexes.
+
+global_count_distinct_operators marks queries with variable DISTINCT counts
+(including only unbound arguments). global_count_distinct_sets is configured
+bound-argument sets per group; global_count_distinct_entries sums actual entries
+across all groups and argument sets. Repeated output/private counters do not
+multiply the entry charge. Empty implicit/explicit group semantics and signed
+count bounds are retained; output cardinalities use the existing integer packer.
+
+Release validation: 19 exact GTests (8 new, 11 related compatibility), one wrapper
+invocation per case. A pre-change 512-input query retaining two distinct terms
+failed after four rows and 9,472 reserved bytes under a 10,000-byte budget. It now
+succeeds through workers, Hash and Broadcast with repeated SELECT/HAVING counts
+sharing one set. Input growth 64/256/1,024 keeps two groups, one set per group,
+two entries total and 7,600 peak logical bytes. Exact/one-byte-short combined
+budgets, high uniqueness, independent arguments/groups, missing/empty inputs,
+typed lexical/datatype/language/blank scope identity, final modifiers, late errors,
+cancellation/recovery and fresh-import typed CLI/schema/failure discard pass.
+Full-tuple exclusion and relevant old all-input budget tests now explicitly use
+COUNT(DISTINCT *); their assertions are retained with the tuple reservation charge.
+
+One WSL host, two logical CPUs, three in-process tservers/RF3, four tablets per
+index; CAPI page1/batch2 and CLI page16/batch128. No new RSS, latency, physical
+multi-host, SOTA, Debug or ASan acceptance. Historical allocator root cause and
+remote cleanup limits remain. No storage/wire, default algorithm or CLI changes.

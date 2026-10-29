@@ -49,6 +49,11 @@ struct GlobalCountSpec {
   std::vector<uint32_t> count_variables;
   // -2 means COUNT(*), -1 is an unbound argument, otherwise an input column.
   std::vector<int32_t> count_columns;
+  bool has_distinct = false;
+  uint64_t distinct_entry_reservation = 128;
+  std::vector<int32_t> distinct_columns;
+  // -1 is ordinary COUNT, -2 is DISTINCT of an unbound argument; otherwise a set slot.
+  std::vector<int32_t> count_set_slots;
 };
 
 // Executable storage-ID graph, separate from the parser's process-local Op tree.

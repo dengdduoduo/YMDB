@@ -356,13 +356,13 @@ TEST_F(MdbFragmentIntegrationTest, GlobalOrderedCountGroupsAndSlice) {
 
 TEST_F(MdbFragmentIntegrationTest, GlobalOrderedGroupBudgetFailureAndRecovery) {
   SeedOrderedGroups();
-  const std::string query = "SELECT ?o (COUNT(DISTINCT ?s) AS ?n) WHERE { ?s <urn:p6:9000> ?k . "
+  const std::string query = "SELECT ?o (COUNT(DISTINCT *) AS ?n) WHERE { ?s <urn:p6:9000> ?k . "
       "?k <urn:p6:9001> ?o } GROUP BY ?o ORDER BY DESC(?n) ?o LIMIT 1";
   const auto success = Query(query, workers_);
   ASSERT_EQ(success.status, 0);
   ASSERT_EQ(success.ordered, (std::vector<std::string>{Iri(1001), "32"}));
-  // Four variables, two sort keys. LIMIT does not reduce Gather's admission.
-  ASSERT_EQ(Field(success.profile, "global_reserved_bytes"), 50 * (1024 + 128 * 4 + 16 * 2));
+  // Four variables, one tuple set and two sort keys. LIMIT does not reduce Gather's admission.
+  ASSERT_EQ(Field(success.profile, "global_reserved_bytes"), 50 * (1024 + 128 * 4 + 16 * 4 + 16 * 2));
   auto limited = workers_;
   limited.coordinator_memory_bytes = 50 * (1024 + 128 * 4);
   const auto exhausted = Query(query, limited);
@@ -4158,7 +4158,7 @@ TEST_F(MdbGlobalTopKTest, DistinctGroupingAndLargeWindowsKeepOriginalAdmission) 
   Seed(32);auto small=workers_;small.coordinator_memory_bytes=20000;
   for(const auto& query:std::vector<std::string>{
       "SELECT DISTINCT ?o"+body+" ORDER BY ?s LIMIT 1",
-      "SELECT ?o (COUNT(DISTINCT ?s) AS ?n)"+body+" GROUP BY ?o ORDER BY DESC(?n) LIMIT 1",
+      "SELECT ?o (COUNT(DISTINCT *) AS ?n)"+body+" GROUP BY ?o ORDER BY DESC(?n) LIMIT 1",
       "SELECT ?o"+body+" LIMIT 1"}) {
     const auto failed=Query(query,small);ASSERT_NE(failed.status,0);ASSERT_TRUE(failed.ordered.empty());
     ASSERT_EQ(Field(failed.profile,"global_topk_operators"),0);
@@ -4335,8 +4335,8 @@ TEST_F(MdbGlobalDistinctTest, ExactBudgetAndIneligibleEnvelopesKeepSafety) {
   options.coordinator_memory_bytes = 10000;
   for (const auto& query : std::vector<std::string>{
       "SELECT DISTINCT ?o" + body + " ORDER BY ?s",
-      "SELECT ?o (COUNT(DISTINCT ?s) AS ?n)" + body + " GROUP BY ?o ORDER BY ?o",
-      "SELECT DISTINCT (COUNT(DISTINCT ?s) AS ?n)" + body,
+      "SELECT ?o (COUNT(DISTINCT *) AS ?n)" + body + " GROUP BY ?o ORDER BY ?o",
+      "SELECT DISTINCT (COUNT(DISTINCT *) AS ?n)" + body,
       "SELECT ?o" + body + " ORDER BY ?o"}) {
     const auto failed = Query(query, options);
     ASSERT_NE(failed.status, 0); ASSERT_TRUE(failed.ordered.empty());
@@ -4557,9 +4557,8 @@ TEST_F(MdbGlobalCountTest, ExactBudgetManyGroupsAndIneligibleEnvelopes) {
   ASSERT_NE(many.status, 0); ASSERT_TRUE(many.ordered.empty());
   ASSERT_EQ(Field(many.profile, "global_count_operators"), 1);
   for (const auto& query : std::vector<std::string>{
-      "SELECT (COUNT(DISTINCT ?s) AS ?n)" + body,
       "SELECT (COUNT(DISTINCT *) AS ?n)" + body,
-      "SELECT ?o (COUNT(*) AS ?n)" + body + " GROUP BY ?o HAVING (COUNT(DISTINCT ?s) > 0)",
+      "SELECT ?o (COUNT(*) AS ?n)" + body + " GROUP BY ?o HAVING (COUNT(DISTINCT *) > 0)",
       "SELECT (COUNT(*) AS ?n) (SUM(?s) AS ?sum)" + body,
       "SELECT ((COUNT(*) + 1) AS ?n)" + body,
       "SELECT ?o" + body + " GROUP BY ?o"}) {
@@ -4778,7 +4777,6 @@ TEST_F(MdbCountHavingTest, ExactBudgetManyGroupsAndExcludedAggregates) {
   const auto many = Query("SELECT ?s (COUNT(*) AS ?n)" + body + " GROUP BY ?s HAVING (COUNT(*) > 0)", options);
   ASSERT_NE(many.status, 0); ASSERT_TRUE(many.ordered.empty()); ASSERT_EQ(Field(many.profile, "global_count_having_operators"), 1);
   for (const auto& query : std::vector<std::string>{
-      "SELECT ?o (COUNT(*) AS ?n)" + body + " GROUP BY ?o HAVING (COUNT(DISTINCT ?s) > 0)",
       "SELECT ?o (COUNT(*) AS ?n)" + body + " GROUP BY ?o HAVING (COUNT(DISTINCT *) > 0)",
       "SELECT ?o (COUNT(*) AS ?n)" + body + " GROUP BY ?o HAVING (SUM(?s) > 0)",
       "SELECT ?o ((COUNT(*) + 1) AS ?n)" + body + " GROUP BY ?o HAVING (COUNT(*) > 0)"}) {
@@ -4855,6 +4853,201 @@ TEST_F(MdbDictionaryRecoveryTest, CountHavingCliBudgetSchemaAndFailedOutputDisca
   ASSERT_EQ(Field(error, "global_input_rows"), 256); ASSERT_EQ(Field(error, "global_count_having_operators"), 1);
   ASSERT_EQ(Field(error, "global_count_having_hidden_counts"), 1); ASSERT_LE(Field(error, "global_reserved_bytes"), 10000);
   args.back() = "SELECT ?o WHERE { ?s <urn:having:p1> ?k . ?k <urn:having:p2> ?o } GROUP BY ?o HAVING (COUNT(*) >= 128) ORDER BY ?o";
+  output.clear(); error.clear(); ASSERT_OK(Subprocess::Call(args, &output, &error)); value.Parse(output.c_str()); ASSERT_FALSE(value.HasParseError());
+  ASSERT_EQ(value["head"]["vars"].Size(), 1); ASSERT_STREQ(value["head"]["vars"][0].GetString(), "o");
+  ASSERT_EQ(value["results"]["bindings"].Size(), 2);
+  for (const auto& row : value["results"]["bindings"].GetArray()) ASSERT_EQ(row.MemberCount(), 1);
+  for (auto& arg : args) if (arg.find("--mdb_worker_binary=") == 0) arg = "--mdb_worker_binary=/bin/false";
+  output.clear(); error.clear(); ASSERT_NOK(Subprocess::Call(args, &output, &error)); ASSERT_TRUE(output.empty());
+}
+}  // namespace
+}  // namespace yb::mdb
+
+
+namespace yb::mdb {
+namespace {
+class MdbDistinctCountTest : public MdbFragmentIntegrationTest {
+ protected:
+  const std::string body = " WHERE { ?s <urn:p6:9000> ?k . ?k <urn:p6:9001> ?o }";
+};
+
+TEST_F(MdbDistinctCountTest, SharedArgumentFitsSmallBudgetAcrossExchangeModes) {
+  Seed(256);
+  const auto query = "SELECT (COUNT(DISTINCT ?o) AS ?n) (COUNT(DISTINCT ?o) AS ?again) "
+      "(COUNT(*) AS ?total) (COUNT(DISTINCT ?missing) AS ?zero)" + body + " HAVING (COUNT(DISTINCT ?o) = 2)";
+  const auto local = Query(query, {}); ASSERT_EQ(local.status, 0);
+  ASSERT_EQ(local.ordered, (std::vector<std::string>{"2", "2", "512", "0"}));
+  const auto spill = GetTestPath("distinct-count-spill"); std::filesystem::create_directory(spill);
+  for (auto mode : {ExchangeMode::None, ExchangeMode::Hash, ExchangeMode::Broadcast}) {
+    auto options = workers_; options.coordinator_memory_bytes = 10000;
+    options.exchange = mode; options.exchange_spill_directory = spill;
+    const auto result = Query(query, options); ASSERT_EQ(result.status, 0) << result.profile;
+    ASSERT_EQ(result.ordered, local.ordered); ASSERT_EQ(Field(result.profile, "global_input_rows"), 512);
+    ASSERT_EQ(Field(result.profile, "global_count_distinct_operators"), 1);
+    ASSERT_EQ(Field(result.profile, "global_count_distinct_sets"), 1);
+    ASSERT_EQ(Field(result.profile, "global_count_distinct_entries"), 2);
+    ASSERT_EQ(Field(result.profile, "global_count_groups"), 1);
+    ASSERT_EQ(Field(result.profile, "global_count_having_operators"), 1);
+    ASSERT_EQ(Field(result.profile, "remote_coordinator_fallbacks"), 0);
+    ASSERT_LE(Field(result.profile, "global_reserved_bytes"), 10000);
+    ASSERT_TRUE(std::filesystem::is_empty(spill));
+  }
+}
+
+TEST_F(MdbDistinctCountTest, GroupsAndArgumentsHaveIndependentIdentity) {
+  Seed(32); auto options = workers_; options.coordinator_memory_bytes = 50000;
+  const auto grouped = "SELECT ?o (COUNT(DISTINCT ?k) AS ?n) (COUNT(DISTINCT ?k) AS ?again) "
+      "(COUNT(*) AS ?total)" + body + " GROUP BY ?o HAVING (COUNT(DISTINCT ?k) = 1) ORDER BY ?o";
+  const auto result = Query(grouped, options), local = Query(grouped, {}); ASSERT_EQ(result.status, 0); ASSERT_EQ(local.status, 0);
+  ASSERT_EQ(result.ordered, (std::vector<std::string>{Iri(1001), "1", "1", "32", Iri(1002), "1", "1", "32"}));
+  ASSERT_EQ(result.ordered, local.ordered); ASSERT_EQ(Field(result.profile, "global_count_groups"), 2);
+  ASSERT_EQ(Field(result.profile, "global_count_distinct_sets"), 1);
+  ASSERT_EQ(Field(result.profile, "global_count_distinct_entries"), 2);
+  const auto different = "SELECT (COUNT(DISTINCT ?o) AS ?a) (COUNT(DISTINCT ?s) AS ?b) "
+      "(COUNT(DISTINCT ?k) AS ?c)" + body;
+  const auto separate = Query(different, options), full = Query(different, {});
+  ASSERT_EQ(separate.status, 0); ASSERT_EQ(full.status, 0); ASSERT_EQ(separate.ordered, full.ordered);
+  ASSERT_EQ(separate.ordered, (std::vector<std::string>{"2", "32", "1"}));
+  ASSERT_EQ(Field(separate.profile, "global_count_distinct_sets"), 3);
+  ASSERT_EQ(Field(separate.profile, "global_count_distinct_entries"), 35);
+  const auto page = Query("SELECT DISTINCT (COUNT(DISTINCT ?k) AS ?n)" + body +
+      " GROUP BY ?o ORDER BY ?n LIMIT 1", options);
+  ASSERT_EQ(page.status, 0); ASSERT_EQ(page.ordered, (std::vector<std::string>{"1"}));
+}
+
+TEST_F(MdbDistinctCountTest, EmptyMissingAndHavingOnlyCounts) {
+  Seed(32); auto options = workers_; options.coordinator_memory_bytes = 15000;
+  const std::string empty = " WHERE { ?s <urn:dc:missing> ?o }";
+  for (const auto& item : std::vector<std::pair<std::string, std::vector<std::string>>>{
+      {"SELECT (COUNT(DISTINCT ?o) AS ?n)" + empty, {"0"}},
+      {"SELECT (COUNT(DISTINCT ?o) AS ?n)" + empty + " HAVING (COUNT(DISTINCT ?o) = 0)", {"0"}},
+      {"SELECT (COUNT(DISTINCT ?o) AS ?n)" + empty + " GROUP BY ?o", {}},
+      {"SELECT (COUNT(DISTINCT ?missing) AS ?n)" + body, {"0"}},
+      {"SELECT (COUNT(DISTINCT ?o) AS ?n)" + body + " GROUP BY ?missing", {"2"}},
+      {"SELECT ?o" + body + " GROUP BY ?o HAVING (COUNT(DISTINCT ?k)) ORDER BY ?o", {Iri(1001), Iri(1002)}},
+      {"SELECT (COUNT(DISTINCT ?o) AS ?n)" + body + " HAVING (COUNT(DISTINCT ?missing))", {}},
+      {"SELECT (COUNT(DISTINCT ?o) AS ?n)" + body + " LIMIT 0", {}}}) {
+    SCOPED_TRACE(item.first); const auto remote = Query(item.first, options), local = Query(item.first, {});
+    ASSERT_EQ(remote.status, 0); ASSERT_EQ(local.status, 0); ASSERT_EQ(remote.ordered, local.ordered); ASSERT_EQ(remote.ordered, item.second);
+    ASSERT_EQ(Field(remote.profile, "global_count_distinct_operators"), 1);
+  }
+}
+
+TEST_F(MdbDistinctCountTest, ExactCombinedBudgetAndHighCardinalityRejection) {
+  Seed(64); const auto query = "SELECT ?o (COUNT(DISTINCT ?k) AS ?n)" + body + " GROUP BY ?o ORDER BY ?o";
+  const auto normal = Query(query, workers_); ASSERT_EQ(normal.status, 0);
+  const auto bytes = Field(normal.profile, "global_reserved_bytes"); ASSERT_GT(bytes, 0);
+  auto options = workers_; options.coordinator_memory_bytes = bytes;
+  const auto exact = Query(query, options); ASSERT_EQ(exact.status, 0); ASSERT_EQ(exact.ordered, normal.ordered);
+  --options.coordinator_memory_bytes; const auto rejected = Query(query, options);
+  ASSERT_NE(rejected.status, 0); ASSERT_TRUE(rejected.ordered.empty());
+  options.coordinator_memory_bytes = 10000;
+  const auto many = Query("SELECT (COUNT(DISTINCT ?s) AS ?n)" + body, options);
+  ASSERT_NE(many.status, 0); ASSERT_TRUE(many.ordered.empty()); ASSERT_EQ(Field(many.profile, "global_count_distinct_operators"), 1);
+  for (const auto& excluded : std::vector<std::string>{
+      "SELECT (COUNT(DISTINCT *) AS ?n)" + body,
+      "SELECT (COUNT(DISTINCT ?o) AS ?n) (COUNT(DISTINCT *) AS ?all)" + body,
+      "SELECT (COUNT(DISTINCT ?o) AS ?n)" + body + " HAVING (COUNT(DISTINCT *) > 0)",
+      "SELECT ((COUNT(DISTINCT ?o) + 1) AS ?n)" + body,
+      "SELECT (COUNT(DISTINCT ?o) AS ?n) (SUM(?s) AS ?total)" + body}) {
+    const auto failed = Query(excluded, options); ASSERT_NE(failed.status, 0); ASSERT_TRUE(failed.ordered.empty());
+    ASSERT_EQ(Field(failed.profile, "global_count_distinct_operators"), 0);
+    const auto full = Query(excluded, workers_); ASSERT_EQ(full.status, 0);
+  }
+  const auto recovered = Query(query, options); ASSERT_EQ(recovered.status, 0); ASSERT_EQ(recovered.ordered, normal.ordered);
+}
+
+TEST_F(MdbDistinctCountTest, TypedTermsUseIdentityNotNumericEquality) {
+  const std::string xsd = "http://www.w3.org/2001/XMLSchema#";
+  const std::vector<SPARQL::RdfTermIdentity> terms = {
+      RdfIdentity(TripleTermType::URI, "urn:dc:a"), RdfIdentity(TripleTermType::URI, "urn:dc:z"),
+      RdfIdentity(TripleTermType::LITERAL, "2", xsd + "integer"), RdfIdentity(TripleTermType::LITERAL, "02", xsd + "integer"),
+      RdfIdentity(TripleTermType::LITERAL, "2", xsd + "decimal"),
+      RdfIdentity(TripleTermType::LITERAL, "same", "@en"), RdfIdentity(TripleTermType::LITERAL, "same", "@fr"),
+      RdfIdentity(TripleTermType::BLANK, "b", "", "dc-a"), RdfIdentity(TripleTermType::BLANK, "b", "", "dc-b")};
+  RegisterRdfIdentity(9003, RdfIdentity(TripleTermType::URI, Iri(9003)));
+  for (size_t i = 0; i < terms.size(); ++i) {
+    RegisterRdfIdentity(600 + i, terms[i]);
+    for (size_t j = 0; j < 8; ++j) {
+      const auto id = 10000 + i * 8 + j; RegisterRdfIdentity(id, RdfIdentity(TripleTermType::URI, Iri(id)));
+      ASSERT_OK(RdfYBModel::Instance().WriteTripleToDocDB(id, 9003, 600 + i));
+    }
+  }
+  ASSERT_OK(RdfYBModel::Instance().Flush());
+  const char* query = "SELECT (COUNT(DISTINCT ?o) AS ?n) (COUNT(?o) AS ?total) WHERE { ?s <urn:p6:9003> ?o }";
+  RdfYBModel::Instance().SetWorkerOptions(WorkerOptions{}); FirstBatchTypedOutput local;
+  ASSERT_EQ(YBCMdbExecuteSparqlWithResults(query, local.Callbacks(), &local), 0);
+  auto options = workers_; options.coordinator_memory_bytes = 10000;
+  RdfYBModel::Instance().SetWorkerOptions(options); FirstBatchTypedOutput remote;
+  ASSERT_EQ(YBCMdbExecuteSparqlWithResults(query, remote.Callbacks(), &remote), 0);
+  ASSERT_TRUE(remote.ended); ASSERT_EQ(remote.names, local.names); ASSERT_EQ(remote.rows, local.rows);
+  ASSERT_EQ(remote.rows.size(), 1); ASSERT_EQ(std::get<1>(remote.rows[0][0]), "9"); ASSERT_EQ(std::get<1>(remote.rows[0][1]), "72");
+  ASSERT_EQ(Field(YBCMdbGetLastQueryProfile(), "global_count_distinct_entries"), 9);
+}
+
+TEST_F(MdbDistinctCountTest, LateFailuresZeroOutputCancellationAndRecovery) {
+  Seed(128); auto options = workers_; options.coordinator_memory_bytes = 10000;
+  const auto wrapper = GetTestPath("dc-late-error");
+  { std::ofstream file(wrapper); file << "#!/bin/sh\n'" << workers_.binary << "' \"$@\"\nexit 23\n"; }
+  std::filesystem::permissions(wrapper, std::filesystem::perms::owner_all); auto broken = options; broken.binary = wrapper;
+  for (const auto& suffix : {std::string("HAVING (COUNT(DISTINCT ?o) = 0)"), std::string("LIMIT 0")}) {
+    const auto result = Query("SELECT (COUNT(DISTINCT ?o) AS ?n)" + body + " " + suffix, broken);
+    ASSERT_NE(result.status, 0); ASSERT_TRUE(result.ordered.empty()); ASSERT_GT(Field(result.profile, "global_input_rows"), 2);
+  }
+  const auto query = "SELECT (COUNT(DISTINCT ?o) AS ?n)" + body;
+  for (bool expire : {false, true}) {
+    struct State { bool expire; size_t cells = 0; } state{expire};
+    auto sink = [](const char*, const char*, void* arg) { auto& state = *static_cast<State*>(arg); ++state.cells;
+      auto* view = DocDBReadContextScope::Current(); if (state.expire) view->deadline = CoarseMonoClock::Now(); else view->cancelled = true; };
+    RdfYBModel::Instance().SetWorkerOptions(options); ASSERT_NE(YBCMdbExecuteSparql(query.c_str(), sink, &state), 0); ASSERT_EQ(state.cells, 1);
+  }
+  const auto fresh = Query(query, options); ASSERT_EQ(fresh.status, 0); ASSERT_EQ(fresh.ordered, (std::vector<std::string>{"2"}));
+}
+
+TEST_F(MdbDistinctCountTest, RetentionTracksUniqueEntriesAsInputGrows) {
+  uint64_t previous = 0;
+  for (size_t count : {32, 128, 512}) {
+    Seed(count); auto options = workers_; options.coordinator_memory_bytes = 10000;
+    const auto query = "SELECT ?o (COUNT(DISTINCT ?k) AS ?n)" + body + " GROUP BY ?o HAVING (COUNT(DISTINCT ?k) = 1) ORDER BY ?o";
+    const auto result = Query(query, options), local = Query(query, {}); ASSERT_EQ(result.status, 0); ASSERT_EQ(local.status, 0);
+    ASSERT_EQ(result.ordered, (std::vector<std::string>{Iri(1001), "1", Iri(1002), "1"})); ASSERT_EQ(result.ordered, local.ordered);
+    ASSERT_EQ(Field(result.profile, "global_input_rows"), 2 * count); ASSERT_EQ(Field(result.profile, "global_count_groups"), 2);
+    ASSERT_EQ(Field(result.profile, "global_count_distinct_sets"), 1); ASSERT_EQ(Field(result.profile, "global_count_distinct_entries"), 2);
+    const auto bytes = Field(result.profile, "global_reserved_bytes"); if (previous) ASSERT_EQ(bytes, previous); previous = bytes;
+    LOG(INFO) << "DISTINCT_COUNT_SAMPLE {\"input_rows\":" << 2 * count << ",\"correct\":true,\"profile\":" << result.profile << "}";
+  }
+}
+}  // namespace
+}  // namespace yb::mdb
+
+namespace yb::mdb {
+namespace {
+TEST_F(MdbDictionaryRecoveryTest, DistinctCountCliBudgetSchemaAndFailedOutputDiscard) {
+  const auto input = GetTestPath("dc-cli.nt");
+  {
+    std::ofstream file(input);
+    for (size_t i = 0; i < 128; ++i) file << "<urn:having:s" << i << "> <urn:having:p1> <urn:having:k> .\n";
+    file << "<urn:having:k> <urn:having:p2> <urn:having:o1> .\n<urn:having:k> <urn:having:p2> <urn:having:o2> .\n";
+  }
+  auto load = Base(); load.insert(load.end(), {"import", input}); ASSERT_OK(Subprocess::Call(load));
+  auto args = Base(); args.insert(args.end(), {"--mdb_result_format=json", "--mdb_query_profile=true",
+      "--mdb_worker_targets=local,local,local", "--mdb_worker_binary=" + workers_.binary,
+      "--mdb_worker_batch_rows=128", "--mdb_worker_page_rows=16", "--mdb_global_memory_bytes=10000",
+      "query", "SELECT ?o (COUNT(DISTINCT ?k) AS ?n) WHERE { ?s <urn:having:p1> ?k . ?k <urn:having:p2> ?o } GROUP BY ?o HAVING (COUNT(DISTINCT ?k) = 1) ORDER BY DESC(?n) ?o LIMIT 1 OFFSET 1"});
+  std::string output, error; const auto status = Subprocess::Call(args, &output, &error); ASSERT_TRUE(status.ok()) << status << error;
+  rapidjson::Document value; value.Parse(output.c_str()); ASSERT_FALSE(value.HasParseError());
+  ASSERT_EQ(value["head"]["vars"].Size(), 2); ASSERT_STREQ(value["head"]["vars"][0].GetString(), "o");
+  ASSERT_STREQ(value["head"]["vars"][1].GetString(), "n");
+  const auto rows = value["results"]["bindings"].GetArray(); ASSERT_EQ(rows.Size(), 1);
+  ASSERT_EQ(rows[0].MemberCount(), 2); ASSERT_STREQ(rows[0]["o"]["type"].GetString(), "uri");
+  ASSERT_STREQ(rows[0]["o"]["value"].GetString(), "urn:having:o2");
+  ASSERT_STREQ(rows[0]["n"]["value"].GetString(), "1"); ASSERT_STREQ(rows[0]["n"]["type"].GetString(), "literal");
+  ASSERT_STREQ(rows[0]["n"]["datatype"].GetString(), "http://www.w3.org/2001/XMLSchema#integer");
+  ASSERT_EQ(Field(error, "global_input_rows"), 256); ASSERT_EQ(Field(error, "global_count_having_operators"), 1);
+  ASSERT_EQ(Field(error, "global_count_distinct_sets"), 1);
+  ASSERT_EQ(Field(error, "global_count_distinct_entries"), 2);
+  ASSERT_EQ(Field(error, "global_count_having_hidden_counts"), 1); ASSERT_LE(Field(error, "global_reserved_bytes"), 10000);
+  args.back() = "SELECT ?o WHERE { ?s <urn:having:p1> ?k . ?k <urn:having:p2> ?o } GROUP BY ?o HAVING (COUNT(DISTINCT ?k) = 1) ORDER BY ?o";
   output.clear(); error.clear(); ASSERT_OK(Subprocess::Call(args, &output, &error)); value.Parse(output.c_str()); ASSERT_FALSE(value.HasParseError());
   ASSERT_EQ(value["head"]["vars"].Size(), 1); ASSERT_STREQ(value["head"]["vars"][0].GetString(), "o");
   ASSERT_EQ(value["results"]["bindings"].Size(), 2);
