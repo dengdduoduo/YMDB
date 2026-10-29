@@ -131,6 +131,9 @@ std::string BatchQueryStats::ToJson() const {
   MDB_STAT(global_count_groups);
   MDB_STAT(global_distinct_operators);
   MDB_STAT(global_distinct_retained_rows);
+  MDB_STAT(global_slice_operators);
+  MDB_STAT(global_slice_capacity);
+  MDB_STAT(global_slice_retained_rows);
   MDB_STAT(global_topk_operators);
   MDB_STAT(global_topk_capacity);
   MDB_STAT(global_topk_retained_rows);

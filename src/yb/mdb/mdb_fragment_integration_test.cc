@@ -4159,7 +4159,7 @@ TEST_F(MdbGlobalTopKTest, DistinctGroupingAndLargeWindowsKeepOriginalAdmission) 
   for(const auto& query:std::vector<std::string>{
       "SELECT DISTINCT ?o"+body+" ORDER BY ?s LIMIT 1",
       "SELECT ?o (COUNT(DISTINCT *) AS ?n)"+body+" GROUP BY ?o ORDER BY DESC(?n) LIMIT 1",
-      "SELECT ?o"+body+" LIMIT 1"}) {
+      "SELECT ?o"+body+" OFFSET 1"}) {
     const auto failed=Query(query,small);ASSERT_NE(failed.status,0);ASSERT_TRUE(failed.ordered.empty());
     ASSERT_EQ(Field(failed.profile,"global_topk_operators"),0);
     const auto full=Query(query,workers_);ASSERT_EQ(full.status,0);
@@ -5054,6 +5054,124 @@ TEST_F(MdbDictionaryRecoveryTest, DistinctCountCliBudgetSchemaAndFailedOutputDis
   for (const auto& row : value["results"]["bindings"].GetArray()) ASSERT_EQ(row.MemberCount(), 1);
   for (auto& arg : args) if (arg.find("--mdb_worker_binary=") == 0) arg = "--mdb_worker_binary=/bin/false";
   output.clear(); error.clear(); ASSERT_NOK(Subprocess::Call(args, &output, &error)); ASSERT_TRUE(output.empty());
+}
+}  // namespace
+}  // namespace yb::mdb
+
+
+namespace yb::mdb {
+namespace {
+class MdbPlainSliceTest : public MdbFragmentIntegrationTest {
+ protected:
+  const std::string body = " WHERE { ?s <urn:p6:9000> ?k . ?k <urn:p6:9001> ?o }";
+  void CheckRows(const Output& result, size_t subjects, size_t rows) {
+    ASSERT_EQ(result.status, 0) << result.profile; ASSERT_EQ(result.ordered.size(), 2 * rows);
+    std::set<std::pair<std::string, std::string>> seen;
+    std::set<std::string> allowed; for (size_t i = 101; i < 101 + subjects; ++i) allowed.insert(Iri(i));
+    for (size_t i = 0; i < result.ordered.size(); i += 2) {
+      ASSERT_TRUE(allowed.count(result.ordered[i]));
+      ASSERT_TRUE(result.ordered[i+1] == Iri(1001) || result.ordered[i+1] == Iri(1002));
+      ASSERT_TRUE(seen.emplace(result.ordered[i], result.ordered[i+1]).second);
+    }
+  }
+};
+TEST_F(MdbPlainSliceTest, SmallBudgetAcrossExchangeModes) {
+  Seed(256); const auto spill = GetTestPath("slice-spill"); std::filesystem::create_directory(spill);
+  for (auto mode : {ExchangeMode::None, ExchangeMode::Hash, ExchangeMode::Broadcast}) {
+    auto options = workers_; options.exchange = mode; options.exchange_spill_directory = spill;
+    options.coordinator_memory_bytes = 20000;
+    const auto result = Query("SELECT ?s ?o" + body + " LIMIT 5 OFFSET 7", options);
+    ASSERT_NO_FATALS(CheckRows(result, 256, 5));
+    ASSERT_EQ(Field(result.profile, "global_slice_operators"), 1);
+    ASSERT_EQ(Field(result.profile, "global_slice_capacity"), 12);
+    ASSERT_EQ(Field(result.profile, "global_slice_retained_rows"), 12);
+    ASSERT_EQ(Field(result.profile, "global_topk_operators"), 0);
+    ASSERT_EQ(Field(result.profile, "global_input_rows"), 512);
+    ASSERT_LE(Field(result.profile, "global_reserved_bytes"), 20000);
+    ASSERT_TRUE(std::filesystem::is_empty(spill));
+  }
+}
+TEST_F(MdbPlainSliceTest, SingleWorkerWindowMatchesCompleteBagAndKeepsDuplicates) {
+  Seed(32); auto options = workers_; options.targets = {"local"}; options.max_workers = 1;
+  const auto full = Query("SELECT ?s ?o" + body, options); ASSERT_EQ(full.status, 0);
+  options.coordinator_memory_bytes = 20000;
+  const auto page = Query("SELECT ?s ?o" + body + " LIMIT 5 OFFSET 7", options);
+  ASSERT_EQ(page.status, 0); ASSERT_EQ(page.ordered, (std::vector<std::string>(full.ordered.begin()+14, full.ordered.begin()+24)));
+  const auto duplicates = Query("SELECT ?k" + body + " LIMIT 6 OFFSET 3", options);
+  ASSERT_EQ(duplicates.status, 0); ASSERT_EQ(duplicates.ordered, std::vector<std::string>(6, Iri(1)));
+}
+TEST_F(MdbPlainSliceTest, ExactBudgetZeroOverflowAndUnboundedAdmission) {
+  Seed(32); const auto query = "SELECT ?s ?o" + body + " LIMIT 3 OFFSET 2";
+  const auto normal = Query(query, workers_); ASSERT_EQ(normal.status, 0);
+  auto options = workers_; options.coordinator_memory_bytes = Field(normal.profile, "global_reserved_bytes");
+  const auto exact = Query(query, options); ASSERT_NO_FATALS(CheckRows(exact, 32, 3));
+  --options.coordinator_memory_bytes; const auto short_budget = Query(query, options);
+  ASSERT_NE(short_budget.status, 0); ASSERT_TRUE(short_budget.ordered.empty());
+  options.coordinator_memory_bytes = 4096;
+  const auto zero = Query("SELECT ?s ?o" + body + " LIMIT 0 OFFSET 18446744073709551615", options);
+  ASSERT_EQ(zero.status, 0); ASSERT_TRUE(zero.ordered.empty()); ASSERT_EQ(Field(zero.profile, "global_input_rows"), 64);
+  ASSERT_EQ(Field(zero.profile, "global_slice_retained_rows"), 0);
+  for (const auto& suffix : {" OFFSET 1", " LIMIT 1000000"}) {
+    const auto failed = Query("SELECT ?s ?o" + body + suffix, options);
+    ASSERT_NE(failed.status, 0); ASSERT_TRUE(failed.ordered.empty()); ASSERT_EQ(Field(failed.profile, "global_slice_operators"), 0);
+  }
+  const auto overflow = Query("SELECT ?s ?o" + body + " LIMIT 2 OFFSET 18446744073709551615", workers_);
+  ASSERT_EQ(overflow.status, 0); ASSERT_TRUE(overflow.ordered.empty()); ASSERT_EQ(Field(overflow.profile, "global_slice_operators"), 0);
+  const auto empty = Query("SELECT ?s WHERE { ?s <urn:slice:missing> ?o } LIMIT 3", options);
+  ASSERT_EQ(empty.status, 0); ASSERT_TRUE(empty.ordered.empty());
+}
+TEST_F(MdbPlainSliceTest, LateErrorsAndZeroOutputStillRequireCompletion) {
+  Seed(128); auto options = workers_; options.coordinator_memory_bytes = 10000;
+  const auto wrapper = GetTestPath("slice-late-error");
+  { std::ofstream file(wrapper); file << "#!/bin/sh\n'" << workers_.binary << "' \"$@\"\nexit 23\n"; }
+  std::filesystem::permissions(wrapper, std::filesystem::perms::owner_all); auto broken = options; broken.binary = wrapper;
+  for (const auto& suffix : {" LIMIT 3", " LIMIT 0"}) {
+    const auto failed = Query("SELECT ?s ?o" + body + suffix, broken);
+    ASSERT_NE(failed.status, 0); ASSERT_TRUE(failed.ordered.empty()); ASSERT_GT(Field(failed.profile, "global_input_rows"), 3);
+  }
+  const auto query = "SELECT ?s ?o" + body + " LIMIT 3";
+  for (bool expire : {false, true}) {
+    struct State { bool expire; size_t cells = 0; } state{expire};
+    auto sink = [](const char*, const char*, void* arg) { auto& state=*static_cast<State*>(arg); ++state.cells;
+      auto* view=DocDBReadContextScope::Current(); if(state.expire)view->deadline=CoarseMonoClock::Now();else view->cancelled=true; };
+    RdfYBModel::Instance().SetWorkerOptions(options); ASSERT_NE(YBCMdbExecuteSparql(query.c_str(), sink, &state), 0); ASSERT_EQ(state.cells, 2);
+  }
+  const auto fresh = Query(query, options); ASSERT_NO_FATALS(CheckRows(fresh, 128, 3));
+}
+TEST_F(MdbPlainSliceTest, WindowRetentionAsInputGrows) {
+  uint64_t previous=0;
+  for(size_t count:{32,128,512}) {
+    Seed(count);auto options=workers_;options.coordinator_memory_bytes=20000;
+    const auto result=Query("SELECT ?s ?o"+body+" LIMIT 5 OFFSET 7",options);ASSERT_NO_FATALS(CheckRows(result,count,5));
+    ASSERT_EQ(Field(result.profile,"global_input_rows"),2*count);ASSERT_EQ(Field(result.profile,"global_slice_retained_rows"),12);
+    const auto bytes=Field(result.profile,"global_reserved_bytes");if(previous)ASSERT_EQ(bytes,previous);previous=bytes;
+    LOG(INFO)<<"SLICE_SAMPLE {\"input_rows\":"<<2*count<<",\"profile\":"<<result.profile<<"}";
+  }
+}
+}  // namespace
+}  // namespace yb::mdb
+
+
+namespace yb::mdb {
+namespace {
+TEST_F(MdbDictionaryRecoveryTest, PlainSliceCliTypedDuplicateRowsAndFailureDiscard) {
+  const auto input=GetTestPath("slice-cli.nt");
+  { std::ofstream file(input);for(size_t i=0;i<128;++i)file<<"<urn:slice:s"<<i<<"> <urn:slice:p1> <urn:slice:k> .\n";
+    file<<"<urn:slice:k> <urn:slice:p2> <urn:slice:o1> .\n<urn:slice:k> <urn:slice:p2> <urn:slice:o2> .\n"; }
+  auto load=Base();load.insert(load.end(),{"import",input});ASSERT_OK(Subprocess::Call(load));
+  auto args=Base();args.insert(args.end(),{"--mdb_result_format=json","--mdb_query_profile=true",
+      "--mdb_worker_targets=local,local,local","--mdb_worker_binary="+workers_.binary,
+      "--mdb_worker_batch_rows=128","--mdb_worker_page_rows=16","--mdb_global_memory_bytes=20000",
+      "query","SELECT ?k WHERE { ?s <urn:slice:p1> ?k . ?k <urn:slice:p2> ?o } LIMIT 6 OFFSET 3"});
+  std::string output,error;const auto status=Subprocess::Call(args,&output,&error);ASSERT_TRUE(status.ok())<<status<<error;
+  rapidjson::Document value;value.Parse(output.c_str());ASSERT_FALSE(value.HasParseError());
+  ASSERT_EQ(value["head"]["vars"].Size(),1);ASSERT_STREQ(value["head"]["vars"][0].GetString(),"k");
+  const auto rows=value["results"]["bindings"].GetArray();ASSERT_EQ(rows.Size(),6);
+  for(const auto& row:rows){ASSERT_EQ(row.MemberCount(),1);ASSERT_STREQ(row["k"]["type"].GetString(),"uri");ASSERT_STREQ(row["k"]["value"].GetString(),"urn:slice:k");}
+  ASSERT_EQ(Field(error,"global_slice_operators"),1);ASSERT_EQ(Field(error,"global_slice_capacity"),9);
+  ASSERT_EQ(Field(error,"global_slice_retained_rows"),9);ASSERT_EQ(Field(error,"global_input_rows"),256);
+  for(auto& arg:args)if(arg.find("--mdb_worker_binary=")==0)arg="--mdb_worker_binary=/bin/false";
+  output.clear();error.clear();ASSERT_NOK(Subprocess::Call(args,&output,&error));ASSERT_TRUE(output.empty());
 }
 }  // namespace
 }  // namespace yb::mdb

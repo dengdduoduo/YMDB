@@ -493,3 +493,42 @@ One WSL host, two logical CPUs, three in-process tservers/RF3, four tablets per
 index; CAPI page1/batch2 and CLI page16/batch128. No new RSS, latency, physical
 multi-host, SOTA, Debug or ASan acceptance. Historical allocator root cause and
 remote cleanup limits remain. No storage/wire, default algorithm or CLI changes.
+
+
+## Finite unordered windows (2026-10-29)
+
+Plain BGP SELECTs with finite LIMIT/OFFSET and no ORDER BY, DISTINCT, grouping,
+HAVING, aggregate or SELECT expression may now keep only the first K complete
+arrivals, where K=LIMIT+OFFSET (K=0 for LIMIT 0). The existing bounded candidate
+collector has an explicit empty-sort-key prefix path that preserves duplicates
+and arrival order, without heap operations. The original Slice still applies
+OFFSET once after all child completion checks. All subsequent dictionary rows,
+child results and worker zero exits are validated even when the prefix is full
+or K is zero; this change does not stop scans or network input early.
+
+The same conservative K+1-slot admission as ordered Top-K must fit the existing
+coordinator budget; overflowing/too-large windows and unbounded OFFSET retain
+the original all-input admission path. Existing DISTINCT/count/ordered paths
+remain separate. global_slice_operators/capacity/retained_rows mark this path;
+ordered Top-K metrics retain their previous meaning. There are no new flags,
+wire/storage changes, default join/exchange changes or worker-local limits.
+
+16 exact Release GTests passed (6 new, 10 related compatibility), each via the
+wrapper separately. A pre-change 512-input LIMIT5 OFFSET7 query failed under
+20,000 bytes; workers, Hash and Broadcast now return five valid complete rows.
+The test checks full row membership/multiplicity, not arbitrary unordered order.
+A max_workers=1 complete-input comparison checks the exact received window and
+one application of OFFSET. Duplicate projected rows remain duplicated. Empty,
+zero, overflow, exact/one-byte-short budgets, late worker exits, cancellation,
+recovery and a fresh-import typed CLI/failure-output-discard gate pass.
+Input 64/256/1,024 retains twelve bindings and 19,552 peak logical reserved
+bytes. This excludes shared dictionaries/client/transport buffers and is not RSS
+or a latency improvement. Unordered output and slices are not stable across
+worker schedules; this does not add an ordering guarantee.
+
+One WSL host, two logical CPUs, three in-process tservers/RF3, four tablets per
+index; CAPI page1/batch2, CLI page16/batch128. No new physical multi-host, SOTA,
+Debug or ASan acceptance. Historical allocator/remote cleanup limitations remain.
+Unbounded global sorts, numeric/external aggregation and worker-to-worker
+consumers remain outside this milestone. The old all-input exclusion case now
+uses unbounded OFFSET rather than finite LIMIT to retain its budget assertion.

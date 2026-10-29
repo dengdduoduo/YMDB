@@ -452,10 +452,10 @@ Result<FragmentPlan> FragmentPlan::Build(
   }
   for (auto var : physical.projection()) if (!bound.count(var))
     return STATUS(NotSupported, "Unbound projection remains at MDB coordinator");
-  // Only plain bound-variable ordering may prune before the original finalizer.
+  // Plain finite windows may retain a bounded prefix or ordered candidates.
   // DISTINCT/groups/expressions must still see the full multiset.
   const auto* top_order = dynamic_cast<const SPARQL::OpOrderBy*>(select->op.get());
-  if (top_order && !top_order->items.empty() && !select->distinct && !aggregate && !grouped &&
+  if (((top_order && !top_order->items.empty()) || !ordered) && !select->distinct && !aggregate && !grouped &&
       !having && select->limit != SPARQL::Op::DEFAULT_LIMIT &&
       std::none_of(select->vars_exprs.begin(), select->vars_exprs.end(),
                    [](const auto& expr) { return bool(expr); }) &&
@@ -466,14 +466,15 @@ Result<FragmentPlan> FragmentPlan::Build(
     // One additional slot admits an incoming candidate while the heap is full.
     spec.row_reservation = plan.global_row_reservation +
         2 * sizeof(::ObjectId) * physical.projection_size() + 2 * sizeof(std::vector<::ObjectId>);
-    for (size_t i = 0; i < top_order->items.size(); ++i) {
+    const size_t key_count = top_order ? top_order->items.size() : 0;
+    for (size_t i = 0; i < key_count; ++i) {
       const auto var = std::get<VarId>(top_order->items[i]).id;
       const auto column = std::find(physical.projection().begin(), physical.projection().end(), var);
       if (column == physical.projection().end()) break;
       spec.key_columns.push_back(static_cast<uint32_t>(column - physical.projection().begin()));
       spec.ascending.push_back(i < top_order->ascending_order.size() ? top_order->ascending_order[i] : true);
     }
-    if (spec.key_columns.size() == top_order->items.size() &&
+    if (spec.key_columns.size() == key_count &&
         spec.rows < options.coordinator_memory_bytes / spec.row_reservation)
       plan.topk = std::move(spec);
   }

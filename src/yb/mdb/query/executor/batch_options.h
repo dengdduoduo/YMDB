@@ -76,6 +76,9 @@ struct BatchQueryStats {
   uint64_t global_count_groups = 0;
   uint64_t global_distinct_operators = 0;
   uint64_t global_distinct_retained_rows = 0;
+  uint64_t global_slice_operators = 0;
+  uint64_t global_slice_capacity = 0;
+  uint64_t global_slice_retained_rows = 0;
   uint64_t global_topk_operators = 0;
   uint64_t global_topk_capacity = 0;
   uint64_t global_topk_retained_rows = 0;

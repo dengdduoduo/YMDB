@@ -533,8 +533,13 @@ int ExecuteSparql(
       std::optional<yb::mdb::GlobalTopK> topk;
       if (physical->topk) {
         topk.emplace(*physical->topk);
-        ++read_context->stats.global_topk_operators;
-        read_context->stats.global_topk_capacity = physical->topk->rows;
+        if (physical->topk->key_columns.empty()) {
+          ++read_context->stats.global_slice_operators;
+          read_context->stats.global_slice_capacity = physical->topk->rows;
+        } else {
+          ++read_context->stats.global_topk_operators;
+          read_context->stats.global_topk_capacity = physical->topk->rows;
+        }
       }
       std::optional<yb::mdb::GlobalDistinct> distinct;
       if (physical->distinct) {
@@ -608,7 +613,9 @@ int ExecuteSparql(
               }
               if (topk) {
                 topk->Add(std::move(candidate));
-                read_context->stats.global_topk_retained_rows = topk->size();
+                if (physical->topk->key_columns.empty())
+                  read_context->stats.global_slice_retained_rows = topk->size();
+                else read_context->stats.global_topk_retained_rows = topk->size();
               }
               ++read_context->stats.global_input_rows;
               read_context->stats.global_reserved_bytes = reserved;

@@ -19,6 +19,11 @@ class GlobalTopK {
 
   void Add(std::vector<::ObjectId> row) {
     if (!spec_.rows) return;
+    // Without ordering, preserve the first K arrivals, including duplicates.
+    if (spec_.key_columns.empty()) {
+      if (heap_.size() < spec_.rows) heap_.push_back(std::move(row));
+      return;
+    }
     auto before = [&](const auto& lhs, const auto& rhs) { return Before(lhs, rhs); };
     if (heap_.size() < spec_.rows) {
       heap_.push_back(std::move(row));
