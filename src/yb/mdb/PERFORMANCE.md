@@ -690,3 +690,30 @@ both orders and worker/Hash paths; local-write invalidation with immutable older
 statistics; and relevant strategy, snapshot, budget, aggregate, fallback and CLI
 regressions. The profile remains null for local/non-accepted worker plans. No
 new latency/RSS, physical multi-host or SOTA claim is made.
+
+
+## Bounded per-predicate join-key sketches (2026-10-29)
+
+The existing ANALYZE scan now maintains separate subject/object linear-counting
+8192-bit sketches for at most 32 predicates. Conservative admission is 4 KiB per
+entry (128 KiB maximum additional reserved metadata); no per-query scan is added.
+Tracking starts at the first row of an admitted predicate. Further predicates,
+missing entries or saturated sketches are unknown, never zero. Estimates are
+clamped to that predicate's historical row count. This is an approximate distinct
+estimate, not an exact set, frequency histogram or key-intersection estimate.
+
+The two-pattern advisory chooses the actual shared subject/object endpoint on
+each side and exposes historical_join_key_distinct_estimate plus historical
+rows-per-key. Each side can independently be null; the availability flag requires
+both estimates. These historical averages do not predict probe-cache hits, data
+skew, intersection, RPC count or total join output. ANALYZE provenance and
+freshness_verified=false/applied=false remain: there is no automatic ordering or
+exchange decision. Local writes still invalidate new-query statistics; pinned
+old contexts retain their immutable historical objects.
+
+Nine exact Release tests pass: two new sketch/advisory guards and seven relevant
+regressions. The real ANALYZE six-graph test verifies 24 complete typed query
+results and compares the per-predicate shared-key estimates to known cardinality
+within 10 percent (absolute tolerance at least one). Unit guards cover endpoint
+selection, duplicates, capacity, saturation and incomplete/missing sketches.
+No new speed/RSS, physical multi-host or SOTA claim is made.

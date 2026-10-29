@@ -1,5 +1,6 @@
 #pragma once
 
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstdint>
@@ -31,6 +32,21 @@ struct QueryStatistics {
   bool predicates_complete = true, degrees_complete = true;
   std::map<uint64_t, uint64_t> predicates, subject_degrees;
   static constexpr size_t kMaxKeys = 4096;
+  // Two fixed sketches per tracked predicate; conservative 4 KiB admission
+  // includes map metadata. Further predicates remain unavailable, never zero.
+  struct PredicateKeys { Distinct subjects, objects; };
+  static constexpr size_t kMaxJoinPredicates = 32;
+  static constexpr size_t kJoinPredicateReservation = 4096;
+  std::map<uint64_t, PredicateKeys> predicate_keys;
+  double PredicateDistinct(uint64_t predicate, bool subject) const {
+    const auto found = predicate_keys.find(predicate);
+    if (found == predicate_keys.end()) return -1;
+    const auto count = predicates.find(predicate);
+    if (count == predicates.end()) return -1;
+    const double estimate = (subject ? found->second.subjects : found->second.objects).Estimate();
+    return estimate < 0 ? -1 : std::min(estimate, static_cast<double>(count->second));
+  }
+
   void Add(uint64_t s, uint64_t p, uint64_t o) {
     ++triples; subjects.Add(s); objects.Add(o);
     auto add = [](auto* map, uint64_t key, bool* complete) {
@@ -41,6 +57,10 @@ struct QueryStatistics {
     };
     add(&predicates, p, &predicates_complete);
     add(&subject_degrees, s, &degrees_complete);
+    auto key = predicate_keys.find(p);
+    if (key == predicate_keys.end() && predicate_keys.size() < kMaxJoinPredicates)
+      key = predicate_keys.try_emplace(p).first;
+    if (key != predicate_keys.end()) { key->second.subjects.Add(s); key->second.objects.Add(o); }
   }
   std::string ToJson() const {
     std::ostringstream out;
@@ -73,6 +93,8 @@ struct QueryStatistics {
     out << "},\"heaviest_tracked_subject\":" << heavy_id
         << ",\"heaviest_tracked_degree\":" << heavy_degree
         << ",\"read_operations\":" << read_operations << ",\"payload_bytes\":" << payload_bytes
+        << ",\"predicate_key_sketches_tracked\":" << predicate_keys.size()
+        << ",\"predicate_key_reserved_bytes\":" << predicate_keys.size() * kJoinPredicateReservation
         << ",\"freshness\":\"invalidated_by_local_writes_only; reanalyze_after_external_writes\"}";
     return out.str();
   }

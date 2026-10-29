@@ -653,6 +653,13 @@ std::string FragmentPlan::DescribeJoinStatistics(
   eligible = eligible && shared == 1;
   const bool available = statistics && statistics->version != 0;
   const bool complete = available && statistics->predicates_complete;
+  std::array<double, 2> distinct{-1, -1};
+  if (eligible && complete) for (int side = 0; side < 2; ++side) {
+    const auto& triple = input.triples(side);
+    const bool subject_key = variables[1 - side].count(triple.terms(0).variable()) != 0;
+    distinct[side] = statistics->PredicateDistinct(triple.terms(1).constant(), subject_key);
+  }
+  const bool keys_available = distinct[0] >= 0 && distinct[1] >= 0;
   const char* reason = !eligible ? "outside_two_pattern_scope" : !available ?
       "missing_statistics" : !complete ? "incomplete_predicate_counts" :
       "statistics_not_bound_to_query_view";
@@ -664,7 +671,8 @@ std::string FragmentPlan::DescribeJoinStatistics(
       << "\",\"statistics_version\":" << (available ? statistics->version : 0)
       << ",\"collected_unix_ms\":" << (available ? statistics->collected_unix_ms : 0)
       << ",\"predicate_counts_complete\":" << (complete ? "true" : "false")
-      << ",\"freshness_verified\":false,\"join_key_statistics_available\":false"
+      << ",\"freshness_verified\":false,\"join_key_statistics_available\":"
+      << (keys_available ? "true" : "false")
       << ",\"applied\":false,\"recommendation\":\"keep_explicit_order_and_mode\""
       << ",\"reason\":\"" << reason << "\",\"historical_predicate_rows\":[";
   for (int side = 0; side < 2; ++side) {
@@ -672,6 +680,18 @@ std::string FragmentPlan::DescribeJoinStatistics(
     if (!eligible || !complete) { out << "null"; continue; }
     const auto found = statistics->predicates.find(input.triples(side).terms(1).constant());
     out << (found == statistics->predicates.end() ? 0 : found->second);
+  }
+  out << "],\"join_key_method\":\"per_predicate_linear_counting_8192_bits\""
+      << ",\"historical_join_key_distinct_estimate\":[";
+  for (int side = 0; side < 2; ++side) {
+    if (side) out << ',';
+    if (distinct[side] < 0) out << "null"; else out << distinct[side];
+  }
+  out << "],\"historical_rows_per_join_key_estimate\":[";
+  for (int side = 0; side < 2; ++side) {
+    if (side) out << ',';
+    if (distinct[side] <= 0) { out << "null"; continue; }
+    out << statistics->predicates.at(input.triples(side).terms(1).constant()) / distinct[side];
   }
   out << "]}";
   return out.str();
