@@ -5700,3 +5700,112 @@ TEST_F(MdbFragmentIntegrationTest, Stage12SameMarginalsDoNotPredictDisjointOrSke
   }
 }
 } }  // namespace yb::mdb
+
+
+namespace yb::mdb { namespace {
+class MdbOrderTrialTest : public MdbFragmentIntegrationTest {
+ protected:
+  const std::string body=" WHERE { ?s <urn:p6:9000> ?k . ?k <urn:p6:9001> ?o }";
+  FragmentPlan Physical() {FragmentPlan p;auto& f=p.physical;
+    for(int side=0;side<2;++side){auto* t=f.add_triples();t->add_terms()->set_variable(0);t->add_terms()->set_constant(9000+side);t->add_terms()->set_variable(side+1);}return p;}
+  void Compare(const std::string& text,WorkerOptions options){
+    auto& model=RdfYBModel::Instance();model.SetWorkerOptions({});FirstBatchTypedOutput expected;
+    ASSERT_EQ(YBCMdbExecuteSparqlWithResults(text.c_str(),expected.Callbacks(),&expected),0);
+    model.SetWorkerOptions(options);FirstBatchTypedOutput actual;
+    ASSERT_EQ(YBCMdbExecuteSparqlWithResults(text.c_str(),actual.Callbacks(),&actual),0);
+    ASSERT_TRUE(actual.ended);ASSERT_EQ(actual.names,expected.names);
+    using Row=decltype(actual.rows)::value_type;ASSERT_EQ(std::multiset<Row>(actual.rows.begin(),actual.rows.end()),std::multiset<Row>(expected.rows.begin(),expected.rows.end()));
+  }
+  void Benchmark(const std::string& shape,size_t n){
+    const size_t keys=shape=="unique"?n:shape=="shared"?1:16,fanout=shape=="unique"?1:shape=="shared"?2:16;
+    using Term=FirstBatchTypedOutput::Term;using Row=std::vector<Term>;std::multiset<Row> expected;
+    for(size_t i=0;i<n;++i){Write(100+i,9000,10000+i%keys);for(size_t j=0;j<fanout;++j)expected.insert(Row{Term{YBC_MDB_IRI,Iri(100+i),"",""},Term{YBC_MDB_IRI,Iri(200000+i%keys*fanout+j),"",""}});}
+    for(size_t k=0;k<keys;++k)for(size_t j=0;j<fanout;++j)Write(10000+k,9001,200000+k*fanout+j);ASSERT_OK(RdfYBModel::Instance().Flush());
+    for(int sample=-1;sample<3;++sample)for(int order=0;order<2;++order){const bool enabled=(order+sample+1)%2;
+      auto options=workers_;options.sample_join_order=enabled;options.page_rows=16;options.batch_rows=128;RdfYBModel::Instance().SetWorkerOptions(options);
+      FirstBatchTypedOutput actual;const auto start=WallMicros();ASSERT_EQ(YBCMdbExecuteSparqlWithResults(("SELECT ?s ?o"+body).c_str(),actual.Callbacks(),&actual),0);const auto elapsed=WallMicros()-start;
+      ASSERT_TRUE(actual.ended);ASSERT_EQ(actual.names,(std::vector<std::string>{"s","o"}));ASSERT_EQ(std::multiset<Row>(actual.rows.begin(),actual.rows.end()),expected);
+      const std::string profile=YBCMdbGetLastQueryProfile();
+      LOG(INFO)<<"ORDER_TRIAL_SAMPLE {\"shape\":\""<<shape<<"\",\"n\":"<<n<<",\"enabled\":"<<(enabled?"true":"false")<<",\"sample\":"<<sample<<",\"elapsed_us\":"<<elapsed<<",\"rows\":"<<actual.rows.size()<<",\"correct\":true,\"profile\":"<<profile<<"}";
+    }
+  }
+};
+TEST_F(MdbOrderTrialTest, TypedBagModifiersEmptyAndExplicitExchange) {
+  Seed(128);auto options=workers_;options.sample_join_order=true;options.page_rows=16;options.batch_rows=128;
+  for(const auto& text:std::vector<std::string>{"SELECT ?s ?o"+body,"SELECT ?o ?s WHERE { ?k <urn:p6:9001> ?o . ?s <urn:p6:9000> ?k }","SELECT DISTINCT ?o"+body+" ORDER BY DESC(?o) LIMIT 1 OFFSET 1","SELECT ?o (COUNT(*) AS ?n)"+body+" GROUP BY ?o HAVING (COUNT(*)=128) ORDER BY ?o","SELECT (MIN(?o) AS ?lo)"+body,"SELECT ?o WHERE { ?s <urn:p6:9000> ?k . ?k <urn:trial:absent> ?o }"})ASSERT_NO_FATALS(Compare(text,options));
+  Write(101,9003,4000);ASSERT_OK(RdfYBModel::Instance().Flush());
+  const std::string ss=" WHERE { ?s <urn:p6:9000> ?k . ?s <urn:p6:9003> ?o }";
+  for(const auto& text:std::vector<std::string>{"SELECT DISTINCT ?o"+ss+" ORDER BY ?o LIMIT 1", "SELECT ?o (COUNT(*) AS ?n)"+ss+" GROUP BY ?o HAVING (COUNT(*) > 0) ORDER BY ?o", "SELECT (MIN(?o) AS ?lo)"+ss})ASSERT_NO_FATALS(Compare(text,options));
+  const auto result=Query("SELECT ?s ?o"+body,options);ASSERT_EQ(result.status,0);rapidjson::Document d;d.Parse(result.profile.c_str());ASSERT_STREQ(d["sampled_join_order"]["status"].GetString(),"unsupported_join_orientation");ASSERT_EQ(d["sampled_join_order"]["read_operations"].GetUint64(),0);
+  const auto spill=GetTestPath("trial-explicit-spill");std::filesystem::create_directory(spill);
+  for(auto mode:{ExchangeMode::Hash,ExchangeMode::Broadcast}){options.exchange=mode;options.exchange_spill_directory=spill;ASSERT_NO_FATALS(Compare("SELECT ?s ?o"+body,options));d.Parse(YBCMdbGetLastQueryProfile());ASSERT_STREQ(d["sampled_join_order"]["status"].GetString(),"explicit_exchange_unchanged");ASSERT_TRUE(std::filesystem::is_empty(spill));}
+}
+TEST_F(MdbOrderTrialTest, BudgetUnsupportedAndInconclusiveRemainUnchanged) {
+  Seed(64);auto& model=RdfYBModel::Instance();auto context=model.NewQueryReadContext();ASSERT_OK(context);auto options=workers_;options.sample_join_order=true;
+  auto p=Physical();options.coordinator_memory_bytes=128*1024-1;ASSERT_OK(FragmentPlan::SampleJoinOrder(&p,model,**context,options));ASSERT_EQ(p.physical.triples(0).terms(1).constant(),9000);ASSERT_NE(p.sampled_join_order.find("insufficient_sample_budget"),std::string::npos);
+  options.coordinator_memory_bytes=128*1024;p=Physical();p.physical.mutable_triples(0)->mutable_terms(2)->set_variable(0);ASSERT_OK(FragmentPlan::SampleJoinOrder(&p,model,**context,options));ASSERT_NE(p.sampled_join_order.find("unsupported_shape"),std::string::npos);
+  for(size_t i=0;i<32;++i)Write(2000+i,9002,3000+i);ASSERT_OK(model.Flush());p=Physical();p.physical.mutable_triples(1)->mutable_terms(1)->set_constant(9002);
+  auto fresh=model.NewQueryReadContext();ASSERT_OK(fresh);ASSERT_OK(FragmentPlan::SampleJoinOrder(&p,model,**fresh,options));ASSERT_EQ(p.physical.triples(0).terms(1).constant(),9000);ASSERT_NE(p.sampled_join_order.find("kept_inconclusive"),std::string::npos);
+}
+TEST_F(MdbOrderTrialTest, SampleAndLaterReadKeepOldViewAfterCommit) {
+  Seed(8);Write(101,9003,4000);Write(102,9003,4001);ASSERT_OK(RdfYBModel::Instance().Flush());auto& model=RdfYBModel::Instance();auto options=workers_;options.sample_join_order=true;auto old=model.NewQueryReadContext();ASSERT_OK(old);auto p=Physical();p.physical.mutable_triples(1)->mutable_terms(1)->set_constant(9003);ASSERT_OK(FragmentPlan::SampleJoinOrder(&p,model,**old,options));
+  Write(103,9003,4002);ASSERT_OK(model.Flush());p=Physical();p.physical.mutable_triples(1)->mutable_terms(1)->set_constant(9003);ASSERT_OK(FragmentPlan::SampleJoinOrder(&p,model,**old,options));rapidjson::Document d;d.Parse(p.sampled_join_order.c_str());ASSERT_EQ(d["rows"][1].GetUint64(),2);
+  auto fresh=model.NewQueryReadContext();ASSERT_OK(fresh);p=Physical();p.physical.mutable_triples(1)->mutable_terms(1)->set_constant(9003);ASSERT_OK(FragmentPlan::SampleJoinOrder(&p,model,**fresh,options));d.Parse(p.sampled_join_order.c_str());ASSERT_EQ(d["rows"][1].GetUint64(),3);
+  const auto latest=Query("SELECT (COUNT(*) AS ?n) WHERE { ?s <urn:p6:9000> ?k . ?s <urn:p6:9003> ?o }",options);ASSERT_EQ(latest.status,0);ASSERT_EQ(latest.ordered,(std::vector<std::string>{"3"}));
+}
+TEST_F(MdbOrderTrialTest, CancellationDeadlineLateExitAndRecovery) {
+  Seed(32);Write(101,9003,4000);ASSERT_OK(RdfYBModel::Instance().Flush());
+  const std::string trial=" WHERE { ?s <urn:p6:9000> ?k . ?s <urn:p6:9003> ?o }";auto& model=RdfYBModel::Instance();auto options=workers_;options.sample_join_order=true;
+  for(bool expire:{false,true}){auto context=model.NewQueryReadContext();ASSERT_OK(context);if(expire)(*context)->deadline=CoarseMonoClock::Now();else(*context)->cancelled=true;auto p=Physical();ASSERT_NOK(FragmentPlan::SampleJoinOrder(&p,model,**context,options));}
+  const auto script=GetTestPath("trial-late-exit");{std::ofstream f(script);f<<"#!/bin/sh\n'"<<workers_.binary<<"' \"$@\"\nexit 23\n";}std::filesystem::permissions(script,std::filesystem::perms::owner_all);auto broken=options;broken.binary=script;
+  for(const auto& suffix:{std::string(""),std::string(" LIMIT 0")}){const auto bad=Query("SELECT (COUNT(*) AS ?n)"+trial+suffix,broken);ASSERT_NE(bad.status,0);ASSERT_TRUE(bad.ordered.empty());}
+  const auto fresh=Query("SELECT (COUNT(*) AS ?n)"+trial,options);ASSERT_EQ(fresh.status,0);ASSERT_EQ(fresh.ordered,(std::vector<std::string>{"1"}));
+}
+TEST_F(MdbOrderTrialTest, Unique128){Benchmark("unique",128);}
+TEST_F(MdbOrderTrialTest, Unique512){Benchmark("unique",512);}
+TEST_F(MdbOrderTrialTest, Shared128){Benchmark("shared",128);}
+TEST_F(MdbOrderTrialTest, Shared512){Benchmark("shared",512);}
+TEST_F(MdbOrderTrialTest, Fanout128){Benchmark("fanout",128);}
+TEST_F(MdbOrderTrialTest, Fanout512){Benchmark("fanout",512);}
+TEST_F(MdbDictionaryRecoveryTest, SampleOrderCliTypesAndFailedOutputDiscard) {
+  const auto input=GetTestPath("trial-cli.nt");{std::ofstream f(input);for(size_t i=0;i<64;++i)f<<"<urn:trial:s"<<i<<"> <urn:trial:p1> <urn:trial:k> .\n";f<<"<urn:trial:s0> <urn:trial:p2> <urn:trial:o> .\n";}
+  auto load=Base();load.insert(load.end(),{"import",input});ASSERT_OK(Subprocess::Call(load));auto args=Base();args.insert(args.end(),{"--mdb_sample_join_order=true","--mdb_result_format=json","--mdb_query_profile=true","--mdb_worker_targets=local,local,local","--mdb_worker_binary="+workers_.binary,"query","SELECT (COUNT(*) AS ?n) WHERE { ?s <urn:trial:p1> ?k . ?s <urn:trial:p2> ?o }"});
+  std::string out,error;ASSERT_OK(Subprocess::Call(args,&out,&error));rapidjson::Document d;d.Parse(out.c_str());ASSERT_FALSE(d.HasParseError());ASSERT_STREQ(d["results"]["bindings"][0]["n"]["value"].GetString(),"1");ASSERT_STREQ(d["results"]["bindings"][0]["n"]["datatype"].GetString(),"http://www.w3.org/2001/XMLSchema#integer");ASSERT_NE(error.find("swapped_complete_smaller_right"),std::string::npos);
+  for(auto& arg:args)if(arg.find("--mdb_worker_binary=")==0)arg="--mdb_worker_binary=/bin/false";out.clear();error.clear();ASSERT_NOK(Subprocess::Call(args,&out,&error));ASSERT_TRUE(out.empty());
+}
+} }  // namespace yb::mdb
+
+
+namespace yb::mdb { namespace {
+TEST_F(MdbOrderTrialTest, SelectiveSharedSubject512) {
+  Seed(512);Write(101,9003,4000);Write(102,9003,4001);ASSERT_OK(RdfYBModel::Instance().Flush());
+  const std::string text="SELECT ?s ?o WHERE { ?s <urn:p6:9000> ?k . ?s <urn:p6:9003> ?o }";
+  using Term=FirstBatchTypedOutput::Term;using Row=std::vector<Term>;
+  const std::multiset<Row> expected={Row{Term{YBC_MDB_IRI,Iri(101),"",""},Term{YBC_MDB_IRI,Iri(4000),"",""}},Row{Term{YBC_MDB_IRI,Iri(102),"",""},Term{YBC_MDB_IRI,Iri(4001),"",""}}};
+  for(int sample=-1;sample<5;++sample)for(int order=0;order<2;++order){const bool enabled=(sample+1+order)%2;
+    auto options=workers_;options.sample_join_order=enabled;options.page_rows=16;options.batch_rows=128;RdfYBModel::Instance().SetWorkerOptions(options);
+    FirstBatchTypedOutput actual;const auto started=WallMicros();ASSERT_EQ(YBCMdbExecuteSparqlWithResults(text.c_str(),actual.Callbacks(),&actual),0);const auto elapsed=WallMicros()-started;
+    ASSERT_TRUE(actual.ended);ASSERT_EQ(actual.names,(std::vector<std::string>{"s","o"}));ASSERT_EQ(std::multiset<Row>(actual.rows.begin(),actual.rows.end()),expected);
+    rapidjson::Document p;p.Parse(YBCMdbGetLastQueryProfile());ASSERT_FALSE(p.HasParseError());
+    if(enabled){ASSERT_STREQ(p["sampled_join_order"]["status"].GetString(),"swapped_complete_smaller_right");ASSERT_LE(p["sampled_join_order"]["read_operations"].GetUint64(),2);ASSERT_LT(p["remote_read_operations"].GetUint64(),32);}
+    else ASSERT_GT(p["remote_read_operations"].GetUint64(),500);
+    LOG(INFO)<<"ORDER_TRIAL_SAMPLE {\"shape\":\"selective_subject\",\"n\":512,\"enabled\":"<<(enabled?"true":"false")<<",\"sample\":"<<sample<<",\"elapsed_us\":"<<elapsed<<",\"rows\":2,\"correct\":true,\"profile\":"<<YBCMdbGetLastQueryProfile()<<"}";
+  }
+}
+} }  // namespace yb::mdb
+
+
+namespace yb::mdb { namespace {
+TEST_F(MdbWorkerProbeTest, SampleOrderThenCommitAndGatherKeepsIdenticalReadView) {
+  Seed(8);Write(101,9003,4000);ASSERT_OK(RdfYBModel::Instance().Flush());auto& model=RdfYBModel::Instance();auto options=workers_;options.sample_join_order=true;
+  auto plan=Plan({{-1,9000,-2},{-1,9003,-3}},3,{0,2},16,128);ASSERT_OK(plan);
+  auto old=model.NewQueryReadContext();ASSERT_OK(old);
+  ASSERT_OK(FragmentPlan::SampleJoinOrder(&*plan,model,**old,options));ASSERT_NE(plan->sampled_join_order.find("swapped_complete"),std::string::npos);
+  Write(102,9003,4001);ASSERT_OK(model.Flush());
+  Rows expected{{101,4000}};
+  Rows actual;uint64_t reads=0;ASSERT_OK(ReadView(*plan,**old,&actual,&reads));ASSERT_EQ(actual,expected);
+  auto fresh=model.NewQueryReadContext();ASSERT_OK(fresh);plan=Plan({{-1,9000,-2},{-1,9003,-3}},3,{0,2},16,128);ASSERT_OK(plan);
+  ASSERT_OK(FragmentPlan::SampleJoinOrder(&*plan,model,**fresh,options));
+  expected.insert({102,4001});actual.clear();ASSERT_OK(ReadView(*plan,**fresh,&actual,&reads));ASSERT_EQ(actual,expected);
+}
+} }  // namespace yb::mdb

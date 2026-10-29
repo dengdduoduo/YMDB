@@ -160,6 +160,7 @@ std::string BatchQueryStats::ToJson() const {
   MDB_STAT(exchange_skew_partitions); MDB_STAT(exchange_cleanup_failures);
 #undef MDB_STAT
   result += "\"remote_worker_pids\":\"" + remote_worker_pids + "\",";
+  result += "\"sampled_join_order\":" + sampled_join_order + ",";
   result += "\"distributed_join_advisory\":" + distributed_join_advisory + ",";
   result += "\"join_decisions\":\"" + join_decisions + "\"}";
   return result;

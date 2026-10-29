@@ -64,6 +64,7 @@ struct GlobalCountSpec {
 struct FragmentPlan {
   PhysicalProperties properties;
   std::string join_statistics_advisory = "null";
+  std::string sampled_join_order = "null";
   FragmentOpenPB physical;
   std::vector<TabletInfo> tasks;
   bool empty = false;
@@ -78,6 +79,8 @@ struct FragmentPlan {
 
   static Result<FragmentPlan> Build(const SPARQL::Op& root, RdfYBModel& model,
                                     const WorkerOptions& options);
+  static Status SampleJoinOrder(FragmentPlan* plan, RdfYBModel& model,
+                                DocDBReadContext& context, const WorkerOptions& options);
   static std::string DescribeJoinStatistics(const FragmentOpenPB& input,
                                              const QueryStatistics* statistics, size_t anchor_tasks = 0);
   static Status ValidateCoverage(const std::vector<TabletInfo>& tasks);

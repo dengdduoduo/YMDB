@@ -737,3 +737,30 @@ therefore cannot justify an output estimate or a universal strategy threshold.
 The previous six-graph read/flush observations are compared offline with real
 ANALYZE endpoint estimates; no repeated performance claim or runtime default
 change is introduced. Historical freshness remains unverified.
+
+
+## Opt-in same-view order trial (2026-10-29)
+
+--mdb_sample_join_order=true (WorkerOptions::sample_join_order) is disabled by
+default. On an eligible two-fixed-predicate, shared-subject BGP without
+explicit exchange, the coordinator reads at most one 16-row PSO page per predicate
+using the current query session/transaction. It reserves 128 KiB of temporary
+coordinator buffered-state allowance, then releases samples before Gather. Lower
+budgets skip sampling. Client/session infrastructure is outside this reservation.
+Two operations are flushed together; cancellation, deadlines and read-restart
+errors fail normally. No historical statistics are trusted for this decision.
+
+The patterns swap only when the right page is complete and strictly smaller than
+the observed left sample. Partial pages are lower bounds, not extrapolated row or
+NDV estimates. Inconclusive/unsupported/empty plans keep order; explicit Hash or
+Broadcast is preserved without sampling. The physical anchor variable changes
+with the first pattern, while complete SPO tablet coverage and original result
+projection/final modifiers remain. No early successful output, query retry,
+worker-local pruning, wire or persistent-format change is introduced.
+
+sampled_join_order reports status, observed counts/completeness, logical read
+operations, temporary reservation and time separately from remote reads. It is
+not the historical distributed_join_advisory.applied flag. An unordered query
+still has no stable arrival order guarantee; ordered modifiers execute normally.
+Local policies and defaults remain unchanged. This is a trial, not a universally
+beneficial automatic optimizer; same-binary on/off tests retain regressions too.

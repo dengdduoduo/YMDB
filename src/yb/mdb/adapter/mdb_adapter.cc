@@ -527,6 +527,7 @@ int ExecuteSparql(
     } else {
       yb::mdb::WallTimeScope timer(&read_context->stats.adapter_execute_us);
       read_context->stats.distributed_join_advisory = physical->join_statistics_advisory;
+      read_context->stats.sampled_join_order = physical->sampled_join_order;
       const auto* select = dynamic_cast<const OpSelect*>(op.get());
       std::vector<ObjectId> gathered;
       std::vector<VarId> gathered_vars;

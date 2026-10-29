@@ -56,6 +56,7 @@ DEFINE_uint32(mdb_worker_batch_rows, 128, "Maximum rows per worker pull response
 DEFINE_uint32(mdb_worker_page_rows, 16, "Maximum storage rows per worker page");
 DEFINE_uint32(mdb_worker_memory_bytes, 8388608, "Per-worker buffered-state budget; excludes shared YB client infrastructure");
 DEFINE_uint32(mdb_global_memory_bytes, 67108864, "Global Gather input reservation budget; excludes shared infrastructure");
+DEFINE_bool(mdb_sample_join_order, false, "Opt-in same-query-view bounded two-pattern order trial");
 DEFINE_string(mdb_exchange, "none", "Opt-in two-triple exchange: none, hash, broadcast");
 DEFINE_uint32(mdb_exchange_partitions, 4, "Number of local exchange partitions (2..64)");
 DEFINE_uint32(mdb_exchange_memory_bytes, 8388608, "Exchange consumer and metadata reservation budget");
@@ -126,6 +127,7 @@ static int RunQuery(int argc, char* argv[]) {
   options.negative_cache_entries = FLAGS_mdb_join_negative_cache_entries;
   yb::mdb::RdfYBModel::Instance().SetBatchJoinOptions(options);
   yb::mdb::WorkerOptions workers;
+  workers.sample_join_order = FLAGS_mdb_sample_join_order;
   if (FLAGS_mdb_exchange == "hash") workers.exchange = yb::mdb::ExchangeMode::Hash;
   else if (FLAGS_mdb_exchange == "broadcast") workers.exchange = yb::mdb::ExchangeMode::Broadcast;
   else if (FLAGS_mdb_exchange != "none") {

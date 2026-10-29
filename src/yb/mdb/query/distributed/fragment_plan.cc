@@ -3,6 +3,8 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
+#include "yb/mdb/storage/docdb_scan_cursor.h"
 #include <functional>
 #include <limits>
 #include <set>
@@ -626,12 +628,73 @@ Result<FragmentPlan> FragmentPlan::Build(
     return a.partition_start < b.partition_start;
   });
   RETURN_NOT_OK(ValidateCoverage(plan.tasks));
-  const auto* context = DocDBReadContextScope::Current();
+  auto* context = DocDBReadContextScope::Current();
+  if (context && options.sample_join_order)
+    RETURN_NOT_OK(SampleJoinOrder(&plan, model, *context, options));
   plan.join_statistics_advisory = DescribeJoinStatistics(
       physical, context ? context->statistics.get() : nullptr, plan.tasks.size());
   return plan;
 }
 
+
+
+Status FragmentPlan::SampleJoinOrder(
+    FragmentPlan* plan, RdfYBModel& model, DocDBReadContext& context,
+    const WorkerOptions& options) {
+  if (!options.sample_join_order) return Status::OK();
+  auto skip = [&](const char* reason) {
+    plan->sampled_join_order = std::string("{\"status\":\"") + reason + "\",\"read_operations\":0}";
+    return Status::OK();
+  };
+  if (options.exchange != ExchangeMode::None) return skip("explicit_exchange_unchanged");
+  auto& input = plan->physical;
+  if (plan->empty || input.triples_size() != 2) return skip("unsupported_shape");
+  std::array<std::set<uint32_t>, 2> vars;
+  for (int side=0;side<2;++side) {
+    const auto& t=input.triples(side);
+    if (t.terms_size()!=3 || !t.terms(1).has_constant() || t.terms(1).has_variable() ||
+        !t.terms(0).has_variable() || t.terms(0).has_constant() ||
+        !t.terms(2).has_variable() || t.terms(2).has_constant()) return skip("unsupported_shape");
+    vars[side]={t.terms(0).variable(),t.terms(2).variable()};
+    if(vars[side].size()!=2) return skip("unsupported_shape");
+  }
+  size_t shared=0;for(auto var:vars[0])shared+=vars[1].count(var);
+  if(shared!=1) return skip("unsupported_shape");
+  // The tested benefit is a selective subject-key probe. Chain/object-key
+  // probes can amplify repeated multi-page reads even for a smaller anchor.
+  if(input.triples(0).terms(0).variable()!=input.triples(1).terms(0).variable())
+    return skip("unsupported_join_orientation");
+  // One page per predicate, then release all sample payload before Gather.
+  // This reservation is separate from client/session infrastructure, not RSS.
+  constexpr uint64_t reservation=128*1024;
+  if(options.coordinator_memory_bytes<reservation) return skip("insufficient_sample_budget");
+  const auto started=std::chrono::steady_clock::now();
+  std::array<DocDBScanCursor,2> cursors;
+  for(int side=0;side<2;++side){
+    DocDBScanSpec spec;spec.hash_key=input.triples(side).terms(1).constant();
+    spec.columns[0]={*spec.hash_key,*spec.hash_key};spec.page_rows=16;
+    spec.page_bytes=16*sizeof(DocDBScanBatch::Row);spec.deadline=context.deadline;
+    spec.cancelled=&context.cancelled;
+    RETURN_NOT_OK(cursors[side].Open(model.GetTable(3),context.session,std::move(spec)));
+  }
+  auto pages=VERIFY_RESULT(DocDBScanCursor::NextBatches({&cursors[0],&cursors[1]}));
+  if(context.cancelled.load()) return STATUS(Aborted,"MDB order sample cancelled");
+  if(CoarseMonoClock::Now()>=context.deadline) return STATUS(TimedOut,"MDB order sample deadline expired");
+  // A partial sample is only a lower bound. Never extrapolate its cardinality
+  // or NDV; swap only if the complete right side is strictly smaller.
+  const bool swap=pages[1].eof && pages[1].rows.size()<pages[0].rows.size();
+  std::ostringstream out;
+  out<<"{\"status\":\""<<(swap?"swapped_complete_smaller_right":"kept_inconclusive_or_left_smaller")
+     <<"\",\"source\":\"current_query_session\",\"rows\":["<<pages[0].rows.size()<<','<<pages[1].rows.size()
+     <<"],\"complete\":["<<(pages[0].eof?"true":"false")<<','<<(pages[1].eof?"true":"false")
+     <<"],\"read_operations\":"<<cursors[0].rpc_calls()+cursors[1].rpc_calls()
+     <<",\"reserved_bytes\":"<<reservation<<",\"elapsed_us\":"
+     <<std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now()-started).count()<<"}";
+  plan->sampled_join_order=out.str();
+  if(swap){input.mutable_triples()->SwapElements(0,1);
+    plan->properties.partition_variable=input.triples(0).terms(0).variable();}
+  return Status::OK();
+}
 
 std::string FragmentPlan::DescribeJoinStatistics(
     const FragmentOpenPB& input, const QueryStatistics* statistics, size_t anchor_tasks) {

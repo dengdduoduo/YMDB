@@ -18,6 +18,8 @@ struct WorkerOptions {
   // Optional remote-local flagfile for the existing YB client's TLS settings.
   std::string flagfile;
   std::string ssh_config;
+  // Experimental same-query-view two-pattern sampling; disabled by default.
+  bool sample_join_order = false;
   size_t max_workers = 3;
   size_t batch_rows = 128;
   size_t page_rows = 16;
