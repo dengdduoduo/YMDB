@@ -2,6 +2,7 @@
 #include "yb/mdb/query/distributed/fragment_plan.h"
 
 #include <algorithm>
+#include <functional>
 #include <limits>
 #include <set>
 #include "graph_models/object_id.h"
@@ -15,6 +16,7 @@
 #include "query/parser/op/sparql/op_order_by.h"
 #include "query/parser/op/sparql/op_group_by.h"
 #include "query/parser/op/sparql/op_having.h"
+#include "query/parser/op/sparql/op_values.h"
 #include "query/parser/expr/sparql/atom/expr_term.h"
 #include "query/parser/expr/sparql/atom/expr_var.h"
 #include "query/parser/expr/sparql/binary/expr_and.h"
@@ -146,6 +148,37 @@ Status ValidateHaving(const SPARQL::Expr& expr, const std::set<VarId>& group_var
     return ValidateHaving(*rhs, group_vars, budget, logical, depth + 1);
   }
   return STATUS(NotSupported, "HAVING expression remains at coordinator");
+}
+
+using CountRewrite = std::function<std::unique_ptr<SPARQL::Expr>(const SPARQL::Expr&)>;
+
+// Preserve existing expression evaluation; only aggregate leaves change.
+std::unique_ptr<SPARQL::Expr> RewriteCountPredicate(
+    const SPARQL::Expr& expr, const CountRewrite& rewrite) {
+  if (dynamic_cast<const SPARQL::ExprAggCount*>(&expr) ||
+      dynamic_cast<const SPARQL::ExprAggCountAll*>(&expr)) return rewrite(expr);
+  auto result = expr.clone();
+  if (dynamic_cast<SPARQL::ExprTerm*>(result.get()) ||
+      dynamic_cast<SPARQL::ExprVar*>(result.get())) return result;
+  if (auto* negation = dynamic_cast<SPARQL::ExprNot*>(result.get())) {
+    negation->expr = RewriteCountPredicate(*negation->expr, rewrite);
+    return negation->expr ? std::move(result) : nullptr;
+  }
+  auto binary = [&](auto* node) {
+    if (!node) return false;
+    node->lhs = RewriteCountPredicate(*node->lhs, rewrite);
+    node->rhs = RewriteCountPredicate(*node->rhs, rewrite);
+    return bool(node->lhs) && bool(node->rhs);
+  };
+  if (binary(dynamic_cast<SPARQL::ExprAnd*>(result.get())) ||
+      binary(dynamic_cast<SPARQL::ExprOr*>(result.get())) ||
+      binary(dynamic_cast<SPARQL::ExprEqual*>(result.get())) ||
+      binary(dynamic_cast<SPARQL::ExprNotEqual*>(result.get())) ||
+      binary(dynamic_cast<SPARQL::ExprGreater*>(result.get())) ||
+      binary(dynamic_cast<SPARQL::ExprGreaterOrEqual*>(result.get())) ||
+      binary(dynamic_cast<SPARQL::ExprLess*>(result.get())) ||
+      binary(dynamic_cast<SPARQL::ExprLessOrEqual*>(result.get()))) return result;
+  return nullptr;
 }
 
 struct ProjectionBudget {
@@ -466,18 +499,22 @@ Result<FragmentPlan> FragmentPlan::Build(
         2 * sizeof(::ObjectId) * (physical.projection_size() + spec.key_columns.size());
     plan.distinct = std::move(spec);
   }
-  // Only direct, non-DISTINCT counts may replace the original aggregate tree.
-  // HAVING and computed extensions must still receive the complete input bag.
-  if (aggregate && !having) {
+  // Computed SELECT extensions and distinct/value aggregates retain the old path.
+  if (aggregate) {
     GlobalCountSpec spec;
     spec.grouped = grouped;
+    spec.having = having != nullptr;
     bool eligible = true;
     const SPARQL::Op* envelope = select->op.get();
     if (auto* order = dynamic_cast<const SPARQL::OpOrderBy*>(envelope)) envelope = order->op.get();
+    if (having) {
+      if (envelope == having) envelope = having->op.get();
+      else eligible = false;
+    }
     if (grouped) {
       auto* group = dynamic_cast<const SPARQL::OpGroupBy*>(envelope);
-      eligible = group && group->op.get() == input;
-    } else eligible = envelope == input;
+      eligible = eligible && group && group->op.get() == input;
+    } else eligible = eligible && envelope == input;
     auto column = [&](VarId var) -> int32_t {
       const auto found = std::find(physical.projection().begin(), physical.projection().end(), var.id);
       return found == physical.projection().end() ? -1 : found - physical.projection().begin();
@@ -501,6 +538,30 @@ Result<FragmentPlan> FragmentPlan::Build(
       spec.count_variables.push_back(select->vars[i].id);
       spec.count_columns.push_back(arg);
     }
+    if (eligible && having) {
+      for (const auto& predicate : having->exprs) {
+        auto rewritten = RewriteCountPredicate(*predicate, [&](const SPARQL::Expr& expr)
+            -> std::unique_ptr<SPARQL::Expr> {
+          int32_t arg;
+          if (auto* all = dynamic_cast<const SPARQL::ExprAggCountAll*>(&expr)) {
+            if (all->distinct) return nullptr;
+            arg = -2;
+          } else {
+            const auto& count = static_cast<const SPARQL::ExprAggCount&>(expr);
+            const auto* var = dynamic_cast<const SPARQL::ExprVar*>(count.expr.get());
+            if (count.distinct || !var) return nullptr;
+            arg = column(var->var);
+          }
+          // Reserve identities without changing the query context or parser tree.
+          const uint32_t var = get_query_ctx().get_var_size() + spec.having_variables.size();
+          spec.having_variables.push_back(var);
+          spec.count_variables.push_back(var);
+          spec.count_columns.push_back(arg);
+          return std::make_unique<SPARQL::ExprVar>(VarId(var));
+        });
+        if (!rewritten) { eligible = false; break; }
+      }
+    }
     // Map keys/counters, incoming key and final Values/order/distinct storage.
     spec.row_reservation = plan.global_row_reservation + 256 +
         4 * sizeof(std::vector<::ObjectId>) +
@@ -523,6 +584,46 @@ Result<FragmentPlan> FragmentPlan::Build(
   });
   RETURN_NOT_OK(ValidateCoverage(plan.tasks));
   return plan;
+}
+
+Status FragmentPlan::FinalizeCount(
+    SPARQL::Op& root, const GlobalCountSpec& spec, std::vector<::ObjectId> rows) {
+  auto& select = dynamic_cast<SPARQL::OpSelect&>(root);
+  auto* slot = &select.op;
+  if (auto* order = dynamic_cast<SPARQL::OpOrderBy*>(slot->get())) slot = &order->op;
+  std::vector<std::unique_ptr<SPARQL::Expr>> predicates;
+  size_t hidden = 0;
+  if (spec.having) {
+    const auto* having = dynamic_cast<const SPARQL::OpHaving*>(slot->get());
+    if (!having) return STATUS(Corruption, "Missing incremental COUNT HAVING envelope");
+    for (const auto& predicate : having->exprs) {
+      auto rewritten = RewriteCountPredicate(*predicate, [&](const SPARQL::Expr&)
+          -> std::unique_ptr<SPARQL::Expr> {
+        if (hidden == spec.having_variables.size()) return nullptr;
+        return std::make_unique<SPARQL::ExprVar>(VarId(spec.having_variables[hidden++]));
+      });
+      if (!rewritten) return STATUS(Corruption, "Incremental COUNT HAVING rewrite mismatch");
+      predicates.push_back(std::move(rewritten));
+    }
+  }
+  if (hidden != spec.having_variables.size())
+    return STATUS(Corruption, "Incremental COUNT HAVING slot mismatch");
+  for (auto var : spec.having_variables) {
+    if (get_query_ctx().get_var_size() != var || get_query_ctx().get_internal_var().id != var)
+      return STATUS(Corruption, "Incremental COUNT private variable mismatch");
+  }
+  std::vector<VarId> vars;
+  for (auto var : spec.group_variables) vars.emplace_back(var);
+  for (auto var : spec.count_variables) vars.emplace_back(var);
+  std::unique_ptr<SPARQL::Op> finalized = std::make_unique<SPARQL::OpValues>(
+      std::move(vars), std::move(rows));
+  if (spec.having)
+    // Keep HAVING's RDF effective-boolean conversion, including bare COUNTs.
+    finalized = std::make_unique<SPARQL::OpHaving>(std::move(finalized), std::move(predicates));
+  *slot = std::move(finalized);
+  select.vars_exprs.clear();
+  select.vars_exprs.resize(select.vars.size());
+  return Status::OK();
 }
 
 std::unique_ptr<SPARQL::Op>* FragmentPlan::InputSlot(SPARQL::Op& root) {

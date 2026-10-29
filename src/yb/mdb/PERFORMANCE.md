@@ -379,3 +379,66 @@ tablets per index; CAPI page1/batch2, CLI page16/batch128. No new latency, peak 
 Debug/ASan, physical multi-host or SOTA result. Historical allocator root cause
 and remote cleanup limitations remain. General HAVING/value aggregation and
 external sorting/aggregation are not implemented by this milestone.
+
+
+## Incremental COUNT HAVING (2026-10-29)
+
+The bounded global count path now accepts the existing restricted HAVING
+predicates when every aggregate in SELECT and HAVING is a direct non-distinct
+COUNT(*) or COUNT(variable). There must be at least one count. GROUP BY remains
+variable-only and SELECT computed expressions stay on their previous path.
+HAVING retains its existing pre-launch validation (including no SELECT alias
+visibility, depth/node/private-aggregate limits and the 128-variable bound).
+COUNT DISTINCT, SUM/AVG/MIN/MAX and unsupported expressions retain original
+all-input admission or the existing pre-launch capability fallback.
+
+Each HAVING count occurrence receives a private counter slot. Planning clones
+the bounded predicate and reserves identities without mutating the query context
+or input tree. Every input row is still validated and counted; all child results
+and successful worker exits are required even when filtering removes every group
+or LIMIT is zero. Only then are private variables allocated and aggregate leaves
+rewritten to finalized count variables. The existing expression evaluator filters
+final group bindings before the original ORDER BY/projection DISTINCT/slice.
+There is no worker-local HAVING filter and no new boolean/error evaluator.
+Implicit empty groups produce zero counts before filtering; explicit empty
+groups produce no rows. Missing count arguments, unbound group keys and boolean
+error truth tables retain their existing semantics. Private counters never
+change public result columns. A count/group-only query without HAVING uses the
+same finalization helper without private variables or an added filter.
+
+Additional private counters are included in existing per-group/candidate
+reservation, binding-slot and HAVING-node charges. `global_count_having_operators`
+and `global_count_having_hidden_counts` identify this path; `global_input_rows`
+still counts every admitted input and `global_count_groups` is pre-filter group
+cardinality. Neither the hidden counters nor HAVING reduce the group admission
+limit early. Too many groups still fail; this is not an external aggregation.
+
+Release evidence: 19 exact GTests (7 new, 12 relevant compatibility), one wrapper
+invocation per case. Pre-change, 512 input rows/two groups with HAVING reached
+9,440 reserved bytes after five input rows and failed at a 10,000-byte limit.
+The same complete-count filter now succeeds through workers, Hash and Broadcast.
+Growth from 64 to 256 to 1,024 input rows keeps two groups, one private counter
+per group and 6,960 peak logical reserved bytes. Comparisons check complete
+ordered results and independent expected counts against the original coordinator.
+New tests cover multiple hidden counts, missing variables, boolean errors,
+hidden-only count projection, SELECT alias rejection before launch, empty groups,
+DISTINCT/slice ordering, exact/one-byte-short budgets, excluded aggregates,
+all-filtered/zero-limit late failures, cancellation/timeout and recovery.
+Fresh-import CLI JSON checks typed counts, public schema/private-column exclusion
+and failed-output discard. Existing count/DISTINCT/HAVING/expression/numeric and
+exchange cases pass. The previous count exclusion test now uses COUNT DISTINCT
+in HAVING to preserve its original all-row admission purpose.
+
+Conditions: one WSL host, two logical CPUs, three in-process tservers/RF3 and four
+tablets per index. CAPI page1/batch2; CLI page16/batch128. Logical reservation
+excludes shared dictionaries, client/RPC infrastructure and transport buffers;
+it is not RSS or a latency result. No new physical multi-host, SOTA, Debug or
+ASan acceptance; historical allocator root cause and remote cleanup limits remain.
+No wire/storage format, default exchange/Hash/Leapfrog policy or worker-local
+aggregation changes. High group cardinality can still exhaust the same budget.
+The first implementation used an ordinary OpFilter and failed the bare
+HAVING(COUNT(*)) regression because that path uses a different boolean converter.
+It was corrected to preserve OpHaving over the finalized Values, thereby using
+the original HAVING RDF conversion. The first run (one pass, one failure) is
+preserved separately and is not included in the final 19 passes. Runtime code
+changed for this correction, so all 19 cases were rerun on the corrected binary.

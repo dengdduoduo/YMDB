@@ -547,6 +547,10 @@ int ExecuteSparql(
         const auto initialized = count->Initialize(worker_options.coordinator_memory_bytes);
         if (!initialized.ok()) { LOG(WARNING) << initialized; return 1; }
         ++read_context->stats.global_count_operators;
+        if (physical->count->having) {
+          ++read_context->stats.global_count_having_operators;
+          read_context->stats.global_count_having_hidden_counts = physical->count->having_variables.size();
+        }
         read_context->stats.global_count_groups = count->size();
         reserved = count->reserved_bytes();
         read_context->stats.global_reserved_bytes = reserved;
@@ -623,16 +627,9 @@ int ExecuteSparql(
       if (topk) gathered = topk->ReleaseRows();
       if (distinct) gathered = distinct->ReleaseRows();
       if (count) {
-        gathered_vars.clear();
-        for (auto var : physical->count->group_variables) gathered_vars.emplace_back(var);
-        for (auto var : physical->count->count_variables) gathered_vars.emplace_back(var);
-        auto values = std::make_unique<OpValues>(std::move(gathered_vars), count->ReleaseRows());
-        auto& root = dynamic_cast<OpSelect&>(*op);
-        // Counts are already final. Preserve only the existing global modifiers.
-        if (auto* order = dynamic_cast<OpOrderBy*>(root.op.get())) order->op = std::move(values);
-        else root.op = std::move(values);
-        root.vars_exprs.clear();
-        root.vars_exprs.resize(root.vars.size());
+        const auto finalized = yb::mdb::FragmentPlan::FinalizeCount(
+            *op, *physical->count, count->ReleaseRows());
+        if (!finalized.ok()) { LOG(WARNING) << finalized; return 1; }
       } else {
         *yb::mdb::FragmentPlan::InputSlot(*op) = std::make_unique<OpValues>(
             std::move(gathered_vars), std::move(gathered));

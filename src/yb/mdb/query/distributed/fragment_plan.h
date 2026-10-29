@@ -41,6 +41,8 @@ struct GlobalDistinctSpec {
 
 struct GlobalCountSpec {
   bool grouped = false;
+  bool having = false;
+  std::vector<uint32_t> having_variables;
   uint64_t row_reservation = 0;
   std::vector<uint32_t> group_variables;
   std::vector<int32_t> group_columns;
@@ -67,6 +69,8 @@ struct FragmentPlan {
   static Result<FragmentPlan> Build(const SPARQL::Op& root, RdfYBModel& model,
                                     const WorkerOptions& options);
   static Status ValidateCoverage(const std::vector<TabletInfo>& tasks);
+  static Status FinalizeCount(SPARQL::Op& root, const GlobalCountSpec& spec,
+                              std::vector<::ObjectId> rows);
 };
 
 // Validation also runs at the worker boundary before allocation or storage reads.
