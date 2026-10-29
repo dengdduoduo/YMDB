@@ -12,6 +12,7 @@ namespace yb::mdb {
 
 class RdfYBModel;
 class DocDBReadContext;
+struct QueryStatistics;
 
 struct PhysicalProperties {
   enum class Partitioning { Unknown, YcqlSubjectHash };
@@ -62,6 +63,7 @@ struct GlobalCountSpec {
 // Executable storage-ID graph, separate from the parser's process-local Op tree.
 struct FragmentPlan {
   PhysicalProperties properties;
+  std::string join_statistics_advisory = "null";
   FragmentOpenPB physical;
   std::vector<TabletInfo> tasks;
   bool empty = false;
@@ -76,6 +78,8 @@ struct FragmentPlan {
 
   static Result<FragmentPlan> Build(const SPARQL::Op& root, RdfYBModel& model,
                                     const WorkerOptions& options);
+  static std::string DescribeJoinStatistics(const FragmentOpenPB& input,
+                                             const QueryStatistics* statistics);
   static Status ValidateCoverage(const std::vector<TabletInfo>& tasks);
   static Status FinalizeCount(SPARQL::Op& root, const GlobalCountSpec& spec,
                               std::vector<::ObjectId> rows);

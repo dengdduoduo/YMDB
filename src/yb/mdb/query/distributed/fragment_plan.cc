@@ -2,9 +2,12 @@
 #include "yb/mdb/query/distributed/fragment_plan.h"
 
 #include <algorithm>
+#include <array>
 #include <functional>
 #include <limits>
 #include <set>
+#include <sstream>
+#include "yb/mdb/storage/docdb_read_context.h"
 #include "graph_models/object_id.h"
 #include "yb/client/table.h"
 #include "yb/util/net/net_util.h"
@@ -623,7 +626,55 @@ Result<FragmentPlan> FragmentPlan::Build(
     return a.partition_start < b.partition_start;
   });
   RETURN_NOT_OK(ValidateCoverage(plan.tasks));
+  const auto* context = DocDBReadContextScope::Current();
+  plan.join_statistics_advisory = DescribeJoinStatistics(
+      physical, context ? context->statistics.get() : nullptr);
   return plan;
+}
+
+
+std::string FragmentPlan::DescribeJoinStatistics(
+    const FragmentOpenPB& input, const QueryStatistics* statistics) {
+  bool eligible = input.triples_size() == 2;
+  std::array<std::set<uint32_t>, 2> variables;
+  if (eligible) for (int side = 0; side < 2; ++side) {
+    const auto& triple = input.triples(side);
+    if (triple.terms_size() != 3 || !triple.terms(1).has_constant() ||
+        triple.terms(1).has_variable() || triple.terms(0).has_constant() ||
+        triple.terms(2).has_constant() || !triple.terms(0).has_variable() ||
+        !triple.terms(2).has_variable()) {
+      eligible = false; break;
+    }
+    variables[side] = {triple.terms(0).variable(), triple.terms(2).variable()};
+    if (variables[side].size() != 2) { eligible = false; break; }
+  }
+  size_t shared = 0;
+  for (auto var : variables[0]) shared += variables[1].count(var);
+  eligible = eligible && shared == 1;
+  const bool available = statistics && statistics->version != 0;
+  const bool complete = available && statistics->predicates_complete;
+  const char* reason = !eligible ? "outside_two_pattern_scope" : !available ?
+      "missing_statistics" : !complete ? "incomplete_predicate_counts" :
+      "statistics_not_bound_to_query_view";
+  // ANALYZE owns an earlier read view. Holding its immutable pointer does not
+  // establish freshness against external writers or per-predicate join keys.
+  std::ostringstream out;
+  out << "{\"eligible\":" << (eligible ? "true" : "false")
+      << ",\"source\":\"" << (available ? "analyze_snapshot" : "none")
+      << "\",\"statistics_version\":" << (available ? statistics->version : 0)
+      << ",\"collected_unix_ms\":" << (available ? statistics->collected_unix_ms : 0)
+      << ",\"predicate_counts_complete\":" << (complete ? "true" : "false")
+      << ",\"freshness_verified\":false,\"join_key_statistics_available\":false"
+      << ",\"applied\":false,\"recommendation\":\"keep_explicit_order_and_mode\""
+      << ",\"reason\":\"" << reason << "\",\"historical_predicate_rows\":[";
+  for (int side = 0; side < 2; ++side) {
+    if (side) out << ',';
+    if (!eligible || !complete) { out << "null"; continue; }
+    const auto found = statistics->predicates.find(input.triples(side).terms(1).constant());
+    out << (found == statistics->predicates.end() ? 0 : found->second);
+  }
+  out << "]}";
+  return out.str();
 }
 
 Status FragmentPlan::FinalizeCount(

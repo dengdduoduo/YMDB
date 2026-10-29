@@ -5564,3 +5564,58 @@ TEST_F(MdbStrategyMatrixTest, Shared512){RunMatrix("shared",512);}
 TEST_F(MdbStrategyMatrixTest, Fanout128){RunMatrix("fanout",128);}
 TEST_F(MdbStrategyMatrixTest, Fanout512){RunMatrix("fanout",512);}
 } }  // namespace yb::mdb
+
+
+namespace yb::mdb { namespace {
+TEST_F(MdbFragmentIntegrationTest, Stage12AdvisoryGuardsMissingPartialAndUnsupportedInputs) {
+  FragmentOpenPB input;
+  for(int side=0;side<2;++side){auto* t=input.add_triples();t->add_terms()->set_variable(side);t->add_terms()->set_constant(9000+side);t->add_terms()->set_variable(side+1);}
+  auto read=[&](const QueryStatistics* stats){rapidjson::Document d;const auto text=FragmentPlan::DescribeJoinStatistics(input,stats);d.Parse(text.c_str());EXPECT_FALSE(d.HasParseError());EXPECT_LT(text.size(),1024);return d;};
+  auto missing=read(nullptr);ASSERT_STREQ(missing["reason"].GetString(),"missing_statistics");ASSERT_TRUE(missing["historical_predicate_rows"][0].IsNull());
+  QueryStatistics stats;stats.version=1;stats.predicates[9000]=32;stats.predicates[9001]=2;
+  auto full=read(&stats);ASSERT_TRUE(full["eligible"].GetBool());ASSERT_FALSE(full["applied"].GetBool());ASSERT_FALSE(full["freshness_verified"].GetBool());
+  ASSERT_EQ(full["historical_predicate_rows"][0].GetUint64(),32);ASSERT_EQ(full["historical_predicate_rows"][1].GetUint64(),2);
+  stats.predicates.erase(9001);auto empty=read(&stats);ASSERT_EQ(empty["historical_predicate_rows"][1].GetUint64(),0);
+  stats.predicates_complete=false;auto partial=read(&stats);ASSERT_STREQ(partial["reason"].GetString(),"incomplete_predicate_counts");ASSERT_TRUE(partial["historical_predicate_rows"][0].IsNull());
+  stats.predicates_complete=true;input.mutable_triples(1)->mutable_terms(0)->set_variable(4);
+  ASSERT_STREQ(read(&stats)["reason"].GetString(),"outside_two_pattern_scope");
+  input.mutable_triples(1)->mutable_terms(0)->set_variable(1);input.mutable_triples(0)->mutable_terms(2)->set_variable(0);
+  ASSERT_FALSE(read(&stats)["eligible"].GetBool());
+  input.mutable_triples(0)->mutable_terms(2)->set_variable(1);input.mutable_triples(0)->mutable_terms(0)->set_constant(100);
+  ASSERT_FALSE(read(&stats)["eligible"].GetBool());input.mutable_triples(0)->mutable_terms(0)->clear_variable();
+  ASSERT_FALSE(read(&stats)["eligible"].GetBool());input.add_triples();ASSERT_FALSE(read(&stats)["eligible"].GetBool());
+}
+TEST_F(MdbFragmentIntegrationTest, Stage12AdvisorySixGraphsMatchAnalyzeAndKeepTypedResults) {
+  auto& model=RdfYBModel::Instance();model.SetStreamingPageRows(16);
+  size_t graph=0;
+  for(const auto& shape:std::vector<std::string>{"unique","shared","fanout"})for(size_t n:{128,512}){
+    const uint64_t base=++graph*1000000,p1=base+9000,p2=p1+1;
+    const size_t keys=shape=="unique"?n:shape=="shared"?1:16,fanout=shape=="unique"?1:shape=="shared"?2:16;
+    using Term=FirstBatchTypedOutput::Term;using Row=std::vector<Term>;std::multiset<Row> expected;
+    for(size_t i=0;i<n;++i){Write(base+100+i,p1,base+10000+i%keys);
+      for(size_t j=0;j<fanout;++j)expected.insert(Row{Term{YBC_MDB_IRI,Iri(base+100+i),"",""},Term{YBC_MDB_IRI,Iri(base+200000+(i%keys)*fanout+j),"",""}});}
+    for(size_t k=0;k<keys;++k)for(size_t j=0;j<fanout;++j)Write(base+10000+k,p2,base+200000+k*fanout+j);
+    ASSERT_OK(model.Flush());ASSERT_OK(model.AnalyzeStatistics());
+    const auto a="?s <"+Iri(p1)+"> ?k",b="?k <"+Iri(p2)+"> ?o";
+    for(int order:{0,1})for(auto mode:{ExchangeMode::None,ExchangeMode::Hash}){
+      auto options=workers_;options.page_rows=16;options.batch_rows=128;options.exchange=mode;options.exchange_spill_directory=GetTestPath("advice-spill");std::filesystem::create_directories(options.exchange_spill_directory);model.SetWorkerOptions(options);
+      const auto text="SELECT ?s ?o WHERE { "+(order?b:a)+" . "+(order?a:b)+" }";FirstBatchTypedOutput output;
+      ASSERT_EQ(YBCMdbExecuteSparqlWithResults(text.c_str(),output.Callbacks(),&output),0);ASSERT_TRUE(output.ended);ASSERT_EQ(output.names,(std::vector<std::string>{"s","o"}));ASSERT_EQ(std::multiset<Row>(output.rows.begin(),output.rows.end()),expected);
+      rapidjson::Document profile;profile.Parse(YBCMdbGetLastQueryProfile());ASSERT_FALSE(profile.HasParseError());
+      const auto& advice=profile["distributed_join_advisory"];ASSERT_TRUE(advice["eligible"].GetBool());ASSERT_FALSE(advice["applied"].GetBool());ASSERT_FALSE(advice["freshness_verified"].GetBool());
+      ASSERT_EQ(advice["historical_predicate_rows"][order?1:0].GetUint64(),n);ASSERT_EQ(advice["historical_predicate_rows"][order?0:1].GetUint64(),keys*fanout);
+      ASSERT_TRUE(std::filesystem::is_empty(options.exchange_spill_directory));
+      LOG(INFO)<<"ADVISORY_SAMPLE {\"shape\":\""<<shape<<"\",\"n\":"<<n<<",\"order\":"<<order<<",\"profile\":"<<YBCMdbGetLastQueryProfile()<<"}";
+    }
+  }
+}
+TEST_F(MdbFragmentIntegrationTest, Stage12AdvisoryPinnedStatisticsAndLocalWriteInvalidation) {
+  Seed(32);auto& model=RdfYBModel::Instance();ASSERT_OK(model.AnalyzeStatistics());
+  auto old=model.NewQueryReadContext();ASSERT_OK(old);ASSERT_NE((*old)->statistics,nullptr);const auto version=(*old)->statistics->version;
+  Write(1000,9000,1);ASSERT_OK(model.Flush());auto fresh=model.NewQueryReadContext();ASSERT_OK(fresh);ASSERT_EQ((*fresh)->statistics,nullptr);ASSERT_EQ((*old)->statistics->version,version);
+  const auto text="SELECT (COUNT(*) AS ?n) WHERE { ?s <urn:p6:9000> ?k . ?k <urn:p6:9001> ?o }";
+  const auto current=Query(text,workers_);ASSERT_EQ(current.status,0);ASSERT_EQ(current.ordered,(std::vector<std::string>{"66"}));
+  rapidjson::Document d;d.Parse(current.profile.c_str());ASSERT_STREQ(d["distributed_join_advisory"]["reason"].GetString(),"missing_statistics");
+  ASSERT_OK(model.AnalyzeStatistics());auto next=model.NewQueryReadContext();ASSERT_OK(next);ASSERT_GT((*next)->statistics->version,version);ASSERT_EQ((*old)->statistics->predicates.at(9000),32);ASSERT_EQ((*next)->statistics->predicates.at(9000),33);
+}
+} }  // namespace yb::mdb

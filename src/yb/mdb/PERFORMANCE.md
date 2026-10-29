@@ -665,3 +665,28 @@ statistics, distinct join-key estimates and budget/locality evidence; absent or
 incomplete statistics should retain existing behavior. No runtime/default change
 is made by this matrix. Raw samples and three-repeat ranges are required when
 interpreting medians; no SOTA, physical scaling, RSS or significance claim.
+
+
+## Historical predicate statistics advisory (2026-10-29)
+
+Worker profiles expose distributed_join_advisory for the accepted physical plan.
+Only two fixed-predicate patterns with distinct variable subject/object endpoints
+and exactly one shared variable are eligible. The query context's immutable
+ANALYZE statistics pointer supplies version/time and predicate counts. Complete
+maps distinguish a historical zero from missing/incomplete statistics (null).
+Other shapes, absent/version-zero or partial statistics retain explicit reasons.
+No predicate IDs, RDF text or unbounded maps are serialized.
+
+The ANALYZE scan predates the query data view. Local writes invalidate the model
+cache, but external writers are not proven absent. The profile always marks
+freshness_verified=false, join_key_statistics_available=false, applied=false,
+and recommends retaining explicit order/mode. Counts are historical observations,
+not a current-view join cardinality or a cost-based automatic selection. No
+extra scan/RPC, ordering, wire, resource limit or default algorithm change occurs.
+
+Nine exact Release cases pass: guards for absent/partial/zero/unsupported inputs;
+24 real ANALYZE-backed complete typed query observations across six graphs,
+both orders and worker/Hash paths; local-write invalidation with immutable older
+statistics; and relevant strategy, snapshot, budget, aggregate, fallback and CLI
+regressions. The profile remains null for local/non-accepted worker plans. No
+new latency/RSS, physical multi-host or SOTA claim is made.

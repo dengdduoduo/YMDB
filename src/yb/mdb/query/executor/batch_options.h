@@ -59,6 +59,7 @@ struct BatchQueryStats {
   uint64_t estimated_hash_build_rows = 0;
   uint64_t estimated_hash_build_bytes = 0;
   std::string join_decisions;
+  std::string distributed_join_advisory = "null";
   uint64_t remote_read_operations = 0;
   uint64_t remote_fragments = 0;
   uint64_t remote_max_workers = 0;
