@@ -40,6 +40,7 @@
 #include "yb/mdb/storage/docdb_read_context.h"
 #include "yb/mdb/storage/rdf_table_schema.h"
 #include "yb/mdb/storage/yb_client_compat.h"
+#include "yb/mdb/storage/legacy_dictionary_scan.h"
 #include "yb/mdb/query/distributed/tablet_router.h"
 #include "yb/mdb/query/distributed/fragment_gather.h"
 #include "yb/mdb/query/distributed/exchange.h"
@@ -5936,5 +5937,155 @@ class MdbConcurrentQueryTest : public MdbDictionaryRecoveryTest {
 };
 TEST_F(MdbConcurrentQueryTest, IndependentProcessesKeepCompleteTypedBags) { RunPair(false); }
 TEST_F(MdbConcurrentQueryTest, FailedWorkerDoesNotPoisonPeerOrRecovery) { RunPair(true); }
+}  // namespace
+}  // namespace yb::mdb
+
+namespace yb::mdb {
+namespace {
+class MdbLegacyDictionaryScanTest : public MdbDictionaryInitTest {
+ protected:
+  using MirrorRows = std::map<int64_t, std::pair<int64_t, std::string>>;
+
+  void CreateMirror(const std::string& ns, int tablets) {
+    ASSERT_OK(client_->CreateNamespaceIfNotExists(ns, YQL_DATABASE_CQL));
+    client::YBSchemaBuilder schema;
+    schema.AddColumn("pack_id")->Type(DataType::INT64)->HashPrimaryKey()->NotNull();
+    schema.AddColumn("gmap_id")->Type(DataType::INT64)->NotNull();
+    schema.AddColumn("uri")->Type(DataType::STRING)->NotNull();
+    TableProperties properties;
+    properties.SetTransactional(true);
+    schema.SetTableProperties(properties);
+    ASSERT_OK(mirror_.Create(client::YBTableName(YQL_DATABASE_CQL, ns, "rdf_idmap"),
+                             tablets, client_.get(), &schema));
+  }
+
+  void WriteMirror(const MirrorRows& rows) {
+    auto session = client_->NewSession(MonoDelta::FromSeconds(30));
+    std::vector<client::YBqlWriteOpPtr> pending;
+    auto flush = [&] {
+      ASSERT_OK(session->TEST_Flush());
+      for (const auto& op : pending) ASSERT_EQ(op->response().status(), QLResponsePB::YQL_STATUS_OK);
+      pending.clear();
+      session->ResetArena(nullptr);
+    };
+    for (const auto& [pack, entry] : rows) {
+      auto op = NewMdbInsertOp(mirror_, session);
+      QLAddInt64HashValue(op->mutable_request(), pack);
+      mirror_.AddInt64ColumnValue(op->mutable_request(), "gmap_id", entry.first);
+      mirror_.AddStringColumnValue(op->mutable_request(), "uri", entry.second);
+      session->Apply(op);
+      pending.push_back(op);
+      if (pending.size() == 128) ASSERT_NO_FATALS(flush());
+    }
+    if (!pending.empty()) ASSERT_NO_FATALS(flush());
+  }
+
+  Result<MirrorRows> ReadMirror(LegacyDictionaryScanStats* stats) {
+    MirrorRows actual;
+    RETURN_NOT_OK(ScanLegacyDictionaryRows(
+        mirror_, client_.get(), {"pack_id", "gmap_id", "uri"}, [&](const auto& row) -> Status {
+          if (!actual.emplace(row.column(0).int64_value(), std::make_pair(
+                  row.column(1).int64_value(), row.column(2).string_value())).second)
+            return STATUS(Corruption, "Duplicate legacy test row");
+          return Status::OK();
+        }, stats));
+    return actual;
+  }
+
+  MirrorRows MakeMirrorRows(size_t count) {
+    MirrorRows result;
+    for (size_t i = 1; i <= count; ++i)
+      result.emplace(i, std::make_pair(i * 3, "urn:legacy:term:" + std::to_string(i)));
+    return result;
+  }
+  client::TableHandle mirror_;
+};
+
+TEST_F(MdbLegacyDictionaryScanTest, EmptyAndPageEdgesPreserveAllColumns) {
+  for (size_t count : {0, 1, 1023, 1024, 1025, 2050}) {
+    ASSERT_NO_FATALS(CreateMirror("mdb_legacy_edge_" + std::to_string(count), 1));
+    const auto expected = MakeMirrorRows(count);
+    ASSERT_NO_FATALS(WriteMirror(expected));
+    LegacyDictionaryScanStats stats;
+    const auto actual = ReadMirror(&stats);
+    ASSERT_OK(actual);
+    ASSERT_EQ(*actual, expected);
+    ASSERT_EQ(stats.rows, count);
+    ASSERT_GE(stats.page_read_operations, 1);
+    ASSERT_LE(stats.page_read_operations, (count + 1023) / 1024 + 1);
+  }
+}
+
+TEST_F(MdbLegacyDictionaryScanTest, EmptyPartitionsAndTypedLargeRowsAcrossFourTablets) {
+  ASSERT_NO_FATALS(CreateMirror("mdb_legacy_four", 4));
+  auto session = client_->NewSession(MonoDelta::FromSeconds(30));
+  int64_t tail = 0;
+  for (int64_t i = 100000; i < 102048; ++i) {
+    auto op = NewMdbReadOp(mirror_, session);
+    QLAddInt64HashValue(op->mutable_request(), i);
+    std::string encoded;
+    ASSERT_OK(op->GetPartitionKey(&encoded));
+    ASSERT_EQ(encoded.size(), 2);
+    if (static_cast<unsigned char>(encoded[0]) >= 192) { tail = i; break; }
+  }
+  ASSERT_GT(tail, 0);
+  MirrorRows expected = {{tail, {90001, "urn:legacy:last-partition"}}};
+  ASSERT_NO_FATALS(WriteMirror(expected));
+  LegacyDictionaryScanStats stats;
+  auto actual = ReadMirror(&stats);
+  ASSERT_OK(actual);
+  ASSERT_EQ(*actual, expected);
+  ASSERT_EQ(stats.rows, 1);
+  ASSERT_GT(stats.page_read_operations, 1);
+  auto more = MakeMirrorRows(2051);
+  more[1].second = RdfDictionaryKey(RdfIdentity(TripleTermType::LITERAL,
+      std::string{'c', 'a', 'f', char(0xc3), char(0xa9)}, "@en"));
+  more[2].second = RdfDictionaryKey(RdfIdentity(TripleTermType::LITERAL, "01",
+      "http://www.w3.org/2001/XMLSchema#integer"));
+  more[3].second = RdfDictionaryKey(RdfIdentity(TripleTermType::BLANK, "b", "", "legacy-scope"));
+  more[4].second = RdfDictionaryKey(RdfIdentity(TripleTermType::LITERAL, std::string(8192, 'x')));
+  ASSERT_NO_FATALS(WriteMirror(more));
+  expected.insert(more.begin(), more.end());
+  actual = ReadMirror(&stats);
+  ASSERT_OK(actual);
+  ASSERT_EQ(*actual, expected);
+  ASSERT_EQ(stats.rows, expected.size());
+}
+
+TEST_F(MdbLegacyDictionaryScanTest, LaterPageCorruptionPreventsMigrationAndCanRecover) {
+  const std::string ns = "mdb_legacy_late_corruption";
+  ASSERT_NO_FATALS(CreateMirror(ns, 1));
+  const auto expected = MakeMirrorRows(2050);
+  ASSERT_NO_FATALS(WriteMirror(expected));
+  int64_t last_pack = 0;
+  ASSERT_OK(ScanLegacyDictionaryRows(
+      mirror_, client_.get(), {"pack_id"}, [&](const auto& row) -> Status {
+        last_pack = row.column(0).int64_value();
+        return Status::OK();
+      }));
+  ASSERT_GT(last_pack, 0);
+  ASSERT_NO_FATALS(WriteMirror({{last_pack, {0, expected.at(last_pack).second}}}));
+  PersistentIdMap dictionary;
+  ASSERT_TRUE(dictionary.Init(client_.get(), ns).IsCorruption());
+  ASSERT_NOK(dictionary.GetOrCreate("urn:legacy:rejected"));
+  client::TableHandle claims;
+  ASSERT_OK(claims.Open(client::YBTableName(YQL_DATABASE_CQL, ns, "rdf_terms"), client_.get()));
+  client::TableIteratorOptions options;
+  options.columns = std::vector<std::string>{"term_key"};
+  Status error;
+  options.error_handler = [&](const Status& status) { error = status; };
+  for (const auto& row : client::TableRange(claims, options))
+    ASSERT_NE(row.column(0).string_value().substr(0, 5), "term:");
+  ASSERT_OK(error);
+  ASSERT_NO_FATALS(WriteMirror({{last_pack, expected.at(last_pack)}}));
+  ASSERT_OK(dictionary.Init(client_.get(), ns));
+  IdMap restored;
+  ASSERT_OK(dictionary.Restore(&restored));
+  ASSERT_EQ(restored.Size(), expected.size());
+  for (const auto& [pack, entry] : expected) {
+    ASSERT_EQ(restored.Get(entry.second), entry.first);
+    ASSERT_EQ(restored.Lookup(entry.first), entry.second);
+  }
+}
 }  // namespace
 }  // namespace yb::mdb

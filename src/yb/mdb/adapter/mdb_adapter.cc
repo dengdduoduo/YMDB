@@ -71,6 +71,7 @@
 #include "yb/util/uuid.h"
 #include "yb/mdb/model/rdf_yb_model.h"
 #include "yb/mdb/storage/yb_client_compat.h"
+#include "yb/mdb/storage/legacy_dictionary_scan.h"
 #include "yb/mdb/storage/rdf_table_schema.h"
 #include "yb/mdb/storage/docdb_read_context.h"
 #include "yb/mdb/query/distributed/fragment_gather.h"
@@ -89,6 +90,9 @@ using yb::MonoDelta;
 using yb::Status;
 using yb::YQL_DATABASE_CQL;
 using namespace SPARQL;
+
+DEFINE_bool(mdb_init_profile, false,
+            "Log MDB cluster initialization stage wall times to stderr");
 
 DEFINE_test_flag(int32, mdb_pause_before_dictionary_mirror_ms, 0,
                  "Pause after imported data commits and before its legacy dictionary mirror");
@@ -224,29 +228,25 @@ Status LoadIdMapFromDocDB() {
   g_gmap_to_uri.clear();
   g_gmap_to_pack.clear();
 
-  yb::client::TableIteratorOptions options;
-  options.columns = std::vector<std::string>{"pack_id", "gmap_id", "uri"};
-  Status scan_status;
-  options.error_handler = [&scan_status](const Status& s) { scan_status = s; };
-  for (const auto& row : yb::client::TableRange(table, options)) {
-    int64_t pack_id = row.column(0).int64_value();
-    int64_t gmap_id = row.column(1).int64_value();
-    if (row.column(2).IsNull()) {
-      return STATUS(Corruption, "Missing persisted RDF term");
-    }
-    auto uri = row.column(2).string_value();
-    if (gmap_id <= 0 || !g_id_map->Restore(static_cast<uint64_t>(gmap_id), uri)) {
-      return STATUS(Corruption, "Conflicting persisted RDF term mapping");
-    }
-    try {
-      auto term = yb::mdb::DecodeRdfDictionaryEntry(uri, ObjectId(static_cast<uint64_t>(pack_id)));
-      yb::mdb::RegisterRdfIdentity(static_cast<uint64_t>(gmap_id), term);
-    } catch (const std::exception& error) {
-      return STATUS(Corruption, error.what());
-    }
-  }
-
-  RETURN_NOT_OK(scan_status);
+  RETURN_NOT_OK(yb::mdb::ScanLegacyDictionaryRows(
+      table, g_yb_client.get(), {"pack_id", "gmap_id", "uri"}, [&](const auto& row) -> Status {
+        if (row.column(0).IsNull() || row.column(1).IsNull() || row.column(2).IsNull()) {
+          return STATUS(Corruption, "Missing persisted RDF term");
+        }
+        const int64_t pack_id = row.column(0).int64_value();
+        const int64_t gmap_id = row.column(1).int64_value();
+        const auto uri = row.column(2).string_value();
+        if (gmap_id <= 0 || !g_id_map->Restore(static_cast<uint64_t>(gmap_id), uri)) {
+          return STATUS(Corruption, "Conflicting persisted RDF term mapping");
+        }
+        try {
+          auto term = yb::mdb::DecodeRdfDictionaryEntry(uri, ObjectId(static_cast<uint64_t>(pack_id)));
+          yb::mdb::RegisterRdfIdentity(static_cast<uint64_t>(gmap_id), term);
+        } catch (const std::exception& error) {
+          return STATUS(Corruption, error.what());
+        }
+        return Status::OK();
+      }));
   RETURN_NOT_OK(yb::mdb::RdfYBModel::Instance().RestoreTermMap(*g_id_map));
   LOG(INFO) << "Loaded " << g_pack_to_gmap.size() << " idmap entries";
   return Status::OK();
@@ -938,6 +938,30 @@ int YBCMdbShutdown() {
 }
 
 int YBCMdbInitCluster(const char* master_addrs, const char* keyspace) {
+  const bool profile = FLAGS_mdb_init_profile;
+  const auto started = profile ? yb::mdb::WallMicros() : 0;
+  uint64_t reset_us = 0, clock_us = 0, client_us = 0, namespace_us = 0;
+  uint64_t rdf_tables_us = 0, idmap_table_us = 0, model_us = 0, dictionary_us = 0;
+  bool initialized = false;
+  const char* stage = "adapter_guard";
+  // Registered before initialization_cleanup so failure cleanup is in total_us.
+  auto profile_cleanup = yb::ScopeExit([&] {
+    if (!profile) return;
+    LOG(INFO) << "MDB_INIT_PROFILE {\"success\":" << (initialized ? "true" : "false")
+              << ",\"last_stage\":\"" << stage << "\",\"reset_us\":" << reset_us
+              << ",\"clock_us\":" << clock_us << ",\"client_us\":" << client_us
+              << ",\"namespace_us\":" << namespace_us
+              << ",\"rdf_tables_us\":" << rdf_tables_us
+              << ",\"idmap_table_us\":" << idmap_table_us << ",\"model_us\":" << model_us
+              << ",\"dictionary_us\":" << dictionary_us
+              << ",\"total_us\":" << yb::mdb::WallMicros() - started << "}";
+  });
+  auto timed = [&](const char* name, uint64_t& elapsed, auto&& action) {
+    stage = name;
+    if (!profile) return action();
+    yb::mdb::WallTimeScope timer(&elapsed);
+    return action();
+  };
   AdapterScope scope;
   if (!scope.entered()) return 1;
   if (master_addrs == nullptr || keyspace == nullptr) {
@@ -950,27 +974,32 @@ int YBCMdbInitCluster(const char* master_addrs, const char* keyspace) {
   const auto worker_options = model.GetWorkerOptions();
   // The model stores a borrowed client pointer. Drop it before replacing an
   // owned client, also when switching namespaces or retrying a failed Init.
-  ResetAdapter();
-  model.SetWorkerOptions(worker_options);
-  g_keyspace = keyspace_str;
-  bool initialized = false;
+  timed("reset", reset_us, [&] {
+    ResetAdapter();
+    model.SetWorkerOptions(worker_options);
+    g_keyspace = keyspace_str;
+  });
   auto initialization_cleanup = yb::ScopeExit([&] {
     if (!initialized) ResetAdapter();
   });
 
   LOG(INFO) << "Connecting to masters at " << master_addrs_str;
 
-  g_clock = make_scoped_refptr<yb::server::HybridClock>();
-  auto clock_status = g_clock->Init();
+  auto clock_status = timed("clock", clock_us, [&] {
+    g_clock = make_scoped_refptr<yb::server::HybridClock>();
+    return g_clock->Init();
+  });
   if (!clock_status.ok()) {
     LOG(WARNING) << "Failed to init HybridClock: " << clock_status;
     return 1;
   }
 
-  auto client_result = yb::client::YBClientBuilder()
-      .add_master_server_addr(master_addrs_str)
-      .default_admin_operation_timeout(MonoDelta::FromSeconds(30))
-      .Build(nullptr, g_clock);
+  auto client_result = timed("client", client_us, [&] {
+    return yb::client::YBClientBuilder()
+        .add_master_server_addr(master_addrs_str)
+        .default_admin_operation_timeout(MonoDelta::FromSeconds(30))
+        .Build(nullptr, g_clock);
+  });
 
   if (!client_result.ok()) {
     LOG(WARNING) << "Failed to create YBClient: " << client_result.status();
@@ -979,37 +1008,43 @@ int YBCMdbInitCluster(const char* master_addrs, const char* keyspace) {
 
   g_yb_client = std::move(*client_result);
 
-  auto ns_status = g_yb_client->CreateNamespaceIfNotExists(
-      g_keyspace, YQL_DATABASE_CQL);
+  auto ns_status = timed("namespace", namespace_us, [&] {
+    return g_yb_client->CreateNamespaceIfNotExists(g_keyspace, YQL_DATABASE_CQL);
+  });
   if (!ns_status.ok()) {
     LOG(WARNING) << "Failed to create namespace: " << ns_status;
     return 1;
   }
 
-  for (int i = 0; i < 6; i++) {
-    yb::client::YBTableName table_name(
-        YQL_DATABASE_CQL, g_keyspace,
-        yb::mdb::RdfYBModel::kTableNames[i]);
+  timed("rdf_tables", rdf_tables_us, [&] {
+    for (int i = 0; i < 6; i++) {
+      yb::client::YBTableName table_name(
+          YQL_DATABASE_CQL, g_keyspace,
+          yb::mdb::RdfYBModel::kTableNames[i]);
 
-    yb::client::YBSchemaBuilder builder;
-    yb::mdb::ConfigureRdfTableSchema(&builder);
+      yb::client::YBSchemaBuilder builder;
+      yb::mdb::ConfigureRdfTableSchema(&builder);
 
-    yb::client::TableHandle tmp;
-    auto status = tmp.Create(table_name, 1, g_yb_client.get(), &builder);
-    if (!status.ok()) {
-      LOG(INFO) << "Table " << yb::mdb::RdfYBModel::kTableNames[i]
-                << ": " << status;
+      yb::client::TableHandle tmp;
+      auto status = tmp.Create(table_name, 1, g_yb_client.get(), &builder);
+      if (!status.ok()) {
+        LOG(INFO) << "Table " << yb::mdb::RdfYBModel::kTableNames[i]
+                  << ": " << status;
+      }
     }
-  }
+  });
 
-  auto create_idmap_status = CreateIdMapTable();
+  auto create_idmap_status = timed("idmap_table", idmap_table_us, [&] {
+    return CreateIdMapTable();
+  });
   if (!create_idmap_status.ok()) {
     LOG(WARNING) << "Failed to create RDF dictionary: " << create_idmap_status;
     return 1;
   }
 
-  auto init_status = yb::mdb::RdfYBModel::Instance().Init(
-      g_yb_client.get(), g_keyspace);
+  auto init_status = timed("model", model_us, [&] {
+    return model.Init(g_yb_client.get(), g_keyspace);
+  });
   if (!init_status.ok()) {
     LOG(WARNING) << "Failed to init RdfYBModel: " << init_status;
     return 1;
@@ -1017,7 +1052,9 @@ int YBCMdbInitCluster(const char* master_addrs, const char* keyspace) {
 
   g_id_map = std::make_unique<yb::mdb::IdMap>();
 
-  auto load_idmap_status = LoadIdMapFromDocDB();
+  auto load_idmap_status = timed("dictionary", dictionary_us, [&] {
+    return LoadIdMapFromDocDB();
+  });
   if (!load_idmap_status.ok()) {
     LOG(WARNING) << "Failed to restore RDF dictionary: " << load_idmap_status;
     return 1;

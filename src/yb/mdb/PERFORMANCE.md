@@ -47,6 +47,20 @@ directory through MDB_STAGE9_DATASETS when invoking one baseline case with
 yb_build.sh. A matching hash identifies input bytes; it is not a correctness or
 performance result by itself.
 
+## Cluster initialization profile
+
+`--mdb_init_profile=true` emits one `MDB_INIT_PROFILE` JSON record through
+the logger on successful or failed cluster initialization. It defaults off.
+It reports reset, clock, client creation, namespace, RDF table checks,
+legacy dictionary table checks, model initialization, and dictionary loading
+in monotonic wall microseconds. `success` and `last_stage` identify the
+completed initialization or the stage where it stopped. Stage durations are
+disjoint; `total_us` also includes unclassified work and failure cleanup.
+The model stage includes table opens and persistent dictionary initialization;
+dictionary loading includes the legacy mirror scan and authoritative restore.
+These counters do not separate every dictionary scan or measure CPU/RPC time.
+Result stdout and query dictionary refresh remain unchanged.
+
 ## Shutdown and rejected samples
 
 The adapter owns its cluster client. Call YBCMdbShutdown before process teardown
@@ -97,6 +111,21 @@ InitStats counts legacy term claim attempts, not total storage or wire RPCs.
 Controlled dictionary seeding is outside timing. First is not cold-cache;
 two CLI observations do not establish tail latency or multi-machine scaling.
 
+
+## Legacy mirror pages
+
+Both legacy migration and adapter dictionary loading scan rdf_idmap with
+MDB-owned strong 1024-row pages. They share the same scanner; the generic
+client TableIterator retains its 128-row behavior. Empty pages follow their
+continuation across tablets. The preceding operation retains its arena while
+its continuation is copied, and a new arena is used for each page. Errors,
+non-advancing continuations and oversized row counts fail the scan.
+
+Row/null/ID checks, complete conflict validation before migration publishes
+claims, counter checks and per-query authoritative refresh remain enabled.
+The row limit is not a strict byte limit: long terms can make a page large,
+and the full dictionary still uses O(N) memory. Optional LegacyDictionaryScanStats
+counts visited rows, page operations and response bytes, not wire RPCs or RSS.
 
 ## Authoritative dictionary pages
 

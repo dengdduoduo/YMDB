@@ -13,6 +13,7 @@
 #include "yb/common/schema_pbutil.h"
 #include "yb/mdb/import/import.h"
 #include "yb/mdb/storage/yb_client_compat.h"
+#include "yb/mdb/storage/legacy_dictionary_scan.h"
 #include "yb/qlexpr/ql_rowblock.h"
 
 namespace yb::mdb {
@@ -116,18 +117,17 @@ Status PersistentIdMap::MigrateLegacy(const std::string& namespace_name) {
   if (status.IsNotFound()) return Status::OK();
   RETURN_NOT_OK(status);
   IdMap restored;
-  Status scan_status;
-  client::TableIteratorOptions options;
-  options.columns = std::vector<std::string>{"gmap_id", "uri"};
-  options.error_handler = [&scan_status](const Status& s) { scan_status = s; };
-  for (const auto& row : client::TableRange(legacy, options)) {
-    auto id = row.column(0).int64_value();
-    if (id <= 0 || row.column(1).IsNull() ||
-        !restored.Restore(static_cast<uint64_t>(id), row.column(1).string_value())) {
-      return STATUS(Corruption, "Conflicting or incomplete legacy RDF dictionary");
-    }
-  }
-  RETURN_NOT_OK(scan_status);
+  RETURN_NOT_OK(ScanLegacyDictionaryRows(
+      legacy, client_, {"gmap_id", "uri"}, [&](const auto& row) -> Status {
+        if (row.column(0).IsNull() || row.column(1).IsNull())
+          return STATUS(Corruption, "Incomplete legacy RDF dictionary row");
+        const auto id = row.column(0).int64_value();
+        if (id <= 0 ||
+            !restored.Restore(static_cast<uint64_t>(id), row.column(1).string_value())) {
+          return STATUS(Corruption, "Conflicting or incomplete legacy RDF dictionary");
+        }
+        return Status::OK();
+      }));
   init_stats_.legacy_terms = restored.Size();
   RETURN_NOT_OK(EnsureMinimumId(static_cast<int64_t>(restored.MaxId())));
   if (restored.Size() == 0) return Status::OK();
