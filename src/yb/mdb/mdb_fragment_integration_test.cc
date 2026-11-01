@@ -62,6 +62,14 @@ DECLARE_int64(mem_tracker_tcmalloc_gc_release_bytes);
 namespace yb::mdb {
 namespace {
 
+template <class Session>
+void ResetTestSessionArena(const Session& session) {
+  // Older clients own operation storage without a session arena.
+  if constexpr (requires { session->ResetArena(nullptr); }) {
+    session->ResetArena(nullptr);
+  }
+}
+
 constexpr const char* kQuery =
     "SELECT ?o WHERE { ?s <urn:p6:9000> ?k . ?k <urn:p6:9001> ?o }";
 std::string Iri(uint64_t id) { return "urn:p6:" + std::to_string(id); }
@@ -2958,7 +2966,7 @@ class MdbDictionaryInitTest : public MdbDictionaryRecoveryTest {
       ASSERT_OK(session->TEST_Flush());
       for (const auto& op : pending) ASSERT_EQ(op->response().status(), QLResponsePB::YQL_STATUS_OK);
       pending.clear();
-      session->ResetArena(nullptr);
+      ResetTestSessionArena(session);
     };
     for (const auto& [id, key] : entries) {
       const auto identity = SPARQL::RdfTermIdentity::IsKey(key) ? SPARQL::RdfTermIdentity::Decode(key)
@@ -3132,7 +3140,7 @@ class MdbDictionaryScanTest : public MdbDictionaryInitTest {
       ASSERT_OK(session->TEST_Flush());
       for (const auto& op : pending) ASSERT_EQ(op->response().status(), QLResponsePB::YQL_STATUS_OK);
       pending.clear();
-      session->ResetArena(nullptr);
+      ResetTestSessionArena(session);
     };
     for (const auto& [id, key] : expected) {
       auto op = NewMdbInsertOp(claims_, session);
@@ -5972,7 +5980,7 @@ class MdbLegacyDictionaryScanTest : public MdbDictionaryInitTest {
       ASSERT_OK(session->TEST_Flush());
       for (const auto& op : pending) ASSERT_EQ(op->response().status(), QLResponsePB::YQL_STATUS_OK);
       pending.clear();
-      session->ResetArena(nullptr);
+      ResetTestSessionArena(session);
     };
     for (const auto& [pack, entry] : rows) {
       auto op = NewMdbInsertOp(mirror_, session);
