@@ -1,5 +1,6 @@
 // Copyright (c) YugabyteDB, Inc.
 #include "yb/mdb/query/distributed/fragment_worker.h"
+#include "yb/mdb/query/distributed/graph_fragment.h"
 
 #include <algorithm>
 #include <array>
@@ -46,6 +47,7 @@ class PhaseTimer {
 class Worker {
  public:
   ~Worker() {
+    graph_.reset();
     prefetch_.clear();
     levels_.clear();
     if (session_) session_->SetTransaction(nullptr);
@@ -89,6 +91,14 @@ class Worker {
       session_ = client_->NewSession(MonoDelta::FromMilliseconds(open.timeout_ms()));
       session_->SetTransaction(transaction_);
     }
+    if (open.graph_version()) {
+      graph_ = std::make_unique<GraphFragment>();
+      std::array<const client::TableHandle*, 6> tables;
+      for (size_t i = 0; i < 6; ++i) {
+        tables[i] = &tables_[i];
+      }
+      return graph_->Open(open, tables, session_, deadline_);
+    }
     const auto spare = open.memory_bytes() - FragmentBufferedReservation(open);
     const uint64_t per_probe = sizeof(Prefetch) + 8192 + uint64_t(open.page_rows()) * 256 +
         uint64_t(open.variable_count()) * 16;
@@ -114,7 +124,35 @@ class Worker {
     return NextImpl(response);
   }
 
+  Status NextGraph(FragmentResponsePB* response) {
+    uint32_t rows = 0;
+    while (rows < open_.batch_rows()) {
+      GraphBinding row;
+      if (!VERIFY_RESULT(graph_->Next(&row))) {
+        auto result = VERIFY_RESULT(transaction_->FinishChild());
+        if (transaction_->IsRestartRequired()) {
+          return STATUS(TryAgain, "Graph child read view requires restart");
+        }
+        *response->mutable_transaction_result() = std::move(result);
+        response->set_eof(true);
+        break;
+      }
+      for (auto variable : open_.projection()) {
+        response->add_values(row.values[variable]);
+      }
+      ++rows;
+    }
+    graph_rows_ += rows;
+    response->set_graph_version(1);
+    response->set_graph_rows(graph_rows_);
+    response->set_rows(rows);
+    response->set_read_operations(graph_->read_operations());
+    return Status::OK();
+  }
   Status NextImpl(FragmentResponsePB* response) {
+    if (graph_) {
+      return NextGraph(response);
+    }
     uint32_t rows = 0;
     // A work quantum permits empty nonterminal responses without monopolizing Gather.
     for (size_t work = 0; work < 4096 && rows < open_.batch_rows(); ++work) {
@@ -359,6 +397,8 @@ class Worker {
     return Status::OK();
   }
 
+  std::unique_ptr<GraphFragment> graph_;
+  uint64_t graph_rows_ = 0;
   FragmentOpenPB open_;
   CoarseTimePoint deadline_;
   scoped_refptr<server::Clock> clock_;
@@ -399,7 +439,7 @@ Status RunFragmentWorker(int input_fd, int output_fd) {
     FragmentRequestPB request;
     RETURN_NOT_OK(ReadFragmentFrame(input_fd, &request, deadline));
     FragmentResponsePB response;
-    response.set_version(kFragmentVersion);
+    response.set_version(request.version());
     response.set_query_id(request.query_id());
     response.set_fragment_id(request.fragment_id());
     response.set_attempt_id(request.attempt_id());
@@ -407,20 +447,29 @@ Status RunFragmentWorker(int input_fd, int output_fd) {
     response.set_batch_seq(request.batch_seq());
     response.set_worker_pid(getpid());
     auto handle = [&]() -> Status {
-      if (request.version() != kFragmentVersion || request.query_id().empty() ||
-          request.query_id().size() > 64 || request.attempt_id() != 1 ||
-          request.stream_id() != request.fragment_id() || request.batch_seq() != sequence)
+      if ((request.version() != kFragmentVersion && request.version() != 2) ||
+          request.query_id().empty() || request.query_id().size() > 64 ||
+          request.attempt_id() != 1 || request.stream_id() != request.fragment_id() ||
+          request.batch_seq() != sequence) {
         return STATUS(InvalidArgument, "MDB worker envelope/version/sequence mismatch");
+      }
       if (sequence == 0) {
         if (!request.has_open()) return STATUS(InvalidArgument, "MDB worker requires OPEN");
+        if ((request.version() == 2) != (request.open().graph_version() == 1)) {
+          return STATUS(NotSupported, "Graph executor requires explicit version-2 envelope");
+        }
         first = request;
         RETURN_NOT_OK(worker.Open(request.open()));
         deadline = worker.deadline();
+        if (request.version() == 2) {
+          response.set_graph_version(1);
+        }
         return Status::OK();
       }
-      if (request.has_open() || request.query_id() != first.query_id() ||
-          request.fragment_id() != first.fragment_id())
+      if (request.version() != first.version() || request.has_open() ||
+          request.query_id() != first.query_id() || request.fragment_id() != first.fragment_id()) {
         return STATUS(InvalidArgument, "MDB worker stream identity changed");
+      }
       return worker.Next(&response);
     };
     auto status = handle();

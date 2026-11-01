@@ -75,6 +75,7 @@
 #include "yb/mdb/storage/rdf_table_schema.h"
 #include "yb/mdb/storage/docdb_read_context.h"
 #include "yb/mdb/query/distributed/fragment_gather.h"
+#include "yb/mdb/query/distributed/graph_fragment.h"
 #include "yb/mdb/query/distributed/global_topk.h"
 #include "yb/mdb/query/distributed/global_distinct.h"
 #include "yb/mdb/query/distributed/global_count.h"
@@ -450,6 +451,12 @@ int ExecuteSparql(
     return 0;
   }
 
+  // Graph planning needs the original VALUES relation, before constant folding
+  // replaces a singleton seed with BIND and substitutes its graph variables.
+  std::unique_ptr<Op> graph_candidate;
+  if (yb::mdb::RdfYBModel::Instance().GetWorkerOptions().UsesGraphPlanning()) {
+    graph_candidate = op->clone();
+  }
   op = QueryParser::rewrite(std::move(op));
   const auto parse_finished = yb::mdb::WallMicros();
 
@@ -500,8 +507,28 @@ int ExecuteSparql(
   }
   if (g_cluster_initialized || !g_pack_to_gmap.empty() || model.UseStreamingReads())
     RebindOpIds(op);
+  if (graph_candidate) {
+    RebindOpIds(graph_candidate);
+  }
 
   const auto worker_options = model.GetWorkerOptions();
+  const auto graph_mode = worker_options.EffectiveGraphMode();
+  yb::mdb::GraphDecision graph_decision;
+  graph_decision.mode = graph_mode == yb::mdb::GraphMode::Auto  ? "auto"
+                        : graph_mode == yb::mdb::GraphMode::New ? "new"
+                                                                : "old";
+  graph_decision.graph = graph_mode == yb::mdb::GraphMode::New;
+  graph_decision.reason = graph_decision.graph ? "explicit_new" : "explicit_old";
+  if (graph_mode == yb::mdb::GraphMode::Auto) {
+    graph_decision.reason = "no_worker_targets_keep_old";
+  }
+  if (read_context) {
+    read_context->stats.graph_execution_decision = graph_decision.ToJson();
+  }
+  if (graph_mode == yb::mdb::GraphMode::New && worker_options.targets.empty()) {
+    LOG(WARNING) << "Graph worker execution requires worker targets";
+    return 1;
+  }
   if (worker_options.exchange != yb::mdb::ExchangeMode::None && worker_options.targets.empty()) {
     LOG(WARNING) << "MDB exchange requires worker targets";
     return 1;
@@ -512,19 +539,56 @@ int ExecuteSparql(
       return 1;
     }
     const auto plan_started = yb::mdb::WallMicros();
-    auto physical = read_context->batch_options.policy == yb::mdb::JoinPolicy::Index
-        ? yb::mdb::FragmentPlan::Build(*op, model, worker_options)
-        : yb::Result<yb::mdb::FragmentPlan>(STATUS(NotSupported,
-            "Worker hash/auto join policies remain at MDB coordinator"));
+    auto physical =
+        read_context->batch_options.policy == yb::mdb::JoinPolicy::Index
+            ? yb::mdb::FragmentPlan::Build(
+                  *(graph_candidate ? graph_candidate : op), model, worker_options)
+            : yb::Result<yb::mdb::FragmentPlan>(
+                  STATUS(NotSupported, "Worker hash/auto join policies remain at MDB coordinator"));
+    if (graph_mode == yb::mdb::GraphMode::Auto) {
+      graph_decision.reason = "unsupported_shape_keep_old";
+      if (physical.ok()) {
+        graph_decision.reason = "decision_cancelled_or_failed";
+        read_context->stats.graph_execution_decision = graph_decision.ToJson();
+        auto choice =
+            yb::mdb::ChooseGraphExecution(*physical, model, *read_context, worker_options);
+        if (!choice.ok()) {
+          LOG(WARNING) << "Graph execution decision failed: " << choice.status();
+          read_context->stats.adapter_plan_us += yb::mdb::WallMicros() - plan_started;
+          return 1;
+        }
+        graph_decision = *choice;
+      }
+      if ((physical.ok() && !graph_decision.graph) ||
+          (!physical.ok() && physical.status().IsNotSupported())) {
+        auto legacy = worker_options;
+        legacy.graph_native = false;
+        legacy.graph_mode = yb::mdb::GraphMode::Old;
+        physical = read_context->batch_options.policy == yb::mdb::JoinPolicy::Index
+                       ? yb::mdb::FragmentPlan::Build(*op, model, legacy)
+                       : yb::Result<yb::mdb::FragmentPlan>(
+                             STATUS(NotSupported, "Retain coordinator join policy"));
+      }
+    } else if (!physical.ok() && physical.status().IsNotSupported()) {
+      graph_decision.graph = false;
+      graph_decision.reason = "unsupported_shape_keep_old";
+    }
+    read_context->stats.graph_execution_decision = graph_decision.ToJson();
     read_context->stats.adapter_plan_us += yb::mdb::WallMicros() - plan_started;
     if (!physical.ok()) {
       if (!physical.status().IsNotSupported()) {
         LOG(WARNING) << "MDB fragment planning failed: " << physical.status();
         return 1;
       }
+      if (worker_options.UsesGraphPlanning()) {
+        LOG(INFO) << "Graph capability fallback: " << physical.status();
+      }
       // Capability fallback happens only before remote work or output starts.
       ++read_context->stats.remote_coordinator_fallbacks;
     } else {
+      if (physical->physical.graph_version() && graph_candidate) {
+        op = std::move(graph_candidate);
+      }
       yb::mdb::WallTimeScope timer(&read_context->stats.adapter_execute_us);
       read_context->stats.distributed_join_advisory = physical->join_statistics_advisory;
       read_context->stats.sampled_join_order = physical->sampled_join_order;

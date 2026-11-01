@@ -23,6 +23,8 @@ class DocDBReadContext {
  public:
   static Result<std::unique_ptr<DocDBReadContext>> Create(
       client::YBClient* client, const std::shared_ptr<client::TransactionManager>& manager);
+  // Borrow a worker-owned child session; its owner finishes the child transaction.
+  static std::unique_ptr<DocDBReadContext> BorrowChildSession(client::YBSessionPtr session);
   ~DocDBReadContext();
   Result<ChildTransactionDataPB> ExportChild();
   Status ApplyChild(const ChildTransactionResultPB& result);

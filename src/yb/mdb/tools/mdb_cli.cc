@@ -47,6 +47,9 @@ DEFINE_uint32(mdb_join_memory_bytes, 4194304, "Per-join buffered-state budget, e
 DEFINE_uint32(mdb_join_max_in_flight, 8, "Maximum index probe page operations per flush");
 DEFINE_uint32(mdb_join_negative_cache_entries, 256, "Maximum cached empty index probes per join");
 DEFINE_bool(mdb_query_profile, false, "Print streaming query operation/payload/buffer counts to stderr");
+DEFINE_NON_RUNTIME_bool(mdb_graph_native, false, "Opt-in versioned graph fragment execution");
+DEFINE_NON_RUNTIME_string(mdb_graph_mode, "",
+                          "Graph mode: old, new, auto; empty uses mdb_graph_native");
 DEFINE_string(mdb_worker_targets, "", "Comma-separated SSH destinations, or local for isolated local processes");
 DEFINE_string(mdb_worker_binary, "", "Absolute mdb_fragment_worker path on every destination");
 DEFINE_string(mdb_worker_flagfile, "", "Optional absolute worker-local flagfile for YB client TLS configuration");
@@ -128,6 +131,23 @@ static int RunQuery(int argc, char* argv[]) {
   yb::mdb::RdfYBModel::Instance().SetBatchJoinOptions(options);
   yb::mdb::WorkerOptions workers;
   workers.sample_join_order = FLAGS_mdb_sample_join_order;
+  workers.graph_native = FLAGS_mdb_graph_native;
+  if (!FLAGS_mdb_graph_mode.empty()) {
+    if (FLAGS_mdb_graph_mode == "old") {
+      workers.graph_mode = yb::mdb::GraphMode::Old;
+    } else if (FLAGS_mdb_graph_mode == "new") {
+      workers.graph_mode = yb::mdb::GraphMode::New;
+    } else if (FLAGS_mdb_graph_mode == "auto") {
+      workers.graph_mode = yb::mdb::GraphMode::Auto;
+    } else {
+      std::cerr << "Invalid --mdb_graph_mode" << std::endl;
+      return 1;
+    }
+    if (FLAGS_mdb_graph_native && workers.graph_mode != yb::mdb::GraphMode::New) {
+      std::cerr << "Conflicting --mdb_graph_mode and --mdb_graph_native" << std::endl;
+      return 1;
+    }
+  }
   if (FLAGS_mdb_exchange == "hash") workers.exchange = yb::mdb::ExchangeMode::Hash;
   else if (FLAGS_mdb_exchange == "broadcast") workers.exchange = yb::mdb::ExchangeMode::Broadcast;
   else if (FLAGS_mdb_exchange != "none") {

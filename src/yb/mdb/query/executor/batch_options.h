@@ -61,6 +61,8 @@ struct BatchQueryStats {
   std::string join_decisions;
   std::string distributed_join_advisory = "null";
   std::string sampled_join_order = "null";
+  std::string graph_execution_decision = "null";
+  uint64_t graph_native_workers = 0, graph_expand_rows = 0;
   uint64_t remote_read_operations = 0;
   uint64_t remote_fragments = 0;
   uint64_t remote_max_workers = 0;

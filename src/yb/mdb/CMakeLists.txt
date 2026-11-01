@@ -59,6 +59,8 @@ set(MDB_IMPORT_SRCS
 
 set(MDB_DISTRIBUTED_SRCS
     query/distributed/fragment_plan.cc
+    query/distributed/graph_fragment.cc
+    query/distributed/graph_fragment_plan.cc
     query/distributed/fragment_transport.cc
     query/distributed/fragment_worker.cc
     query/distributed/fragment_gather.cc
@@ -72,6 +74,8 @@ set(MDB_DISTRIBUTED_SRCS
 
 set(MDB_CORE_SRCS
     query/executor/batch_operator.cc
+    query/executor/graph_expand.cc
+    query/executor/graph_expand_pipeline.cc
     query/executor/batch_index_join.cc
     query/executor/hash_join.cc
     query/id.cc

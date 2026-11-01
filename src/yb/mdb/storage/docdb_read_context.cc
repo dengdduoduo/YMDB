@@ -30,6 +30,13 @@ Result<std::unique_ptr<DocDBReadContext>> DocDBReadContext::Create(
   return context;
 }
 
+std::unique_ptr<DocDBReadContext> DocDBReadContext::BorrowChildSession(
+    client::YBSessionPtr session) {
+  auto context = std::unique_ptr<DocDBReadContext>(new DocDBReadContext());
+  context->session = std::move(session);
+  return context;
+}
+
 DocDBReadContext::~DocDBReadContext() {
   if (session) session->SetTransaction(nullptr);
   if (transaction_) transaction_->Abort();

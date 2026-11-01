@@ -29,6 +29,11 @@ message FragmentOpenPB {
   optional uint32 page_rows = 12;
   optional uint64 memory_bytes = 13;
   optional string id_namespace = 14 [default = "rdf_idmap-v1"];
+  // Mandatory execution capability when envelope version is 2.
+  optional uint32 graph_version = 20;
+  repeated fixed64 graph_seed_values = 21 [packed = true];
+  optional uint32 graph_seed_rows = 22;
+  optional bool graph_seeded = 23;
 }
 
 message FragmentRequestPB {
@@ -56,4 +61,6 @@ message FragmentResponsePB {
   optional ChildTransactionResultPB transaction_result = 11;
   optional uint64 worker_pid = 12;
   optional uint64 read_operations = 13;
+  optional uint32 graph_version = 20;
+  optional uint64 graph_rows = 21;
 }

@@ -119,7 +119,7 @@ Status GatherInputs(const std::array<const FragmentPlan*, 2>& plans, size_t inpu
     auto stream = std::make_unique<Stream>();
     stream->input = side;
     auto& request = stream->request;
-    request.set_version(kFragmentVersion);
+    request.set_version(plan.physical.graph_version() ? 2 : kFragmentVersion);
     request.set_query_id(query_id);
     request.set_fragment_id(fragment);
     request.set_attempt_id(1);
@@ -162,6 +162,11 @@ Status GatherInputs(const std::array<const FragmentPlan*, 2>& plans, size_t inpu
   };
   while (fragment < task_count && active.size() < options.max_workers) RETURN_NOT_OK(start());
   auto open_ack = [&](Stream& stream, const FragmentResponsePB& response) -> Status {
+    if (plans[stream.input]->physical.graph_version()) {
+      if (response.graph_version() != 1)
+        return STATUS(NotSupported, "Worker did not acknowledge graph execution capability");
+      ++context.stats.graph_native_workers;
+    }
     if (response.rows() || response.values_size() || response.eof())
       return STATUS(Corruption, "Unexpected MDB OPEN acknowledgement payload");
     if (!context.stats.remote_worker_pids.empty()) context.stats.remote_worker_pids += ',';
@@ -239,6 +244,7 @@ Status GatherInputs(const std::array<const FragmentPlan*, 2>& plans, size_t inpu
         }
         RETURN_NOT_OK(sink(stream.input, row));
         ++context.stats.remote_rows;
+        if (plans[stream.input]->physical.graph_version()) ++context.stats.graph_expand_rows;
       }
     }
     if (response.eof()) {

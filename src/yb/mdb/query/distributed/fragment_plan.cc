@@ -1,5 +1,7 @@
 // Copyright (c) YugabyteDB, Inc.
 #include "yb/mdb/query/distributed/fragment_plan.h"
+#include "yb/mdb/query/distributed/graph_fragment.h"
+#include "query/parser/op/sparql/op_filter.h"
 
 #include <algorithm>
 #include <array>
@@ -279,7 +281,9 @@ Status FragmentPlan::ValidateCoverage(const std::vector<TabletInfo>& tasks) {
 }
 
 uint64_t FragmentBufferedReservation(const FragmentOpenPB& open) {
-  return 4 * kFragmentMaxFrame + uint64_t(open.triples_size()) *
+  const uint64_t graph_buffers = open.graph_version() ?
+      65536 + 128 * uint64_t(open.variable_count() + 4) * 16 + uint64_t(open.page_rows()) * 96 : 0;
+  return graph_buffers + 4 * kFragmentMaxFrame + uint64_t(open.triples_size()) *
       (uint64_t(open.variable_count()) * 8 + uint64_t(open.page_rows()) * 96 + 4096);
 }
 
@@ -293,6 +297,7 @@ Status ValidateFragmentOpen(const FragmentOpenPB& open) {
       !open.batch_rows() || open.batch_rows() > 256 || !open.page_rows() || open.page_rows() > 256 ||
       !open.timeout_ms() || open.timeout_ms() > 30000)
     return STATUS(InvalidArgument, "MDB fragment dimensions exceed supported limits");
+  if (open.has_graph_version()) RETURN_NOT_OK(ValidateGraphProgram(open));
   // Include all frame copies, depth-first bindings, decoded pages and protocol slack.
   const uint64_t reserved = FragmentBufferedReservation(open);
   if (open.memory_bytes() < reserved || open.memory_bytes() > 64 * 1024 * 1024)
@@ -323,6 +328,7 @@ Status ValidateFragmentOpen(const FragmentOpenPB& open) {
 
 Result<FragmentPlan> FragmentPlan::Build(
     const SPARQL::Op& root, RdfYBModel& model, const WorkerOptions& options) {
+  if (options.UsesGraphPlanning()) return BuildGraphFragment(root, model, options);
   auto* select = dynamic_cast<const SPARQL::OpSelect*>(&root);
   if (!select || !select->op || select->is_sub_select)
     return STATUS(NotSupported, "Worker input requires a root SELECT");
@@ -822,6 +828,7 @@ std::unique_ptr<SPARQL::Op>* FragmentPlan::InputSlot(SPARQL::Op& root) {
     if (auto* order = dynamic_cast<SPARQL::OpOrderBy*>(slot->get())) slot = &order->op;
     else if (auto* having = dynamic_cast<SPARQL::OpHaving*>(slot->get())) slot = &having->op;
     else if (auto* group = dynamic_cast<SPARQL::OpGroupBy*>(slot->get())) slot = &group->op;
+    else if (auto* filter = dynamic_cast<SPARQL::OpFilter*>(slot->get())) slot = &filter->op;
     else return slot;
   }
 }

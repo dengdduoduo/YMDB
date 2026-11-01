@@ -1,55 +1,61 @@
 // Copyright (c) YugabyteDB, Inc.
-#include <gtest/gtest.h>
 #include <arpa/inet.h>
-#include "yb/mdb/query/distributed/fragment_transport.h"
-#include "yb/mdb/query/distributed/global_count.h"
-#include <limits>
-#include "yb/mdb/import/persistent_id_map.h"
-#include "yb/util/test_thread_holder.h"
-#include "yb/mdb/query/executor/wall_time_scope.h"
-#include "yb/mdb/storage/managed_transaction.h"
-#include "yb/client/transaction.h"
-#include "yb/client/transaction_manager.h"
-#include "yb/server/clock.h"
-#include <iomanip>
-#include "rapidjson/document.h"
-#include <algorithm>
-#include <chrono>
-#include <cerrno>
-#include <cstdlib>
-#include <csignal>
-#include <fstream>
-#include <filesystem>
 #include <pwd.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
+#include <algorithm>
+#include <cerrno>
+#include <chrono>
+#include <csignal>
+#include <cstdlib>
+#include <filesystem>
+#include <fstream>
+#include <iomanip>
+#include <limits>
 #include <map>
 #include <set>
 #include <sstream>
 #include <thread>
-#include <unistd.h>
 
+#include "rapidjson/document.h"
 #include "yb/client/schema.h"
 #include "yb/client/table.h"
-#include "yb/common/ql_protocol_util.h"
 #include "yb/client/table_handle.h"
+#include "yb/client/transaction.h"
+#include "yb/client/transaction_manager.h"
 #include "yb/client/yb_table_name.h"
+#include "yb/common/ql_protocol_util.h"
 #include "yb/integration-tests/mini_cluster.h"
 #include "yb/integration-tests/yb_mini_cluster_test_base.h"
 #include "yb/mdb/adapter/mdb_adapter.h"
+#include "yb/mdb/import/persistent_id_map.h"
 #include "yb/mdb/import/rdf_term.h"
 #include "yb/mdb/model/rdf_yb_model.h"
+#include "yb/mdb/query/distributed/exchange.h"
+#include "yb/mdb/query/distributed/fragment_gather.h"
+#include "yb/mdb/query/distributed/fragment_transport.h"
+#include "yb/mdb/query/distributed/global_count.h"
+#include "yb/mdb/query/distributed/graph_fragment.h"
+#include "yb/mdb/query/distributed/tablet_router.h"
+#include "yb/mdb/query/executor/graph_expand.h"
+#include "yb/mdb/query/executor/graph_expand_pipeline.h"
+#include "yb/mdb/query/executor/wall_time_scope.h"
 #include "yb/mdb/storage/docdb_read_context.h"
+#include "yb/mdb/storage/docdb_scan_cursor.h"
+#include "yb/mdb/storage/legacy_dictionary_scan.h"
+#include "yb/mdb/storage/managed_transaction.h"
 #include "yb/mdb/storage/rdf_table_schema.h"
 #include "yb/mdb/storage/yb_client_compat.h"
-#include "yb/mdb/storage/legacy_dictionary_scan.h"
-#include "yb/mdb/query/distributed/tablet_router.h"
-#include "yb/mdb/query/distributed/fragment_gather.h"
-#include "yb/mdb/query/distributed/exchange.h"
+#include "yb/server/clock.h"
 #include "yb/util/backoff_waiter.h"
 #include "yb/util/flags.h"
 #include "yb/util/mem_tracker.h"
 #include "yb/util/subprocess.h"
 #include "yb/util/test_macros.h"
+#include "yb/util/test_thread_holder.h"
 #include "yb/util/test_util.h"
+#include <gtest/gtest.h>
 
 DECLARE_int64(mem_tracker_tcmalloc_gc_release_bytes);
 
@@ -6085,6 +6091,1454 @@ TEST_F(MdbLegacyDictionaryScanTest, LaterPageCorruptionPreventsMigrationAndCanRe
   for (const auto& [pack, entry] : expected) {
     ASSERT_EQ(restored.Get(entry.second), entry.first);
     ASSERT_EQ(restored.Lookup(entry.first), entry.second);
+  }
+}
+
+TEST_F(MdbFragmentIntegrationTest, Round2FrozenGraphExpandBaseline) {
+  using Term = FirstBatchTypedOutput::Term;
+  using Row = std::vector<Term>;
+  Write(1, 9000, 2);
+  Write(1, 9000, 3);
+  Write(2, 9000, 4);
+  Write(3, 9000, 4);
+  Write(4, 9000, 4);
+  Write(2, 9001, 5);
+  Write(3, 9001, 5);
+  Write(4, 9001, 6);
+  Write(1, 9002, 2);
+  RegisterRdfIdentity(9003, RdfIdentity(TripleTermType::URI, Iri(9003)));
+  RegisterRdfIdentity(
+      50001, RdfIdentity(TripleTermType::LITERAL, "5", "http://www.w3.org/2001/XMLSchema#integer"));
+  RegisterRdfIdentity(
+      50002, RdfIdentity(TripleTermType::LITERAL, "5", "http://www.w3.org/2001/XMLSchema#string"));
+  ASSERT_OK(RdfYBModel::Instance().WriteTripleToDocDB(1, 9003, 50001));
+  ASSERT_OK(RdfYBModel::Instance().WriteTripleToDocDB(1, 9003, 50002));
+  ASSERT_OK(RdfYBModel::Instance().Flush());
+  auto term = [](uint64_t id) -> Term {
+    if (id == 50001 || id == 50002) {
+      return {
+          YBC_MDB_LITERAL, "5",
+          id == 50001 ? "http://www.w3.org/2001/XMLSchema#integer"
+                      : "http://www.w3.org/2001/XMLSchema#string",
+          ""};
+    }
+    return {YBC_MDB_IRI, Iri(id), "", ""};
+  };
+  struct Case {
+    const char* name;
+    const char* query;
+    std::vector<std::pair<uint64_t, uint64_t>> expected;
+  };
+  const std::vector<Case> cases = {
+      {"out",
+       "SELECT ?x ?y WHERE { VALUES ?x { <urn:p6:1> } ?x <urn:p6:9000> ?y }",
+       {{1, 2}, {1, 3}}},
+      {"in",
+       "SELECT ?x ?y WHERE { VALUES ?y { <urn:p6:4> } ?x <urn:p6:9000> ?y }",
+       {{2, 4}, {3, 4}, {4, 4}}},
+      {"two_hop",
+       "SELECT ?x ?y WHERE { VALUES ?x { <urn:p6:1> } ?x <urn:p6:9000> ?k . ?k <urn:p6:9001> ?y }",
+       {{1, 5}, {1, 5}}},
+      {"duplicate_seeds",
+       "SELECT ?x ?y WHERE { VALUES ?x { <urn:p6:1> <urn:p6:1> } ?x <urn:p6:9000> ?y }",
+       {{1, 2}, {1, 3}, {1, 2}, {1, 3}}},
+      {"filter",
+       "SELECT ?x ?y WHERE { VALUES ?x { <urn:p6:1> } ?x <urn:p6:9000> ?y FILTER(?y = <urn:p6:2>) "
+       "}",
+       {{1, 2}}},
+      {"distinct",
+       "SELECT DISTINCT ?x ?y WHERE { VALUES ?x { <urn:p6:1> } ?x <urn:p6:9000> ?k . ?k "
+       "<urn:p6:9001> ?y }",
+       {{1, 5}}},
+      {"empty", "SELECT ?x ?y WHERE { VALUES ?x { <urn:p6:6> } ?x <urn:p6:9000> ?y }", {}},
+      {"self_loop",
+       "SELECT ?x ?y WHERE { VALUES ?x { <urn:p6:4> } ?x <urn:p6:9000> ?y FILTER(?x = ?y) }",
+       {{4, 4}}},
+      {"bound_neighbor",
+       "SELECT ?x ?y WHERE { VALUES (?x ?y) { (<urn:p6:1> <urn:p6:2>) (<urn:p6:1> <urn:p6:5>) } ?x "
+       "<urn:p6:9000> ?y }",
+       {{1, 2}}},
+      {"typed_neighbor",
+       "SELECT ?x ?y WHERE { VALUES ?x { <urn:p6:1> } ?x <urn:p6:9003> ?y }",
+       {{1, 50001}, {1, 50002}}},
+      {"scan_seed_out",
+       "SELECT ?x ?y WHERE { ?x <urn:p6:9002> ?seed . ?x <urn:p6:9000> ?y }",
+       {{1, 2}, {1, 3}}},
+      {"scan_seed_two_hop",
+       "SELECT ?x ?y WHERE { ?x <urn:p6:9002> ?seed . ?x <urn:p6:9000> ?k . ?k <urn:p6:9001> ?y }",
+       {{1, 5}, {1, 5}}},
+  };
+  for (const auto& item : cases) {
+    std::multiset<Row> expected;
+    for (const auto& pair : item.expected) {
+      expected.insert({term(pair.first), term(pair.second)});
+    }
+    for (int mode = 0; mode < 3; ++mode) {
+      SCOPED_TRACE(std::string(item.name) + " mode=" + std::to_string(mode));
+      auto options = mode == 0 ? WorkerOptions{} : workers_;
+      if (mode == 2) {
+        options.page_rows = 3;
+        options.batch_rows = 3;
+      }
+      auto& model = RdfYBModel::Instance();
+      model.SetWorkerOptions(options);
+      model.SetStreamingPageRows(mode == 2 ? 3 : 1);
+      model.SetBatchJoinOptions({});
+      FirstBatchTypedOutput output;
+      const auto start = WallMicros();
+      const auto status = YBCMdbExecuteSparqlWithResults(item.query, output.Callbacks(), &output);
+      const auto elapsed = WallMicros() - start;
+      const std::string profile = YBCMdbGetLastQueryProfile();
+      ASSERT_EQ(status, 0) << profile;
+      ASSERT_TRUE(output.ended);
+      ASSERT_EQ(output.kind, YBC_MDB_BINDINGS);
+      ASSERT_EQ(output.names, (std::vector<std::string>{"x", "y"}));
+      ASSERT_EQ(std::multiset<Row>(output.rows.begin(), output.rows.end()), expected);
+      if (std::string(item.name).find("scan_seed_") == 0 && mode != 0) {
+        ASSERT_GT(Field(profile, "remote_fragments"), 0);
+        ASSERT_EQ(Field(profile, "remote_coordinator_fallbacks"), 0);
+      }
+      LOG(INFO) << "ROUND2_BASELINE {\"case\":\"" << item.name << "\",\"mode\":" << mode
+                << ",\"elapsed_us\":" << elapsed << ",\"rows\":" << output.rows.size()
+                << ",\"profile\":" << profile << "}";
+    }
+  }
+  RdfYBModel::Instance().SetWorkerOptions({});
+}
+
+TEST_F(MdbFragmentIntegrationTest, Round2CursorSnapshotLateFailureAndReopen) {
+  for (uint64_t o = 1001; o < 1018; ++o) {
+    Write(2, 9001, o);
+  }
+  ASSERT_OK(RdfYBModel::Instance().Flush());
+  auto view = RdfYBModel::Instance().NewQueryReadContext();
+  ASSERT_OK(view);
+  DocDBScanSpec spec;
+  spec.hash_key = 2;
+  spec.columns[0] = {2, 2};
+  spec.columns[1] = {9001, 9001};
+  spec.page_rows = 2;
+  spec.cancelled = &(*view)->cancelled;
+  DocDBScanCursor cursor;
+  ASSERT_OK(cursor.Open(RdfYBModel::Instance().GetTable(0), (*view)->session, spec));
+  auto first = cursor.NextBatch();
+  ASSERT_OK(first);
+  ASSERT_FALSE(first->eof);
+  ASSERT_FALSE(first->rows.empty());
+  Write(2, 9001, 2000);
+  ASSERT_OK(RdfYBModel::Instance().Flush());
+  std::multiset<uint64_t> actual;
+  for (const auto& row : first->rows) {
+    actual.insert(row[2]);
+  }
+  bool eof = first->eof;
+  while (!eof) {
+    auto page = cursor.NextBatch();
+    ASSERT_OK(page);
+    for (const auto& row : page->rows) {
+      actual.insert(row[2]);
+    }
+    eof = page->eof;
+  }
+  std::multiset<uint64_t> expected;
+  for (uint64_t o = 1001; o < 1018; ++o) {
+    expected.insert(o);
+  }
+  ASSERT_EQ(actual, expected);
+
+  ASSERT_OK(cursor.Open(RdfYBModel::Instance().GetTable(0), (*view)->session, spec));
+  ASSERT_OK(cursor.NextBatch());
+  (*view)->cancelled.store(true);
+  ASSERT_TRUE(cursor.NextBatch().status().IsAborted());
+  (*view)->cancelled.store(false);
+  ASSERT_TRUE(cursor.NextBatch().status().IsAborted());
+  ASSERT_OK(cursor.Open(RdfYBModel::Instance().GetTable(0), (*view)->session, spec));
+  ASSERT_OK(cursor.NextBatch());
+  auto expired = spec;
+  expired.deadline = CoarseMonoClock::Now();
+  ASSERT_OK(cursor.Open(RdfYBModel::Instance().GetTable(0), (*view)->session, expired));
+  ASSERT_TRUE(cursor.NextBatch().status().IsTimedOut());
+  ASSERT_TRUE(cursor.NextBatch().status().IsTimedOut());
+  cursor.Close();
+  ASSERT_NOK(cursor.NextBatch());
+
+  auto fresh = RdfYBModel::Instance().NewQueryReadContext();
+  ASSERT_OK(fresh);
+  spec.cancelled = &(*fresh)->cancelled;
+  ASSERT_OK(cursor.Open(RdfYBModel::Instance().GetTable(0), (*fresh)->session, spec));
+  actual.clear();
+  eof = false;
+  while (!eof) {
+    auto page = cursor.NextBatch();
+    ASSERT_OK(page);
+    for (const auto& row : page->rows) {
+      actual.insert(row[2]);
+    }
+    eof = page->eof;
+  }
+  expected.insert(2000);
+  ASSERT_EQ(actual, expected);
+}
+
+TEST_F(MdbWorkerProbeTest, Round2PagedAdjacencyBagSnapshotAndBindingConstraints) {
+  for (uint64_t origin : {101, 102}) {
+    Write(origin, 9000, 2);
+    Write(origin, 9000, 2);
+    Write(origin, 9002, 1001);
+  }
+  for (uint64_t o = 1001; o < 1018; ++o) {
+    Write(2, 9001, o);
+  }
+  Write(1001, 9003, 1001);
+  Write(1001, 9003, 2001);
+  ASSERT_OK(RdfYBModel::Instance().Flush());
+  Rows expected;
+  for (uint64_t origin : {101, 102}) {
+    for (uint64_t o = 1001; o < 1018; ++o) {
+      expected.insert({origin, o});
+    }
+  }
+  auto old = RdfYBModel::Instance().NewQueryReadContext();
+  ASSERT_OK(old);
+  Write(2, 9001, 2000);
+  ASSERT_OK(RdfYBModel::Instance().Flush());
+  for (size_t page_rows : {1, 4}) {
+    auto plan = Plan({{-1, 9000, -2}, {-2, 9001, -3}}, 3, {0, 2}, page_rows, 2);
+    ASSERT_OK(plan);
+    Rows actual;
+    uint64_t reads = 0;
+    auto options = workers_;
+    options.page_rows = page_rows;
+    const auto before_fragments = (*old)->stats.remote_fragments;
+    ASSERT_OK(GatherFragments(*plan, options, **old, [&](const std::vector<uint64_t>& row) {
+      actual.insert(row);
+      return Status::OK();
+    }));
+    ASSERT_EQ((*old)->stats.remote_fragments - before_fragments, 4);
+    reads = (*old)->stats.remote_read_operations;
+    ASSERT_EQ(actual, expected);
+    ASSERT_GT(reads, 0);
+    actual.clear();
+    ASSERT_OK(Read(*plan, &actual, &reads));
+    auto appended = expected;
+    appended.insert({101, 2000});
+    appended.insert({102, 2000});
+    ASSERT_EQ(actual, appended);
+
+    plan = Plan({{-1, 9002, -2}, {-3, 9001, -2}}, 3, {0, 2}, page_rows, 2);
+    ASSERT_OK(plan);
+    actual.clear();
+    ASSERT_OK(Read(*plan, &actual, &reads));
+    ASSERT_EQ(actual, (Rows{{101, 2}, {102, 2}}));
+    plan = Plan({{-1, 9002, -2}, {-2, 9003, -2}}, 2, {0, 1}, page_rows, 2);
+    ASSERT_OK(plan);
+    actual.clear();
+    ASSERT_OK(Read(*plan, &actual, &reads));
+    ASSERT_EQ(actual, (Rows{{101, 1001}, {102, 1001}}));
+  }
+}
+
+TEST_F(MdbFragmentIntegrationTest, Round2WorkerTypedNeighborsKeepIdentityAndColumnOrder) {
+  Write(101, 9000, 2);
+  const std::string integer = "http://www.w3.org/2001/XMLSchema#integer";
+  const std::string string = "http://www.w3.org/2001/XMLSchema#string";
+  RegisterRdfIdentity(50001, RdfIdentity(TripleTermType::LITERAL, "5", integer));
+  RegisterRdfIdentity(50002, RdfIdentity(TripleTermType::LITERAL, "5", string));
+  RegisterRdfIdentity(9001, RdfIdentity(TripleTermType::URI, Iri(9001)));
+  ASSERT_OK(RdfYBModel::Instance().WriteTripleToDocDB(2, 9001, 50001));
+  ASSERT_OK(RdfYBModel::Instance().WriteTripleToDocDB(2, 9001, 50002));
+  ASSERT_OK(RdfYBModel::Instance().Flush());
+  RdfYBModel::Instance().SetWorkerOptions(workers_);
+  FirstBatchTypedOutput output;
+  ASSERT_EQ(
+      YBCMdbExecuteSparqlWithResults(
+          "SELECT ?o ?s WHERE { ?s <urn:p6:9000> ?k . ?k <urn:p6:9001> ?o }", output.Callbacks(),
+          &output),
+      0);
+  using Term = FirstBatchTypedOutput::Term;
+  using Row = std::vector<Term>;
+  const Term origin{YBC_MDB_IRI, Iri(101), "", ""};
+  const std::multiset<Row> expected{
+      {{YBC_MDB_LITERAL, "5", integer, ""}, origin}, {{YBC_MDB_LITERAL, "5", string, ""}, origin}};
+  ASSERT_EQ(output.names, (std::vector<std::string>{"o", "s"}));
+  ASSERT_TRUE(output.ended);
+  ASSERT_EQ(std::multiset<Row>(output.rows.begin(), output.rows.end()), expected);
+  const std::string profile = YBCMdbGetLastQueryProfile();
+  ASSERT_GT(Field(profile, "remote_fragments"), 0);
+  ASSERT_EQ(Field(profile, "remote_coordinator_fallbacks"), 0);
+}
+
+TEST_F(MdbFragmentIntegrationTest, GraphExpandDirectionMultiplicityAndConstraints) {
+  for (uint64_t o = 1001; o < 1018; ++o) {
+    Write(2, 9001, o);
+  }
+  Write(2, 9001, 2);
+  Write(2, 9001, 1001);
+  Write(2, 9002, 2000);
+  ASSERT_OK(RdfYBModel::Instance().Flush());
+  std::array<const client::TableHandle*, 6> tables;
+  for (int i = 0; i < 6; ++i) {
+    tables[i] = RdfYBModel::Instance().GetTable(i);
+  }
+  auto view = RdfYBModel::Instance().NewQueryReadContext();
+  ASSERT_OK(view);
+  using Row = std::pair<uint64_t, std::vector<uint64_t>>;
+  for (size_t page : {1, 4, 16}) {
+    GraphExpandSpec spec;
+    spec.predicate = 9001;
+    spec.page_rows = page;
+    GraphExpand expand(tables, **view, spec);
+    ASSERT_OK(expand.Open({{7, {2, 0, 77}}, {8, {2, 0, 88}}, {9, {6, 0, 99}}}));
+    std::multiset<Row> actual, expected;
+    for (uint64_t origin : {7, 8}) {
+      expected.insert({origin, {2, 2, origin == 7 ? 77UL : 88UL}});
+      for (uint64_t o = 1001; o < 1018; ++o) {
+        expected.insert({origin, {2, o, origin == 7 ? 77UL : 88UL}});
+      }
+    }
+    while (true) {
+      GraphBinding row;
+      auto more = expand.Next(&row);
+      ASSERT_OK(more);
+      if (!*more) {
+        break;
+      }
+      actual.insert({row.origin, row.values});
+    }
+    ASSERT_EQ(actual, expected);
+    ASSERT_EQ(expand.stats().input_rows, 3);
+    ASSERT_EQ(expand.stats().output_rows, 36);
+    ASSERT_EQ(expand.stats().probes, 2);
+    ASSERT_EQ(expand.stats().shared_inputs, 1);
+    ASSERT_GT(expand.stats().pages, 0);
+    ASSERT_LE(expand.stats().reserved_bytes, spec.memory_bytes);
+    LOG(INFO) << "GRAPH_EXPAND_EXECUTED page_rows=" << page
+              << " rows=" << expand.stats().output_rows
+              << " reads=" << expand.stats().read_operations;
+
+    ASSERT_OK(expand.Open({{1, {2, 1001}}, {2, {2, 2000}}}));
+    GraphBinding row;
+    auto more = expand.Next(&row);
+    ASSERT_OK(more);
+    ASSERT_TRUE(*more);
+    ASSERT_EQ(row.origin, 1);
+    ASSERT_EQ(row.values, (std::vector<uint64_t>{2, 1001}));
+    more = expand.Next(&row);
+    ASSERT_OK(more);
+    ASSERT_FALSE(*more);
+    ASSERT_TRUE(row.values.empty());
+
+    spec.neighbor_slot = 0;
+    GraphExpand self(tables, **view, spec);
+    ASSERT_OK(self.Open({{3, {2}}}));
+    more = self.Next(&row);
+    ASSERT_OK(more);
+    ASSERT_TRUE(*more);
+    ASSERT_EQ(row.values, (std::vector<uint64_t>{2}));
+    more = self.Next(&row);
+    ASSERT_OK(more);
+    ASSERT_FALSE(*more);
+
+    spec.direction = GraphDirection::In;
+    spec.neighbor_slot = 1;
+    GraphExpand reverse(tables, **view, spec);
+    ASSERT_OK(reverse.Open({{10, {1001, 0}}, {11, {2, 0}}}));
+    actual.clear();
+    while (true) {
+      auto next = reverse.Next(&row);
+      ASSERT_OK(next);
+      if (!*next) {
+        break;
+      }
+      actual.insert({row.origin, row.values});
+    }
+    ASSERT_EQ(actual, (std::multiset<Row>{{10, {1001, 2}}, {11, {2, 2}}}));
+  }
+}
+
+TEST_F(MdbFragmentIntegrationTest, GraphExpandSnapshotAndTypedIdsAcrossPages) {
+  RegisterRdfIdentity(
+      50001, RdfIdentity(TripleTermType::LITERAL, "5", "http://www.w3.org/2001/XMLSchema#integer"));
+  RegisterRdfIdentity(
+      50002, RdfIdentity(TripleTermType::LITERAL, "5", "http://www.w3.org/2001/XMLSchema#string"));
+  for (uint64_t o = 1001; o < 1018; ++o) {
+    Write(2, 9001, o);
+  }
+  ASSERT_OK(RdfYBModel::Instance().WriteTripleToDocDB(2, 9001, 50001));
+  ASSERT_OK(RdfYBModel::Instance().WriteTripleToDocDB(2, 9001, 50002));
+  ASSERT_OK(RdfYBModel::Instance().Flush());
+  std::array<const client::TableHandle*, 6> tables;
+  for (int i = 0; i < 6; ++i) {
+    tables[i] = RdfYBModel::Instance().GetTable(i);
+  }
+  auto view = RdfYBModel::Instance().NewQueryReadContext();
+  ASSERT_OK(view);
+  GraphExpandSpec spec;
+  spec.predicate = 9001;
+  spec.page_rows = 2;
+  GraphExpand expand(tables, **view, spec);
+  ASSERT_OK(expand.Open({{1, {2, 0}}}));
+  GraphBinding row;
+  auto more = expand.Next(&row);
+  ASSERT_OK(more);
+  ASSERT_TRUE(*more);
+  std::multiset<uint64_t> actual{row.values[1]}, expected{50001, 50002};
+  for (uint64_t o = 1001; o < 1018; ++o) {
+    expected.insert(o);
+  }
+  Write(2, 9001, 2000);
+  ASSERT_OK(RdfYBModel::Instance().Flush());
+  while (true) {
+    more = expand.Next(&row);
+    ASSERT_OK(more);
+    if (!*more) {
+      break;
+    }
+    actual.insert(row.values[1]);
+  }
+  ASSERT_EQ(actual, expected);
+  auto fresh = RdfYBModel::Instance().NewQueryReadContext();
+  ASSERT_OK(fresh);
+  GraphExpand latest(tables, **fresh, spec);
+  ASSERT_OK(latest.Open({{1, {2, 0}}}));
+  actual.clear();
+  while (true) {
+    more = latest.Next(&row);
+    ASSERT_OK(more);
+    if (!*more) {
+      break;
+    }
+    actual.insert(row.values[1]);
+  }
+  expected.insert(2000);
+  ASSERT_EQ(actual, expected);
+  spec.direction = GraphDirection::In;
+  GraphExpand reverse(tables, **fresh, spec);
+  ASSERT_OK(reverse.Open({{1, {50001, 0}}, {2, {50002, 0}}}));
+  std::multiset<std::vector<uint64_t>> reversed;
+  while (true) {
+    more = reverse.Next(&row);
+    ASSERT_OK(more);
+    if (!*more) {
+      break;
+    }
+    reversed.insert(row.values);
+  }
+  ASSERT_EQ(reversed, (std::multiset<std::vector<uint64_t>>{{50001, 2}, {50002, 2}}));
+}
+
+TEST_F(MdbFragmentIntegrationTest, GraphExpandAdmissionLateErrorsAndRecovery) {
+  for (uint64_t o = 1001; o < 1018; ++o) {
+    Write(2, 9001, o);
+  }
+  ASSERT_OK(RdfYBModel::Instance().Flush());
+  std::array<const client::TableHandle*, 6> tables;
+  for (int i = 0; i < 6; ++i) {
+    tables[i] = RdfYBModel::Instance().GetTable(i);
+  }
+  auto view = RdfYBModel::Instance().NewQueryReadContext();
+  ASSERT_OK(view);
+  GraphExpandSpec spec;
+  spec.predicate = 9001;
+  spec.page_rows = 1;
+  GraphExpand expand(tables, **view, spec);
+  ASSERT_NOK(expand.Open({{1, {2, 0}}, {2, {0, 0}}}));
+  ASSERT_EQ(expand.stats().read_operations, 0);
+  ASSERT_NOK(expand.Open({{1, {2, 0}}, {2, {2}}}));
+  ASSERT_NOK(expand.Open(std::vector<GraphBinding>(257, {0, {2, 0}})));
+  ASSERT_OK(expand.Open({{1, {2, 0}}}));
+  GraphBinding row;
+  auto next = expand.Next(&row);
+  ASSERT_OK(next);
+  ASSERT_TRUE(*next);
+  (*view)->cancelled.store(true);
+  ASSERT_TRUE(expand.Next(&row).status().IsAborted());
+  ASSERT_TRUE(row.values.empty());
+  (*view)->cancelled.store(false);
+  ASSERT_TRUE(expand.Next(&row).status().IsAborted());
+  ASSERT_OK(expand.Open({{1, {2, 0}}}));
+  next = expand.Next(&row);
+  ASSERT_OK(next);
+  ASSERT_TRUE(*next);
+  (*view)->deadline = CoarseMonoClock::Now();
+  ASSERT_TRUE(expand.Next(&row).status().IsTimedOut());
+  (*view)->deadline = CoarseMonoClock::Now() + MonoDelta::FromSeconds(30);
+  ASSERT_TRUE(expand.Next(&row).status().IsTimedOut());
+  ASSERT_OK(expand.Open({}));
+  next = expand.Next(&row);
+  ASSERT_OK(next);
+  ASSERT_FALSE(*next);
+  expand.Close();
+  ASSERT_NOK(expand.Next(&row));
+  spec.memory_bytes = 1024;
+  GraphExpand tiny(tables, **view, spec);
+  ASSERT_NOK(tiny.Open({{1, {2, 0}}}));
+  ASSERT_EQ(tiny.stats().read_operations, 0);
+  spec.memory_bytes = 8 * 1024 * 1024;
+  spec.predicate = 0;
+  GraphExpand invalid(tables, **view, spec);
+  ASSERT_NOK(invalid.Open({{1, {2, 0}}}));
+  spec.predicate = 9001;
+  spec.neighbor_slot = 2;
+  GraphExpand invalid_slot(tables, **view, spec);
+  ASSERT_NOK(invalid_slot.Open({{1, {2, 0}}}));
+  spec.neighbor_slot = 1;
+  GraphExpand recovered(tables, **view, spec);
+  ASSERT_OK(recovered.Open({{1, {2, 0}}}));
+  size_t count = 0;
+  while (true) {
+    next = recovered.Next(&row);
+    ASSERT_OK(next);
+    if (!*next) {
+      break;
+    }
+    ++count;
+  }
+  ASSERT_EQ(count, 17);
+}
+
+TEST_F(MdbFragmentIntegrationTest, GraphExpandBatchSharesPagesWithoutLosingOrigins) {
+  for (uint64_t i = 1; i <= 17; ++i) {
+    Write(2, 9001, 1000 + i);
+    Write(3, 9001, 2000 + i);
+  }
+  ASSERT_OK(RdfYBModel::Instance().Flush());
+  std::array<const client::TableHandle*, 6> tables;
+  for (int i = 0; i < 6; ++i) {
+    tables[i] = RdfYBModel::Instance().GetTable(i);
+  }
+  auto view = RdfYBModel::Instance().NewQueryReadContext();
+  ASSERT_OK(view);
+  const std::vector<GraphBinding> seeds{
+      {7, {2, 0, 70}}, {8, {3, 0, 80}}, {9, {2, 0, 90}}, {10, {3, 0, 100}}, {11, {6, 0, 110}}};
+  using Row = std::pair<uint64_t, std::vector<uint64_t>>;
+  std::multiset<Row> expected;
+  for (const auto& seed : seeds) {
+    if (seed.values[0] != 6) {
+      for (uint64_t i = 1; i <= 17; ++i) {
+        expected.insert(
+            {seed.origin,
+             {seed.values[0], (seed.values[0] == 2 ? 1000 : 2000) + i, seed.values[2]}});
+      }
+    }
+  }
+  for (size_t page : {1, 4}) {
+    for (size_t wave : {1, 3}) {
+      GraphExpandSpec spec;
+      spec.predicate = 9001;
+      spec.page_rows = page;
+      spec.probe_batch_size = wave;
+      GraphExpand expand(tables, **view, spec);
+      ASSERT_OK(expand.Open(seeds));
+      std::multiset<Row> actual;
+      GraphBinding row;
+      while (true) {
+        auto more = expand.Next(&row);
+        ASSERT_OK(more);
+        if (!*more) {
+          break;
+        }
+        actual.insert({row.origin, row.values});
+      }
+      ASSERT_EQ(actual, expected);
+      ASSERT_EQ(expand.stats().probes, 3);
+      ASSERT_EQ(expand.stats().shared_inputs, 2);
+      ASSERT_LE(expand.stats().max_in_flight, wave);
+      ASSERT_LE(expand.stats().reserved_bytes, spec.memory_bytes);
+      if (wave == 3) {
+        ASSERT_LT(expand.stats().flush_rounds, expand.stats().read_operations);
+      }
+      const auto shared_reads = expand.stats().read_operations;
+      uint64_t separate_reads = 0;
+      actual.clear();
+      for (const auto& seed : seeds) {
+        ASSERT_OK(expand.Open({seed}));
+        while (true) {
+          auto more = expand.Next(&row);
+          ASSERT_OK(more);
+          if (!*more) {
+            break;
+          }
+          actual.insert({row.origin, row.values});
+        }
+        separate_reads += expand.stats().read_operations;
+      }
+      ASSERT_EQ(actual, expected);
+      ASSERT_LT(shared_reads, separate_reads);
+      LOG(INFO) << "GRAPH_BATCH_EXECUTED page=" << page << " wave=" << wave
+                << " shared_reads=" << shared_reads << " separate_reads=" << separate_reads;
+      auto more = expand.Next(&row);
+      ASSERT_OK(more);
+      ASSERT_FALSE(*more);
+    }
+  }
+}
+
+TEST_F(MdbFragmentIntegrationTest, GraphPipelineTwoHopFilterProjectionAndBoundJoin) {
+  Write(1, 9000, 2);
+  Write(1, 9000, 3);
+  Write(2, 9001, 10);
+  Write(2, 9001, 11);
+  Write(3, 9001, 11);
+  ASSERT_OK(RdfYBModel::Instance().Flush());
+  std::array<const client::TableHandle*, 6> tables;
+  for (int i = 0; i < 6; ++i) {
+    tables[i] = RdfYBModel::Instance().GetTable(i);
+  }
+  auto view = RdfYBModel::Instance().NewQueryReadContext();
+  ASSERT_OK(view);
+  GraphExpandSpec first;
+  first.predicate = 9000;
+  first.start_slot = 0;
+  first.neighbor_slot = 1;
+  GraphExpandSpec second;
+  second.predicate = 9001;
+  second.start_slot = 1;
+  second.neighbor_slot = 2;
+  using Row = std::pair<uint64_t, std::vector<uint64_t>>;
+  for (size_t batch : {1, 2, 4}) {
+    first.page_rows = second.page_rows = batch;
+    GraphPipelineOptions options;
+    options.seed_batch_rows = batch;
+    GraphExpandPipeline pipeline(tables, **view, first, second, options);
+    ASSERT_OK(pipeline.Open({{7, {1, 0, 0}}, {8, {1, 0, 0}}}));
+    std::multiset<Row> actual, expected;
+    for (uint64_t origin : {7, 8}) {
+      expected.insert({origin, {1, 2, 10}});
+      expected.insert({origin, {1, 2, 11}});
+      expected.insert({origin, {1, 3, 11}});
+    }
+    GraphBinding row;
+    while (true) {
+      auto more = pipeline.Next(&row);
+      ASSERT_OK(more);
+      if (!*more) {
+        break;
+      }
+      actual.insert({row.origin, row.values});
+    }
+    ASSERT_EQ(actual, expected);
+    ASSERT_LE(pipeline.peak_seed_rows(), batch);
+    ASSERT_LE(pipeline.reserved_bytes(), options.memory_bytes);
+    ASSERT_GT(pipeline.second_hop_batches(), 0);
+    options.filter = [](const GraphBinding& binding) -> Result<bool> {
+      return binding.values[2] == 11;
+    };
+    options.projection = {2, 0};
+    GraphExpandPipeline filtered(tables, **view, first, second, options);
+    ASSERT_OK(filtered.Open({{7, {1, 0, 0}}, {8, {1, 0, 0}}}));
+    actual.clear();
+    expected.clear();
+    for (uint64_t origin : {7, 8}) {
+      expected.insert({origin, {11, 1}});
+      expected.insert({origin, {11, 1}});
+    }
+    while (true) {
+      auto more = filtered.Next(&row);
+      ASSERT_OK(more);
+      if (!*more) {
+        break;
+      }
+      actual.insert({row.origin, row.values});
+    }
+    ASSERT_EQ(actual, expected);
+    GraphExpandPipeline constrained(tables, **view, first, second, options);
+    ASSERT_OK(constrained.Open({{7, {1, 0, 11}}, {8, {1, 0, 99}}}));
+    actual.clear();
+    while (true) {
+      auto more = constrained.Next(&row);
+      ASSERT_OK(more);
+      if (!*more) {
+        break;
+      }
+      actual.insert({row.origin, row.values});
+    }
+    ASSERT_EQ(actual, (std::multiset<Row>{{7, {11, 1}}, {7, {11, 1}}}));
+    LOG(INFO) << "GRAPH_PIPELINE_EXECUTED batch=" << batch << " complete_rows=6 filtered_rows=4";
+  }
+}
+
+TEST_F(MdbFragmentIntegrationTest, GraphPipelineKeepsSnapshotAcrossSecondHopBatches) {
+  Write(1, 9000, 2);
+  Write(1, 9000, 3);
+  Write(2, 9001, 10);
+  Write(3, 9001, 11);
+  ASSERT_OK(RdfYBModel::Instance().Flush());
+  std::array<const client::TableHandle*, 6> tables;
+  for (int i = 0; i < 6; ++i) {
+    tables[i] = RdfYBModel::Instance().GetTable(i);
+  }
+  auto view = RdfYBModel::Instance().NewQueryReadContext();
+  ASSERT_OK(view);
+  GraphExpandSpec first;
+  first.predicate = 9000;
+  GraphExpandSpec second;
+  second.predicate = 9001;
+  second.start_slot = 1;
+  second.neighbor_slot = 2;
+  GraphPipelineOptions options;
+  options.seed_batch_rows = 1;
+  GraphExpandPipeline pipeline(tables, **view, first, second, options);
+  ASSERT_OK(pipeline.Open({{7, {1, 0, 0}}, {8, {1, 0, 0}}}));
+  GraphBinding row;
+  auto more = pipeline.Next(&row);
+  ASSERT_OK(more);
+  ASSERT_TRUE(*more);
+  using Row = std::pair<uint64_t, std::vector<uint64_t>>;
+  std::multiset<Row> actual{{row.origin, row.values}}, expected;
+  Write(3, 9001, 12);
+  ASSERT_OK(RdfYBModel::Instance().Flush());
+  while (true) {
+    more = pipeline.Next(&row);
+    ASSERT_OK(more);
+    if (!*more) {
+      break;
+    }
+    actual.insert({row.origin, row.values});
+  }
+  for (uint64_t origin : {7, 8}) {
+    expected.insert({origin, {1, 2, 10}});
+    expected.insert({origin, {1, 3, 11}});
+  }
+  ASSERT_EQ(actual, expected);
+  auto fresh = RdfYBModel::Instance().NewQueryReadContext();
+  ASSERT_OK(fresh);
+  GraphExpandPipeline latest(tables, **fresh, first, second, options);
+  ASSERT_OK(latest.Open({{7, {1, 0, 0}}, {8, {1, 0, 0}}}));
+  actual.clear();
+  while (true) {
+    more = latest.Next(&row);
+    ASSERT_OK(more);
+    if (!*more) {
+      break;
+    }
+    actual.insert({row.origin, row.values});
+  }
+  for (uint64_t origin : {7, 8}) {
+    expected.insert({origin, {1, 3, 12}});
+  }
+  ASSERT_EQ(actual, expected);
+}
+
+TEST_F(MdbFragmentIntegrationTest, GraphPipelineDrainsFilteredErrorsAndBoundsState) {
+  Write(1, 9000, 2);
+  Write(1, 9000, 3);
+  Write(2, 9001, 10);
+  Write(2, 9001, 11);
+  Write(3, 9001, 12);
+  ASSERT_OK(RdfYBModel::Instance().Flush());
+  std::array<const client::TableHandle*, 6> tables;
+  for (int i = 0; i < 6; ++i) {
+    tables[i] = RdfYBModel::Instance().GetTable(i);
+  }
+  auto view = RdfYBModel::Instance().NewQueryReadContext();
+  ASSERT_OK(view);
+  GraphExpandSpec first;
+  first.predicate = 9000;
+  GraphExpandSpec second;
+  second.predicate = 9001;
+  second.start_slot = 1;
+  second.neighbor_slot = 2;
+  GraphPipelineOptions options;
+  options.seed_batch_rows = 1;
+  size_t filtered = 0;
+  options.filter = [&](const GraphBinding&) -> Result<bool> {
+    if (++filtered == 3) {
+      return STATUS(RuntimeError, "Injected graph filter failure");
+    }
+    return false;
+  };
+  GraphExpandPipeline pipeline(tables, **view, first, second, options);
+  ASSERT_OK(pipeline.Open({{1, {1, 0, 0}}}));
+  GraphBinding row;
+  ASSERT_NOK(pipeline.Next(&row));
+  ASSERT_EQ(filtered, 3);
+  ASSERT_TRUE(row.values.empty());
+  ASSERT_NOK(pipeline.Next(&row));
+  options.filter = [&](const GraphBinding&) -> Result<bool> {
+    (*view)->cancelled.store(true);
+    return true;
+  };
+  GraphExpandPipeline cancelled(tables, **view, first, second, options);
+  ASSERT_OK(cancelled.Open({{1, {1, 0, 0}}}));
+  ASSERT_TRUE(cancelled.Next(&row).status().IsAborted());
+  ASSERT_TRUE(row.values.empty());
+  (*view)->cancelled.store(false);
+  ASSERT_TRUE(cancelled.Next(&row).status().IsAborted());
+  options.filter = {};
+  options.projection = {99};
+  GraphExpandPipeline bad_slot(tables, **view, first, second, options);
+  ASSERT_NOK(bad_slot.Open({{1, {1, 0, 0}}}));
+  options.projection = {};
+  options.memory_bytes = 1024;
+  GraphExpandPipeline tiny(tables, **view, first, second, options);
+  ASSERT_NOK(tiny.Open({{1, {1, 0, 0}}}));
+  options.memory_bytes = 8 * 1024 * 1024;
+  GraphExpandPipeline recovered(tables, **view, first, second, options);
+  ASSERT_OK(recovered.Open({{1, {1, 0, 0}}}));
+  size_t count = 0;
+  while (true) {
+    auto more = recovered.Next(&row);
+    ASSERT_OK(more);
+    if (!*more) {
+      break;
+    }
+    ++count;
+  }
+  ASSERT_EQ(count, 3);
+  ASSERT_LE(recovered.peak_seed_rows(), 1);
+  auto more = recovered.Next(&row);
+  ASSERT_OK(more);
+  ASSERT_FALSE(*more);
+  ASSERT_OK(recovered.Open({}));
+  more = recovered.Next(&row);
+  ASSERT_OK(more);
+  ASSERT_FALSE(*more);
+  recovered.Close();
+  ASSERT_NOK(recovered.Next(&row));
+}
+
+// This documents the legacy transport's permissive behavior, not acceptance
+// of a future graph execution mode. Graph requests need an explicit capability ACK.
+TEST_F(MdbWorkerProbeTest, LegacyWorkerIgnoresUnknownExecutionRequirement) {
+  Seed(8);
+  auto plan = Plan({{-1, 9000, -2}, {-2, 9001, -3}}, 3, {0, 2}, 2, 2);
+  ASSERT_OK(plan);
+  // An unassigned optional field survives coordinator serialization and is
+  // parsed as unknown by the legacy worker. It cannot require a new executor.
+  constexpr int kUnknownRequirement = 190;
+  auto* unknown = plan->physical.GetReflection()->MutableUnknownFields(&plan->physical);
+  unknown->AddVarint(kUnknownRequirement, 1);
+  std::string encoded;
+  ASSERT_TRUE(plan->physical.SerializeToString(&encoded));
+  FragmentOpenPB round_trip;
+  ASSERT_TRUE(round_trip.ParseFromString(encoded));
+  const auto& recovered = round_trip.GetReflection()->GetUnknownFields(round_trip);
+  ASSERT_EQ(recovered.field_count(), 1);
+  ASSERT_EQ(recovered.field(0).number(), kUnknownRequirement);
+  plan->physical = std::move(round_trip);
+  Rows actual, expected;
+  for (uint64_t origin = 101; origin < 109; ++origin) {
+    for (uint64_t neighbor : {1001, 1002}) {
+      expected.insert({origin, neighbor});
+    }
+  }
+  uint64_t reads = 0;
+  ASSERT_OK(Read(*plan, &actual, &reads));
+  ASSERT_EQ(actual, expected);
+  LOG(INFO) << "LEGACY_UNKNOWN_EXECUTION_REQUIREMENT accepted=true legacy_rows=" << actual.size()
+            << " required_feature_tag=" << kUnknownRequirement;
+}
+TEST_F(MdbFragmentIntegrationTest, GraphNativePublicFrozenTypedBagAndModifiers) {
+  using Term = FirstBatchTypedOutput::Term;
+  using Row = std::vector<Term>;
+  Write(1, 9000, 2);
+  Write(1, 9000, 3);
+  Write(2, 9000, 4);
+  Write(3, 9000, 4);
+  Write(4, 9000, 4);
+  Write(2, 9001, 5);
+  Write(3, 9001, 5);
+  Write(4, 9001, 6);
+  Write(1, 9002, 2);
+  RegisterRdfIdentity(9003, RdfIdentity(TripleTermType::URI, Iri(9003)));
+  RegisterRdfIdentity(
+      50001, RdfIdentity(TripleTermType::LITERAL, "5", "http://www.w3.org/2001/XMLSchema#integer"));
+  RegisterRdfIdentity(
+      50002, RdfIdentity(TripleTermType::LITERAL, "5", "http://www.w3.org/2001/XMLSchema#string"));
+  ASSERT_OK(RdfYBModel::Instance().WriteTripleToDocDB(1, 9003, 50001));
+  ASSERT_OK(RdfYBModel::Instance().WriteTripleToDocDB(1, 9003, 50002));
+  ASSERT_OK(RdfYBModel::Instance().Flush());
+  auto term = [](uint64_t id) -> Term {
+    if (id == 50001 || id == 50002) {
+      return {
+          YBC_MDB_LITERAL, "5",
+          id == 50001 ? "http://www.w3.org/2001/XMLSchema#integer"
+                      : "http://www.w3.org/2001/XMLSchema#string",
+          ""};
+    }
+    return {YBC_MDB_IRI, Iri(id), "", ""};
+  };
+  struct Case {
+    const char* name;
+    const char* query;
+    std::vector<std::pair<uint64_t, uint64_t>> expected;
+  };
+  const std::vector<Case> cases = {
+      {"out",
+       "SELECT ?x ?y WHERE { VALUES ?x { <urn:p6:1> } ?x <urn:p6:9000> ?y }",
+       {{1, 2}, {1, 3}}},
+      {"in",
+       "SELECT ?x ?y WHERE { VALUES ?y { <urn:p6:4> } ?x <urn:p6:9000> ?y }",
+       {{2, 4}, {3, 4}, {4, 4}}},
+      {"two_hop",
+       "SELECT ?x ?y WHERE { VALUES ?x { <urn:p6:1> } ?x <urn:p6:9000> ?k . ?k <urn:p6:9001> ?y }",
+       {{1, 5}, {1, 5}}},
+      {"duplicate_seeds",
+       "SELECT ?x ?y WHERE { VALUES ?x { <urn:p6:1> <urn:p6:1> } ?x <urn:p6:9000> ?y }",
+       {{1, 2}, {1, 3}, {1, 2}, {1, 3}}},
+      {"filter",
+       "SELECT ?x ?y WHERE { VALUES ?x { <urn:p6:1> } ?x <urn:p6:9000> ?y FILTER(?y = <urn:p6:2>) "
+       "}",
+       {{1, 2}}},
+      {"distinct",
+       "SELECT DISTINCT ?x ?y WHERE { VALUES ?x { <urn:p6:1> } ?x <urn:p6:9000> ?k . ?k "
+       "<urn:p6:9001> ?y }",
+       {{1, 5}}},
+      {"empty", "SELECT ?x ?y WHERE { VALUES ?x { <urn:p6:6> } ?x <urn:p6:9000> ?y }", {}},
+      {"self_loop",
+       "SELECT ?x ?y WHERE { VALUES ?x { <urn:p6:4> } ?x <urn:p6:9000> ?y FILTER(?x = ?y) }",
+       {{4, 4}}},
+      {"bound_neighbor",
+       "SELECT ?x ?y WHERE { VALUES (?x ?y) { (<urn:p6:1> <urn:p6:2>) (<urn:p6:1> <urn:p6:5>) } ?x "
+       "<urn:p6:9000> ?y }",
+       {{1, 2}}},
+      {"typed_neighbor",
+       "SELECT ?x ?y WHERE { VALUES ?x { <urn:p6:1> } ?x <urn:p6:9003> ?y }",
+       {{1, 50001}, {1, 50002}}},
+      {"scan_seed_out",
+       "SELECT ?x ?y WHERE { ?x <urn:p6:9002> ?seed . ?x <urn:p6:9000> ?y }",
+       {{1, 2}, {1, 3}}},
+      {"scan_seed_two_hop",
+       "SELECT ?x ?y WHERE { ?x <urn:p6:9002> ?seed . ?x <urn:p6:9000> ?k . ?k <urn:p6:9001> ?y }",
+       {{1, 5}, {1, 5}}},
+  };
+  for (const auto& item : cases) {
+    std::multiset<Row> expected;
+    for (const auto& pair : item.expected) {
+      expected.insert({term(pair.first), term(pair.second)});
+    }
+    for (int mode = 0; mode < 2; ++mode) {
+      SCOPED_TRACE(std::string(item.name) + " mode=" + std::to_string(mode));
+      auto options = mode == 0 ? WorkerOptions{} : workers_;
+      options.graph_native = mode != 0;
+      auto& model = RdfYBModel::Instance();
+      model.SetWorkerOptions(options);
+      model.SetStreamingPageRows(mode == 2 ? 3 : 1);
+      model.SetBatchJoinOptions({});
+      FirstBatchTypedOutput output;
+      const auto start = WallMicros();
+      const auto status = YBCMdbExecuteSparqlWithResults(item.query, output.Callbacks(), &output);
+      const auto elapsed = WallMicros() - start;
+      const std::string profile = YBCMdbGetLastQueryProfile();
+      ASSERT_EQ(status, 0) << profile;
+      ASSERT_TRUE(output.ended);
+      ASSERT_EQ(output.kind, YBC_MDB_BINDINGS);
+      ASSERT_EQ(output.names, (std::vector<std::string>{"x", "y"}));
+      ASSERT_EQ(std::multiset<Row>(output.rows.begin(), output.rows.end()), expected);
+      if (mode) {
+        ASSERT_GT(Field(profile, "graph_native_workers"), 0) << profile;
+        ASSERT_EQ(Field(profile, "remote_coordinator_fallbacks"), 0);
+        ASSERT_EQ(Field(profile, "graph_expand_rows"), Field(profile, "remote_rows"));
+      }
+      if (std::string(item.name).find("scan_seed_") == 0 && mode != 0) {
+        ASSERT_GT(Field(profile, "remote_fragments"), 0);
+        ASSERT_EQ(Field(profile, "remote_coordinator_fallbacks"), 0);
+      }
+      LOG(INFO) << "ROUND2_BASELINE {\"case\":\"" << item.name << "\",\"mode\":" << mode
+                << ",\"elapsed_us\":" << elapsed << ",\"rows\":" << output.rows.size()
+                << ",\"profile\":" << profile << "}";
+    }
+  }
+  RdfYBModel::Instance().SetWorkerOptions({});
+}
+
+TEST_F(MdbFragmentIntegrationTest, GraphNativeOldLateWorkerFailureExposesNoPublicRows) {
+  Seed(128);
+  const auto* legacy_path = std::getenv("MDB_GRAPH_LEGACY_WORKER");
+  if (!legacy_path) {
+    GTEST_SKIP() << "Set MDB_GRAPH_LEGACY_WORKER to a matching legacy runtime";
+  }
+  const std::string old_runtime = legacy_path;
+  ASSERT_TRUE(std::filesystem::exists(old_runtime));
+  const auto old = GetTestPath("verified-old-worker");
+  const auto old_error = GetTestPath("verified-old-worker.stderr");
+  const auto old_frame = GetTestPath("verified-old-worker.frame");
+  {
+    std::ofstream file(old);
+    file << "#!/bin/bash\n'" << old_runtime << "' > '" << old_frame << "' 2>> '" << old_error
+         << "'\nstatus=$?\ncat '" << old_frame << "'\nexit \"$status\"\n";
+  }
+  ASSERT_EQ(chmod(old.c_str(), 0700), 0);
+  auto error_text = [&] {
+    std::ifstream file(old_error);
+    return std::string(std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>());
+  };
+  auto options = workers_;
+  options.graph_native = true;
+  options.binary = old;
+  RdfYBModel::Instance().SetWorkerOptions(options);
+  FirstBatchTypedOutput failed;
+  ASSERT_NE(YBCMdbExecuteSparqlWithResults(kQuery, failed.Callbacks(), &failed), 0);
+  ASSERT_TRUE(failed.rows.empty());
+  ASSERT_FALSE(failed.ended);
+  const auto first_error = error_text();
+  ASSERT_NE(first_error.find("MDB worker envelope/version/sequence mismatch"), std::string::npos);
+  // Run the first three tasks with the new worker and the last with the saved
+  // legacy binary. Serial scheduling ensures this exercises late admission.
+  const auto counter = GetTestPath("graph-worker-counter");
+  const auto wrapper = GetTestPath("mixed-graph-worker");
+  {
+    std::ofstream file(wrapper);
+    file << "#!/bin/bash\ncount=0\nif test -f '" << counter << "'; then read count < '" << counter
+         << "'; fi\n"
+         << "count=$((count+1))\nprintf '%s\\n' \"$count\" > '" << counter << "'\n"
+         << "if test \"$count\" -ge 4; then exec '" << old << "'; fi\nexec '" << workers_.binary
+         << "'\n";
+  }
+  ASSERT_EQ(chmod(wrapper.c_str(), 0700), 0);
+  options.binary = wrapper;
+  options.max_workers = 1;
+  RdfYBModel::Instance().SetWorkerOptions(options);
+  failed = {};
+  ASSERT_NE(YBCMdbExecuteSparqlWithResults(kQuery, failed.Callbacks(), &failed), 0);
+  ASSERT_TRUE(failed.rows.empty());
+  ASSERT_FALSE(failed.ended);
+  const std::string profile = YBCMdbGetLastQueryProfile();
+  ASSERT_GT(Field(profile, "graph_expand_rows"), 0) << profile;
+  ASSERT_NE(
+      error_text().substr(first_error.size()).find("MDB worker envelope/version/sequence mismatch"),
+      std::string::npos);
+  options.binary = workers_.binary;
+  RdfYBModel::Instance().SetWorkerOptions(options);
+  FirstBatchTypedOutput recovered;
+  ASSERT_EQ(YBCMdbExecuteSparqlWithResults(kQuery, recovered.Callbacks(), &recovered), 0);
+  ASSERT_EQ(recovered.rows.size(), 256);
+  ASSERT_TRUE(recovered.ended);
+}
+
+TEST_F(MdbFragmentIntegrationTest, GraphNativeUnsupportedRetainsOldPathAndDefaultOff) {
+  Seed(8);
+  ASSERT_FALSE(WorkerOptions{}.graph_native);
+  WorkerOptions missing;
+  missing.graph_native = true;
+  ASSERT_NE(Query(kQuery, missing).status, 0);
+  const std::string query = "SELECT ?s WHERE { ?s ?p ?o }";
+  const auto baseline = Query(query, {});
+  auto options = workers_;
+  options.graph_native = true;
+  options.binary = "/bin/false";
+  const auto fallback = Query(query, options);
+  ASSERT_EQ(fallback.status, 0);
+  ASSERT_EQ(fallback.values, baseline.values);
+  ASSERT_EQ(Field(fallback.profile, "remote_coordinator_fallbacks"), 1);
+  ASSERT_EQ(Field(fallback.profile, "remote_fragments"), 0);
+}
+
+TEST_F(MdbWorkerProbeTest, GraphNativeSharedSnapshotAcrossPagesAndWorkerWaves) {
+  Seed(128);
+  Write(1001, 9002, 2001);
+  Write(1002, 9002, 2002);
+  RegisterRdfIdentity(2003, RdfIdentity(TripleTermType::URI, Iri(2003)));
+  auto& model = RdfYBModel::Instance();
+  ASSERT_OK(model.Flush());
+  auto plan = Plan({{-1, 9000, -2}, {-2, 9001, -3}, {-3, 9002, -4}}, 4, {0, 3}, 1, 1);
+  ASSERT_OK(plan);
+  plan->physical.set_graph_version(1);
+  auto view = model.NewQueryReadContext();
+  ASSERT_OK(view);
+  auto options = workers_;
+  options.graph_native = true;
+  options.max_workers = 1;
+  Rows rows, expected;
+  bool committed = false;
+  for (uint64_t s = 101; s < 229; ++s) {
+    for (uint64_t o : {2001, 2002}) {
+      expected.insert({s, o});
+    }
+  }
+  ASSERT_OK(GatherFragments(*plan, options, **view, [&](const auto& row) -> Status {
+    rows.insert(row);
+    if (!committed) {
+      RETURN_NOT_OK(model.BeginTransaction());
+      RETURN_NOT_OK(model.WriteTripleToDocDB(1001, 9002, 2003));
+      RETURN_NOT_OK(model.CommitTransaction());
+      committed = true;
+    }
+    return Status::OK();
+  }));
+  ASSERT_TRUE(committed);
+  ASSERT_EQ(rows, expected);
+  ASSERT_EQ((*view)->stats.graph_native_workers, 4);
+  ASSERT_EQ((*view)->stats.remote_fragments, 4);
+  ASSERT_EQ((*view)->stats.graph_expand_rows, 256);
+  for (uint64_t s = 101; s < 229; ++s) {
+    expected.insert({s, 2003});
+  }
+  rows.clear();
+  uint64_t reads = 0;
+  auto fresh = model.NewQueryReadContext();
+  ASSERT_OK(fresh);
+  ASSERT_OK(ReadView(*plan, **fresh, &rows, &reads, 1));
+  ASSERT_EQ(rows, expected);
+  ASSERT_EQ((*fresh)->stats.graph_native_workers, 4);
+}
+
+TEST_F(MdbWorkerProbeTest, GraphNativeLateCancellationDeadlineReapsAndRecovers) {
+  Seed(64);
+  auto plan = Plan({{-1, 9000, -2}, {-2, 9001, -3}}, 3, {0, 2}, 1, 1);
+  ASSERT_OK(plan);
+  plan->physical.set_graph_version(1);
+  auto options = workers_;
+  options.graph_native = true;
+  options.max_workers = 2;
+  for (bool expire : {false, true}) {
+    SCOPED_TRACE(expire ? "deadline" : "cancellation");
+    auto view = RdfYBModel::Instance().NewQueryReadContext();
+    ASSERT_OK(view);
+    size_t delivered = 0;
+    const auto status = GatherFragments(*plan, options, **view, [&](const auto&) {
+      ++delivered;
+      if (expire) {
+        (*view)->deadline = CoarseMonoClock::Now();
+      } else {
+        (*view)->cancelled.store(true);
+      }
+      return Status::OK();
+    });
+    ASSERT_TRUE(expire ? status.IsTimedOut() : status.IsAborted()) << status;
+    ASSERT_EQ(delivered, 1);
+    ASSERT_GT((*view)->stats.graph_native_workers, 0);
+    std::istringstream pids((*view)->stats.remote_worker_pids);
+    std::string pid;
+    while (std::getline(pids, pid, ',')) {
+      errno = 0;
+      ASSERT_EQ(kill(static_cast<pid_t>(std::stoll(pid)), 0), -1);
+      ASSERT_EQ(errno, ESRCH);
+    }
+    auto fresh = RdfYBModel::Instance().NewQueryReadContext();
+    ASSERT_OK(fresh);
+    Rows recovered, expected;
+    uint64_t reads = 0;
+    ASSERT_OK(ReadView(*plan, **fresh, &recovered, &reads, 2));
+    for (uint64_t s = 101; s < 165; ++s) {
+      for (uint64_t o : {1001, 1002}) {
+        expected.insert({s, o});
+      }
+    }
+    ASSERT_EQ(recovered, expected);
+    ASSERT_EQ((*fresh)->stats.graph_native_workers, 4);
+  }
+}
+
+TEST_F(MdbFragmentIntegrationTest, GraphNativeWorkerAndGatherBudgetsExposeNoRowsAndRecover) {
+  Seed(128);
+  for (bool worker_budget : {true, false}) {
+    SCOPED_TRACE(worker_budget ? "worker" : "gather");
+    auto options = workers_;
+    options.graph_native = true;
+    options.max_workers = 1;
+    if (worker_budget) {
+      options.memory_bytes = 4 * 1024 * 1024 + 128 * 1024;
+    } else {
+      options.coordinator_memory_bytes = 65536;
+    }
+    RdfYBModel::Instance().SetWorkerOptions(options);
+    FirstBatchTypedOutput output;
+    ASSERT_NE(YBCMdbExecuteSparqlWithResults(kQuery, output.Callbacks(), &output), 0);
+    ASSERT_TRUE(output.rows.empty());
+    ASSERT_FALSE(output.ended);
+    const std::string profile = YBCMdbGetLastQueryProfile();
+    ASSERT_GT(Field(profile, "graph_native_workers"), 0) << profile;
+    if (!worker_budget) {
+      ASSERT_GT(Field(profile, "graph_expand_rows"), 0) << profile;
+    }
+    ASSERT_EQ(DocDBReadContextScope::Current(), nullptr);
+  }
+  auto options = workers_;
+  options.graph_native = true;
+  RdfYBModel::Instance().SetWorkerOptions(options);
+  FirstBatchTypedOutput recovered;
+  ASSERT_EQ(YBCMdbExecuteSparqlWithResults(kQuery, recovered.Callbacks(), &recovered), 0);
+  ASSERT_TRUE(recovered.ended);
+  using Row = std::vector<FirstBatchTypedOutput::Term>;
+  std::multiset<Row> expected;
+  for (uint64_t i = 0; i < 128; ++i) {
+    for (uint64_t o : {1001, 1002}) {
+      expected.insert({{YBC_MDB_IRI, Iri(o), "", ""}});
+    }
+  }
+  ASSERT_EQ(std::multiset<Row>(recovered.rows.begin(), recovered.rows.end()), expected);
+}
+
+TEST_F(MdbFragmentIntegrationTest, GraphAutoModesKeepCompleteBagsAndExplainReuse) {
+  Seed(32);
+  Write(1001, 9004, 2001);
+  Write(1002, 9004, 2002);
+  for (uint64_t i = 0; i < 16; ++i) {
+    Write(301 + i, 9002, 401 + i);
+    Write(401 + i, 9003, 501 + i);
+  }
+  ASSERT_OK(RdfYBModel::Instance().Flush());
+  using Row = std::vector<FirstBatchTypedOutput::Term>;
+  auto term = [](uint64_t id) -> FirstBatchTypedOutput::Term {
+    return {YBC_MDB_IRI, Iri(id), "", ""};
+  };
+  struct Case {
+    std::string name, query;
+    std::multiset<Row> expected;
+    bool graph;
+    bool probe;
+  };
+  std::vector<Case> cases;
+  cases.push_back({"scan_shared", kQuery, {}, true, true});
+  for (size_t i = 0; i < 32; ++i) {
+    for (uint64_t o : {1001, 1002}) {
+      cases.back().expected.insert({term(o)});
+    }
+  }
+  std::string repeated = "", unique = "", reverse = "";
+  for (uint64_t i = 0; i < 8; ++i) {
+    repeated += "<urn:p6:101> ";
+    unique += "<" + Iri(101 + i) + "> ";
+    reverse += "<urn:p6:1001> ";
+  }
+  for (const auto& values : {repeated, unique}) {
+    cases.push_back(
+        {values == repeated ? "values_repeated" : "values_unique",
+         "SELECT ?s ?o WHERE { VALUES ?s { " + values +
+             "} ?s <urn:p6:9000> ?k . ?k <urn:p6:9001> ?o }",
+         {},
+         values == repeated,
+         false});
+    for (uint64_t i = 0; i < 8; ++i) {
+      for (uint64_t o : {1001, 1002}) {
+        cases.back().expected.insert({term(values == repeated ? 101 : 101 + i), term(o)});
+      }
+    }
+  }
+  cases.push_back(
+      {"reverse_values",
+       "SELECT ?k ?o WHERE { VALUES ?o { " + reverse + "} ?k <urn:p6:9001> ?o }",
+       {},
+       true,
+       false});
+  for (size_t i = 0; i < 8; ++i) {
+    cases.back().expected.insert({term(1), term(1001)});
+  }
+  cases.push_back(
+      {"scan_unique",
+       "SELECT ?s ?o WHERE { ?s <urn:p6:9002> ?k . ?k <urn:p6:9003> ?o }",
+       {},
+       false,
+       true});
+  for (uint64_t i = 0; i < 16; ++i) {
+    cases.back().expected.insert({term(301 + i), term(501 + i)});
+  }
+  cases.push_back(
+      {"two_hop",
+       "SELECT ?s ?o WHERE { ?s <urn:p6:9000> ?k . ?k <urn:p6:9001> ?m . ?m <urn:p6:9004> ?o }",
+       {},
+       true,
+       true});
+  for (uint64_t i = 0; i < 32; ++i) {
+    for (uint64_t o : {2001, 2002}) {
+      cases.back().expected.insert({term(101 + i), term(o)});
+    }
+  }
+  cases.push_back(
+      {"modifiers",
+       "SELECT DISTINCT ?o WHERE { ?s <urn:p6:9000> ?k . ?k <urn:p6:9001> ?o } ORDER BY ?o OFFSET "
+       "1 LIMIT 1",
+       {{term(1002)}},
+       true,
+       true});
+  for (const auto& item : cases) {
+    for (auto mode : {GraphMode::Old, GraphMode::New, GraphMode::Auto}) {
+      SCOPED_TRACE(item.name + " mode=" + std::to_string(static_cast<int>(mode)));
+      auto options = workers_;
+      options.graph_mode = mode;
+      // Explicit Old must also override the backwards-compatible true boolean.
+      options.graph_native = true;
+      RdfYBModel::Instance().SetWorkerOptions(options);
+      FirstBatchTypedOutput output;
+      ASSERT_EQ(YBCMdbExecuteSparqlWithResults(item.query.c_str(), output.Callbacks(), &output), 0);
+      ASSERT_TRUE(output.ended);
+      ASSERT_EQ(std::multiset<Row>(output.rows.begin(), output.rows.end()), item.expected);
+      ASSERT_EQ(
+          output.names, item.expected.begin()->size() == 1 ? std::vector<std::string>{"o"}
+                        : item.name == "reverse_values"    ? (std::vector<std::string>{"k", "o"})
+                                                           : (std::vector<std::string>{"s", "o"}));
+      const std::string profile = YBCMdbGetLastQueryProfile();
+      rapidjson::Document parsed;
+      parsed.Parse(profile.c_str());
+      ASSERT_FALSE(parsed.HasParseError());
+      const auto& decision = parsed["graph_execution_decision"];
+      ASSERT_TRUE(decision.IsObject());
+      const bool graph = mode == GraphMode::New || (mode == GraphMode::Auto && item.graph);
+      ASSERT_STREQ(decision["selected"].GetString(), graph ? "graph" : "old");
+      ASSERT_EQ(Field(profile, "graph_native_workers"), graph ? 4 : 0);
+      ASSERT_LE(decision["probe_read_operations"].GetUint64(), 1);
+      ASSERT_LE(decision["sample_rows"].GetUint64(), 16);
+      if (mode == GraphMode::Auto && item.probe) {
+        ASSERT_GT(decision["probe_read_operations"].GetUint64(), 0);
+      } else {
+        ASSERT_EQ(decision["probe_read_operations"].GetUint64(), 0);
+      }
+      ASSERT_FALSE(decision["historical_statistics_used"].GetBool());
+      LOG(INFO) << "ROUND2_GRAPH_DECISION {\"case\":\"" << item.name << "\",\"profile\":" << profile
+                << "}";
+    }
+  }
+}
+
+TEST_F(MdbWorkerProbeTest, GraphAutoProbeKeepsSnapshotAndBoundsAdmissionAndControls) {
+  for (uint64_t i = 0; i < 8; ++i) {
+    Write(101 + i, 9000, 1);
+  }
+  Write(1, 9001, 1001);
+  ASSERT_OK(RdfYBModel::Instance().Flush());
+  auto plan = Plan({{-1, 9000, -2}, {-2, 9001, -3}}, 3, {0, 2}, 1, 1);
+  ASSERT_OK(plan);
+  plan->physical.set_graph_version(1);
+  auto& model = RdfYBModel::Instance();
+  auto view = model.NewQueryReadContext();
+  ASSERT_OK(view);
+  auto options = workers_;
+  options.graph_mode = GraphMode::Auto;
+  auto first = ChooseGraphExecution(*plan, model, **view, options);
+  ASSERT_OK(first);
+  ASSERT_TRUE(first->graph);
+  ASSERT_EQ(first->sample_rows, 8);
+  ASSERT_GE(first->unique_probes, 1);
+  ASSERT_LE(first->unique_probes, 4);
+  // Historical metadata is neither a fresh-count promise nor an execution input.
+  auto misleading = std::make_shared<QueryStatistics>();
+  misleading->predicates_complete = false;
+  misleading->predicates[9000] = 999999;
+  (*view)->statistics = misleading;
+  ASSERT_OK(model.BeginTransaction());
+  for (uint64_t i = 0; i < 8; ++i) {
+    Write(201 + i, 9000, 301 + i);
+    Write(301 + i, 9001, 401 + i);
+  }
+  ASSERT_OK(model.CommitTransaction());
+  auto same = ChooseGraphExecution(*plan, model, **view, options);
+  ASSERT_OK(same);
+  ASSERT_TRUE(same->graph);
+  ASSERT_EQ(same->sample_rows, 8);
+  auto fresh = model.NewQueryReadContext();
+  ASSERT_OK(fresh);
+  auto changed = ChooseGraphExecution(*plan, model, **fresh, options);
+  ASSERT_OK(changed);
+  ASSERT_FALSE(changed->graph);
+  ASSERT_EQ(changed->sample_rows, 16);
+  ASSERT_GE(changed->unique_probes, 9);
+  ASSERT_LE(changed->unique_probes, 12);
+  ASSERT_LE(changed->read_operations, 1);
+  auto tiny = options;
+  tiny.coordinator_memory_bytes = 512 * 1024 - 1;
+  auto denied = ChooseGraphExecution(*plan, model, **fresh, tiny);
+  ASSERT_OK(denied);
+  ASSERT_FALSE(denied->graph);
+  ASSERT_EQ(denied->read_operations, 0);
+  auto capped = *plan;
+  auto tail = capped.tasks.back();
+  capped.tasks.back().partition_end = std::string(2, static_cast<char>(0xe0));
+  tail.partition_start = capped.tasks.back().partition_end;
+  tail.tablet_id += "-probe-limit";
+  capped.tasks.push_back(tail);
+  auto coverage = ChooseGraphExecution(capped, model, **fresh, options);
+  ASSERT_OK(coverage);
+  ASSERT_FALSE(coverage->graph);
+  ASSERT_EQ(coverage->read_operations, 0);
+  auto missing = *plan;
+  missing.physical.mutable_triples(0)->mutable_terms(1)->set_constant(99999);
+  auto no_evidence = ChooseGraphExecution(missing, model, **fresh, options);
+  ASSERT_OK(no_evidence);
+  ASSERT_FALSE(no_evidence->graph);
+  ASSERT_EQ(no_evidence->sample_rows, 0);
+  ASSERT_LE(no_evidence->read_operations, 1);
+  std::array<size_t, 4> per_fragment{};
+  for (uint64_t id = 10000; id < 10256; ++id) {
+    auto read = NewMdbReadOp(*model.GetTable(0), (*fresh)->session);
+    QLAddInt64HashValue(read->mutable_request(), static_cast<int64_t>(id));
+    std::string hash;
+    ASSERT_OK(read->GetPartitionKey(&hash));
+    for (size_t i = 0; i < plan->tasks.size(); ++i) {
+      const auto& task = plan->tasks[i];
+      if (hash >= task.partition_start &&
+          (task.partition_end.empty() || hash < task.partition_end) && per_fragment[i] < 2) {
+        Write(id, 9005, 1001 + per_fragment[i]);
+        ++per_fragment[i];
+        break;
+      }
+    }
+    if (std::all_of(per_fragment.begin(), per_fragment.end(), [](size_t n) { return n == 2; })) {
+      break;
+    }
+  }
+  for (auto n : per_fragment) {
+    ASSERT_EQ(n, 2);
+  }
+  ASSERT_OK(model.Flush());
+  auto scoped = model.NewQueryReadContext();
+  ASSERT_OK(scoped);
+  auto separate = *plan;
+  separate.physical.mutable_triples(0)->mutable_terms(1)->set_constant(9005);
+  auto no_cross_fragment_sharing = ChooseGraphExecution(separate, model, **scoped, options);
+  ASSERT_OK(no_cross_fragment_sharing);
+  ASSERT_FALSE(no_cross_fragment_sharing->graph);
+  ASSERT_EQ(no_cross_fragment_sharing->sample_rows, 8);
+  ASSERT_EQ(no_cross_fragment_sharing->unique_probes, 8);
+  (*fresh)->cancelled = true;
+  ASSERT_TRUE(ChooseGraphExecution(*plan, model, **fresh, options).status().IsAborted());
+  (*fresh)->cancelled = false;
+  (*fresh)->deadline = CoarseMonoClock::Now();
+  ASSERT_TRUE(ChooseGraphExecution(*plan, model, **fresh, options).status().IsTimedOut());
+}
+
+TEST_F(MdbDictionaryRecoveryTest, GraphModesCliDefaultsValidationAndFailedOutput) {
+  const auto input = GetTestPath("graph-auto-cli.nt");
+  {
+    std::ofstream f(input);
+    for (size_t i = 0; i < 16; ++i) {
+      f << "<urn:mode:s" << i << "> <urn:mode:p> <urn:mode:k> .\n";
+    }
+    f << "<urn:mode:k> <urn:mode:e> <urn:mode:o> .\n";
+  }
+  auto load = Base();
+  load.insert(load.end(), {"import", input});
+  ASSERT_OK(Subprocess::Call(load));
+  const std::string query = "SELECT ?s ?o WHERE { ?s <urn:mode:p> ?k . ?k <urn:mode:e> ?o }";
+  auto base = Base();
+  base.insert(
+      base.end(), {"--mdb_result_format=json", "--mdb_query_profile=true",
+                   "--mdb_worker_targets=local", "--mdb_worker_binary=" + workers_.binary});
+  for (const std::string mode : {"", "old", "new", "auto"}) {
+    auto args = base;
+    if (!mode.empty()) {
+      args.push_back("--mdb_graph_mode=" + mode);
+    }
+    args.insert(args.end(), {"query", query});
+    std::string out, error;
+    ASSERT_OK(Subprocess::Call(args, &out, &error));
+    rapidjson::Document doc;
+    doc.Parse(out.c_str());
+    ASSERT_FALSE(doc.HasParseError());
+    ASSERT_EQ(doc["head"]["vars"].Size(), 2);
+    std::multiset<std::pair<std::string, std::string>> rows, expected;
+    for (const auto& row : doc["results"]["bindings"].GetArray()) {
+      ASSERT_STREQ(row["s"]["type"].GetString(), "uri");
+      ASSERT_STREQ(row["o"]["type"].GetString(), "uri");
+      rows.emplace(row["s"]["value"].GetString(), row["o"]["value"].GetString());
+    }
+    for (size_t i = 0; i < 16; ++i) {
+      expected.emplace("urn:mode:s" + std::to_string(i), "urn:mode:o");
+    }
+    ASSERT_EQ(rows, expected);
+    ASSERT_EQ(Field(error, "graph_native_workers"), (mode == "new" || mode == "auto") ? 4 : 0);
+  }
+  for (const std::vector<std::string>& flags :
+       {std::vector<std::string>{"--mdb_graph_mode=invalid"},
+        std::vector<std::string>{"--mdb_graph_mode=auto", "--mdb_graph_native=true"},
+        std::vector<std::string>{"--mdb_graph_mode=auto", "--mdb_worker_binary=/bin/false"}}) {
+    auto args = base;
+    args.insert(args.end(), flags.begin(), flags.end());
+    args.insert(args.end(), {"query", query});
+    std::string out, error;
+    ASSERT_NOK(Subprocess::Call(args, &out, &error));
+    ASSERT_TRUE(out.empty());
   }
 }
 }  // namespace

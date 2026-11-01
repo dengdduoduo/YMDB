@@ -9,6 +9,7 @@
 namespace yb::mdb {
 
 enum class ExchangeMode { None, Hash, Broadcast };
+enum class GraphMode { Default, Old, New, Auto };
 
 struct WorkerOptions {
   // "local" runs an isolated process for single-host deployments and tests.
@@ -20,6 +21,14 @@ struct WorkerOptions {
   std::string ssh_config;
   // Experimental same-query-view two-pattern sampling; disabled by default.
   bool sample_join_order = false;
+  // Default preserves the original boolean flag/API; explicit modes take precedence.
+  bool graph_native = false;
+  GraphMode graph_mode = GraphMode::Default;
+  GraphMode EffectiveGraphMode() const {
+    return graph_mode == GraphMode::Default ? (graph_native ? GraphMode::New : GraphMode::Old)
+                                            : graph_mode;
+  }
+  bool UsesGraphPlanning() const { return EffectiveGraphMode() != GraphMode::Old; }
   size_t max_workers = 3;
   size_t batch_rows = 128;
   size_t page_rows = 16;
