@@ -69,6 +69,18 @@ def markers(stderr):
     return fields
 
 
+def declared_deadline_failure(config, record, stdout_path, stderr):
+    allowed = {(item['query_id'], item['mode'])
+               for item in config.get('deadline_failure_contracts', [])}
+    timing_status = record.get('cli_timing', {}).get('status')
+    return ((record['query_id'], record['mode']) in allowed and
+            record['status'] == 'cli_failed' and record.get('exit_code') == 1 and
+            type(timing_status) is int and timing_status == 1 and
+            Path(stdout_path).stat().st_size == 0 and
+            'MDB fragment query failed: Timed out' in stderr and
+            'MDB Gather deadline expired' in stderr)
+
+
 def summarize(records):
     groups = defaultdict(list)
     for row in records:
@@ -78,23 +90,27 @@ def summarize(records):
     for (query, mode), rows in sorted(groups.items()):
         good = [r for r in rows if r['status'] == 'passed']
         wall = [r['wall_seconds'] for r in good]
+        complete = len(good) == len(rows)
+        campaign_class = rows[0].get('campaign_class', 'performance')
         metrics = {}
         for field in ['adapter_plan_us','adapter_execute_us','adapter_total_us','storage_flush_us',
                       'remote_spawn_us','remote_open_wait_us','remote_pull_wait_us','remote_cleanup_us',
                       'read_operations','remote_read_operations','peak_buffered_bytes',
                       'graph_native_workers','remote_coordinator_fallbacks']:
             values = [r.get('profile',{}).get(field) for r in good]
-            metrics[field] = (statistics.median(values) if values and
+            metrics[field] = (statistics.median(values) if complete and values and
                               all(isinstance(x,(int,float)) for x in values) else None)
         result.append(dict(query_id=query, mode=mode, samples=len(rows), passed=len(good),
+                           campaign_class=campaign_class,
+                           verified_deadline_failures=sum(r.get('failure_contract_verified',False) for r in rows),
                            failures=[r['run_id'] for r in rows if r['status'] != 'passed'],
-                           wall_median_seconds=statistics.median(wall) if wall else None,
-                           wall_min_seconds=min(wall) if wall else None,
-                           wall_max_seconds=max(wall) if wall else None,
-                           wall_mad_seconds=statistics.median(abs(x-statistics.median(wall)) for x in wall) if wall else None,
+                           wall_median_seconds=statistics.median(wall) if complete and wall else None,
+                           wall_min_seconds=min(wall) if complete and wall else None,
+                           wall_max_seconds=max(wall) if complete and wall else None,
+                           wall_mad_seconds=statistics.median(abs(x-statistics.median(wall)) for x in wall) if complete and wall else None,
                            selected=[r.get('profile', {}).get('graph_execution_decision') for r in rows],
                            profile_medians=metrics,
-                           performance_acceptance=len(rows)>=5 and len(good)==len(rows)))
+                           performance_acceptance=campaign_class=='performance' and len(rows)>=5 and complete))
     return result
 
 
@@ -142,6 +158,7 @@ def campaign(config_path, manifest_path, output, selected, repeats, warmups):
                               config_sha256=identity['config_sha256'], input_sha256=manifest['sha256'],
                               query_sha256=case['query_sha256'], result_path=str(stdout),
                               stderr_path=str(stderr), command=args, status='started')
+                record['campaign_class'] = config.get('case_classes', {}).get(case['name'], 'performance')
                 stop, peaks, simultaneous = threading.Event(), {}, [0]
                 started = time.perf_counter()
                 with stdout.open('wb') as out, stderr.open('wb') as err:
@@ -174,18 +191,28 @@ def campaign(config_path, manifest_path, output, selected, repeats, warmups):
                 except Exception as error:
                     record['status'] = 'oracle_or_profile_failed'
                     record['error'] = str(error)
+                record['failure_contract_verified'] = declared_deadline_failure(
+                    config, record, stdout, stderr.read_text(errors='replace'))
+                if record['failure_contract_verified']:
+                    record['failure_contract'] = 'declared_query_deadline_with_no_public_output'
+                    record['oracle'] = dict(complete_typed_bag=False, no_public_rows=True, query_succeeded=False)
                 rows.append(record)
                 with (output/'runs.jsonl').open('a') as f:
                     f.write(json.dumps(record)+'\n')
                 (output/'summary.json').write_text(json.dumps(summarize(rows),indent=2))
                 print(json.dumps({k:record[k] for k in ['run_id','status','wall_seconds']}),flush=True)
-                if record['status']!='passed':
+                if record['status']!='passed' and not record['failure_contract_verified']:
                     raise RuntimeError('Correctness/timeout gate stopped campaign; artifacts retained: '+run_id)
     # Catch changed code/libraries, including accidental builds during measurement.
     if identity['cli']!=binary_identity(config['cli']) or identity['worker']!=binary_identity(config['worker_binary']):
         (output/'IDENTITY_CHANGED').write_text('Reject this campaign: binary/library identity changed')
         raise RuntimeError('Binary/library changed during campaign')
-    (output/'complete.json').write_text(json.dumps(dict(passed=True,runs=len(rows))))
+    (output/'complete.json').write_text(json.dumps(dict(completed=True,
+        passed=all(r['status']=='passed' for r in rows), runs=len(rows),
+        full_result_passes=sum(r['status']=='passed' for r in rows),
+        failed_queries=sum(r['status']!='passed' for r in rows),
+        verified_deadline_failures=sum(r['failure_contract_verified'] for r in rows),
+        unexpected_failures=0)))
 
 
 if __name__=='__main__':

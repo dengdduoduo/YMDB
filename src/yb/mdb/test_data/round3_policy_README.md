@@ -99,3 +99,27 @@ includes database-daemon RSS nor guarantees capture of the actual peak. The
 summary reports medians, min/max and median absolute deviation. Buffer
 accounting and RSS remain distinct. The tool never changes server state or
 stops a shared service.
+
+## Declared deadline contracts
+
+Keep exhausted query budgets separate from successful performance cells. An
+observed deadline may be frozen explicitly in the private configuration:
+
+```json
+{
+  "deadline_failure_contracts": [{"query_id": "twohop4096", "mode": "old"}],
+  "case_classes": {"twohop4096": "deadline_contract"}
+}
+```
+
+These fields supplement the required configuration above. A contract continues
+only for the declared query/mode, CLI exit and timing status both equal to 1, the exact
+Gather deadline diagnostics, and an empty public output. The record remains
+`cli_failed`, and its complete-result oracle remains false. All other errors,
+partial public output, and incorrect successful results stop the campaign.
+`complete.json` distinguishes a completed campaign from all queries passing.
+Failed cells have no success-only headline median. Contract-class cells never
+receive performance acceptance, including their successful modes.
+
+Run `python3 src/yb/mdb/test_data/round3_policy_measure_test.py` to check the
+failure gates, preservation of failed statuses, and stop-on-wrong-result behavior.
