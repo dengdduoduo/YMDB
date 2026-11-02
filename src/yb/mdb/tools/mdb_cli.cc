@@ -12,6 +12,7 @@
 //
 
 #include <iostream>
+#include <fstream>
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
@@ -91,7 +92,7 @@ static int RunImport(int argc, char* argv[]) {
   return YBCMdbImportFile(argv[0]);
 }
 
-static int RunQuery(int argc, char* argv[]) {
+static int RunQuery(int argc, char* argv[], bool* initialized = nullptr) {
   const auto command_started = yb::mdb::WallMicros();
   uint64_t init_us = 0, analyze_us = 0, execute_us = 0, publish_us = 0;
   int command_status = 1;
@@ -181,13 +182,16 @@ static int RunQuery(int argc, char* argv[]) {
   yb::mdb::RdfYBModel::Instance().SetWorkerOptions(std::move(workers));
   yb::mdb::RdfYBModel::Instance().SetUseTransactions(FLAGS_mdb_use_transactions);
 
-  int init_ret;
-  {
+  if (!initialized || !*initialized) {
     yb::mdb::WallTimeScope timer(&init_us);
-    init_ret = YBCMdbInitCluster(FLAGS_mdb_masters.c_str(), FLAGS_mdb_keyspace.c_str());
-  }
-  if (init_ret != 0) {
-    return init_ret;
+    const int init_ret = YBCMdbInitCluster(
+        FLAGS_mdb_masters.c_str(), FLAGS_mdb_keyspace.c_str());
+    if (init_ret != 0) {
+      return init_ret;
+    }
+    if (initialized) {
+      *initialized = true;
+    }
   }
 
   if (FLAGS_mdb_analyze_statistics) {
@@ -229,6 +233,46 @@ static int RunQuery(int argc, char* argv[]) {
   }
 }
 
+// Each file is one request. Successful result documents are JSON lines; request
+// statuses on stderr identify updates and failures that produce no document.
+static int RunSession(int argc, char* argv[]) {
+  if (argc < 1 || argc > 1024 || FLAGS_mdb_result_format != "json") {
+    std::cerr << "Usage: mdb_cli --mdb_result_format=json session <query-file>..."
+              << " (1..1024 requests, at most 1 MiB each)" << std::endl;
+    return 1;
+  }
+  bool initialized = false;
+  int session_status = 0;
+  for (int i = 0; i < argc; ++i) {
+    std::ifstream input(argv[i], std::ios::binary);
+    std::string query;
+    char ch;
+    while (input.get(ch)) {
+      if (query.size() == 1024 * 1024) {
+        break;
+      }
+      query.push_back(ch);
+    }
+    int status = 1;
+    if (!input.bad() && input.eof() && !query.empty() && query.find('\0') == std::string::npos) {
+      char* text = query.data();
+      status = RunQuery(1, &text, &initialized);
+    } else {
+      std::cerr << "Invalid or unreadable session query file at request " << i << std::endl;
+    }
+    std::cout.flush();
+    std::cerr << "MDB_SESSION_REQUEST {\"index\":" << i << ",\"status\":" << status << "}"
+              << std::endl;
+    if (!std::cout.good()) {
+      return 1;
+    }
+    if (status != 0) {
+      session_status = 1;
+    }
+  }
+  return session_status;
+}
+
 int main(int argc, char* argv[]) {
   yb::ParseCommandLineFlags(&argc, &argv, true);
   // Drain transaction RPCs before process-static response buffers are destroyed.
@@ -239,6 +283,7 @@ int main(int argc, char* argv[]) {
     std::cerr << "Commands:" << std::endl;
     std::cerr << "  init   <master_addrs> <keyspace>  Connect to cluster" << std::endl;
     std::cerr << "  import <file_path>                 Import RDF data file" << std::endl;
+    std::cerr << "  session <query-file>...          Sequential JSON requests" << std::endl;
     std::cerr << "  query  <sparql>                    Execute SPARQL query" << std::endl;
     return 1;
   }
@@ -249,6 +294,8 @@ int main(int argc, char* argv[]) {
     return RunInit(argc - 2, argv + 2);
   } else if (command == "import") {
     return RunImport(argc - 2, argv + 2);
+  } else if (command == "session") {
+    return RunSession(argc - 2, argv + 2);
   } else if (command == "query") {
     return RunQuery(argc - 2, argv + 2);
   } else {
