@@ -39,7 +39,7 @@ of numeric-vs-lexical sorting ambiguity. The ordered case validates both the
 complete bag and the actual sequence after OFFSET/LIMIT.
 
 Each manifest binds dataset, query, expected gzip and generator digests. Every
-case declares its output rows, a 120-second query timeout, 8-MiB worker buffer
+case declares its output rows, a 120-second outer process timeout, 8-MiB worker buffer
 budget and 64-MiB Gather budget before execution. The largest expected output is
 32,768 rows. These are bounded test inputs and accounting budgets, not RSS caps.
 Two input sizes in one dataset do not measure scaling of initialization against
@@ -101,6 +101,8 @@ accounting and RSS remain distinct. The tool never changes server state or
 stops a shared service.
 
 ## Declared deadline contracts
+
+The existing streamed query read view retains its 30-second internal deadline.
 
 Keep exhausted query budgets separate from successful performance cells. An
 observed deadline may be frozen explicitly in the private configuration:
