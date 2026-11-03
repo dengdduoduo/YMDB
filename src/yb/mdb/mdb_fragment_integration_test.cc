@@ -7553,3 +7553,5 @@ TEST_F(MdbDictionaryRecoveryTest, GraphModesCliDefaultsValidationAndFailedOutput
 }  // namespace yb::mdb
 
 #include "yb/mdb/mdb_session_cli_test.inc"
+
+#include "yb/mdb/mdb_worker_reuse_test.inc"

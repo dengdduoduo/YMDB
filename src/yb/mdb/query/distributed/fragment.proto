@@ -45,6 +45,11 @@ message FragmentRequestPB {
   optional uint64 batch_seq = 6;
   // Present only in sequence zero; subsequent requests grant one batch credit.
   optional FragmentOpenPB open = 7;
+  // Required together with envelope v3 and an explicitly enabled worker.
+  optional uint64 lease_id = 30;
+  optional uint32 reuse_version = 31;
+  optional bool release = 32;
+  optional bool shutdown = 33;
 }
 
 message FragmentResponsePB {
@@ -63,4 +68,9 @@ message FragmentResponsePB {
   optional uint64 read_operations = 13;
   optional uint32 graph_version = 20;
   optional uint64 graph_rows = 21;
+  optional uint64 lease_id = 30;
+  optional uint32 reuse_version = 31;
+  optional bool released = 32;
+  optional bool shutdown_ack = 33;
+  optional bool runtime_reused = 34;
 }

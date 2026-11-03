@@ -29,6 +29,7 @@ struct WorkerOptions {
                                             : graph_mode;
   }
   bool UsesGraphPlanning() const { return EffectiveGraphMode() != GraphMode::Old; }
+  bool reuse_processes = false;
   size_t max_workers = 3;
   size_t batch_rows = 128;
   size_t page_rows = 16;

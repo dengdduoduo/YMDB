@@ -24,6 +24,7 @@
 
 #include "yb/mdb/adapter/mdb_adapter.h"
 #include "yb/mdb/tools/cli_result_writer.h"
+#include "yb/mdb/query/distributed/fragment_gather.h"
 #include "yb/mdb/model/rdf_yb_model.h"
 #include "yb/mdb/storage/docdb_read_context.h"
 #include "yb/util/flags.h"
@@ -51,6 +52,8 @@ DEFINE_bool(mdb_query_profile, false, "Print streaming query operation/payload/b
 DEFINE_NON_RUNTIME_bool(mdb_graph_native, false, "Opt-in versioned graph fragment execution");
 DEFINE_NON_RUNTIME_string(mdb_graph_mode, "",
                           "Graph mode: old, new, auto; empty uses mdb_graph_native");
+DEFINE_NON_RUNTIME_bool(mdb_worker_reuse, false,
+                       "Reuse bounded worker infrastructure in session mode");
 DEFINE_string(mdb_worker_targets, "", "Comma-separated SSH destinations, or local for isolated local processes");
 DEFINE_string(mdb_worker_binary, "", "Absolute mdb_fragment_worker path on every destination");
 DEFINE_string(mdb_worker_flagfile, "", "Optional absolute worker-local flagfile for YB client TLS configuration");
@@ -131,6 +134,7 @@ static int RunQuery(int argc, char* argv[], bool* initialized = nullptr) {
   options.negative_cache_entries = FLAGS_mdb_join_negative_cache_entries;
   yb::mdb::RdfYBModel::Instance().SetBatchJoinOptions(options);
   yb::mdb::WorkerOptions workers;
+  workers.reuse_processes = FLAGS_mdb_worker_reuse;
   workers.sample_join_order = FLAGS_mdb_sample_join_order;
   workers.graph_native = FLAGS_mdb_graph_native;
   if (!FLAGS_mdb_graph_mode.empty()) {
@@ -241,6 +245,15 @@ static int RunSession(int argc, char* argv[]) {
               << " (1..1024 requests, at most 1 MiB each)" << std::endl;
     return 1;
   }
+  std::unique_ptr<yb::mdb::FragmentWorkerPool> pool;
+  if (FLAGS_mdb_worker_reuse) {
+    if (!FLAGS_mdb_worker_max_processes || FLAGS_mdb_worker_max_processes > 16 ||
+        FLAGS_mdb_worker_targets.empty()) {
+      std::cerr << "Worker reuse requires worker targets and a capacity in 1..16" << std::endl;
+      return 1;
+    }
+    pool = std::make_unique<yb::mdb::FragmentWorkerPool>(FLAGS_mdb_worker_max_processes);
+  }
   bool initialized = false;
   int session_status = 0;
   for (int i = 0; i < argc; ++i) {
@@ -270,6 +283,16 @@ static int RunSession(int argc, char* argv[]) {
       session_status = 1;
     }
   }
+  if (pool) {
+    const auto status = pool->Close();
+    if (FLAGS_mdb_query_profile) {
+      std::cerr << "MDB_WORKER_POOL " << pool->StatsJson() << std::endl;
+    }
+    if (!status.ok()) {
+      std::cerr << status.ToString() << std::endl;
+      return 1;
+    }
+  }
   return session_status;
 }
 
@@ -289,6 +312,10 @@ int main(int argc, char* argv[]) {
   }
 
   std::string command = argv[1];
+  if (FLAGS_mdb_worker_reuse && command != "session") {
+    std::cerr << "Worker reuse requires an explicit session" << std::endl;
+    return 1;
+  }
 
   if (command == "init") {
     return RunInit(argc - 2, argv + 2);

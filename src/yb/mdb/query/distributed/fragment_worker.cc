@@ -33,29 +33,59 @@ namespace {
 class PhaseTimer {
  public:
   explicit PhaseTimer(uint64_t* value) : value_(value) {
-    if (value_) start_ = std::chrono::steady_clock::now();
+    if (value_) {
+      start_ = std::chrono::steady_clock::now();
+    }
   }
   ~PhaseTimer() {
-    if (value_) *value_ += std::chrono::duration_cast<std::chrono::microseconds>(
-        std::chrono::steady_clock::now() - start_).count();
+    if (value_) {
+      *value_ += std::chrono::duration_cast<std::chrono::microseconds>(
+                     std::chrono::steady_clock::now() - start_)
+                     .count();
+    }
   }
+
  private:
   uint64_t* value_;
   std::chrono::steady_clock::time_point start_;
 };
 
+struct WorkerRuntime {
+  ~WorkerRuntime() {
+    if (manager) {
+      manager->Shutdown();
+    }
+    if (client) {
+      client->Shutdown();
+    }
+  }
+  bool ready = false;
+  std::string masters, keyspace, id_namespace;
+  scoped_refptr<server::Clock> clock;
+  std::unique_ptr<client::YBClient> client;
+  std::shared_ptr<client::TransactionManager> manager;
+  std::array<client::TableHandle, 6> tables;
+};
+
 class Worker {
  public:
+  explicit Worker(WorkerRuntime& runtime)
+      : runtime_(runtime),
+        clock_(runtime.clock),
+        client_(runtime.client),
+        manager_(runtime.manager),
+        tables_(runtime.tables) {}
   ~Worker() {
     graph_.reset();
     prefetch_.clear();
     levels_.clear();
-    if (session_) session_->SetTransaction(nullptr);
+    if (session_) {
+      session_->SetTransaction(nullptr);
+    }
     session_.reset();
     transaction_.reset();
-    if (manager_) manager_->Shutdown();
-    // Drain callbacks while the client and stopped manager still exist.
-    if (client_) client_->Shutdown();
+    // Query-owned references are gone. The runtime retains infrastructure and
+    // owns any transaction-manager callbacks until session shutdown.
   }
 
   Status Open(const FragmentOpenPB& open) {
@@ -63,29 +93,51 @@ class Worker {
     RETURN_NOT_OK(ValidateFragmentOpen(open));
     open_ = open;
     deadline_ = CoarseMonoClock::Now() + MonoDelta::FromMilliseconds(open.timeout_ms());
-    {
-      PhaseTimer client_timer(Phase(&client_us_));
-      clock_ = make_scoped_refptr<server::HybridClock>();
-      RETURN_NOT_OK(clock_->Init());
-      client_ = VERIFY_RESULT(client::YBClientBuilder()
-          .add_master_server_addr(open.master_addresses())
-          .default_admin_operation_timeout(MonoDelta::FromMilliseconds(open.timeout_ms()))
-          .default_rpc_timeout(MonoDelta::FromMilliseconds(open.timeout_ms()))
-          .Build(static_cast<rpc::Messenger*>(nullptr), clock_));
-    }
-    {
-      PhaseTimer tables_timer(Phase(&tables_us_));
-      for (int perm = 0; perm < 6; ++perm) {
-        RETURN_NOT_OK(tables_[perm].Open(client::YBTableName(
-            YQL_DATABASE_CQL, open.keyspace(), RdfYBModel::kTableNames[perm]), client_.get()));
-        if (tables_[perm].table()->id() != open.table_ids(perm))
-          return STATUS(Corruption, "MDB table generation changed before worker open");
+    if (runtime_.ready) {
+      if (runtime_.masters != open.master_addresses() || runtime_.keyspace != open.keyspace() ||
+          runtime_.id_namespace != open.id_namespace()) {
+        return STATUS(Corruption, "Worker runtime storage identity changed");
       }
+      for (int perm = 0; perm < 6; ++perm) {
+        if (tables_[perm].table()->id() != open.table_ids(perm)) {
+          return STATUS(Corruption, "Worker runtime table generation changed");
+        }
+      }
+    } else {
+      {
+        PhaseTimer client_timer(Phase(&client_us_));
+        clock_ = make_scoped_refptr<server::HybridClock>();
+        RETURN_NOT_OK(clock_->Init());
+        client_ = VERIFY_RESULT(
+            client::YBClientBuilder()
+                .add_master_server_addr(open.master_addresses())
+                .default_admin_operation_timeout(MonoDelta::FromMilliseconds(open.timeout_ms()))
+                .default_rpc_timeout(MonoDelta::FromMilliseconds(open.timeout_ms()))
+                .Build(static_cast<rpc::Messenger*>(nullptr), clock_));
+      }
+      {
+        PhaseTimer tables_timer(Phase(&tables_us_));
+        for (int perm = 0; perm < 6; ++perm) {
+          RETURN_NOT_OK(
+              tables_[perm].Open(
+                  client::YBTableName(
+                      YQL_DATABASE_CQL, open.keyspace(), RdfYBModel::kTableNames[perm]),
+                  client_.get()));
+          if (tables_[perm].table()->id() != open.table_ids(perm)) {
+            return STATUS(Corruption, "MDB table generation changed before worker open");
+          }
+        }
+      }
+      manager_ = std::make_shared<client::TransactionManager>(
+          client_.get(), scoped_refptr<server::Clock>(client_->Clock()),
+          client::LocalTabletFilter());
+      runtime_.masters = open.master_addresses();
+      runtime_.keyspace = open.keyspace();
+      runtime_.id_namespace = open.id_namespace();
+      runtime_.ready = true;
     }
     {
       PhaseTimer transaction_timer(Phase(&transaction_us_));
-      manager_ = std::make_shared<client::TransactionManager>(
-          client_.get(), scoped_refptr<server::Clock>(client_->Clock()), client::LocalTabletFilter());
       auto data = VERIFY_RESULT(client::ChildTransactionData::FromPB(open.transaction()));
       transaction_ = MakeManagedTransaction(manager_, std::move(data));
       session_ = client_->NewSession(MonoDelta::FromMilliseconds(open.timeout_ms()));
@@ -101,9 +153,11 @@ class Worker {
     }
     const auto spare = open.memory_bytes() - FragmentBufferedReservation(open);
     const uint64_t per_probe = sizeof(Prefetch) + 8192 + uint64_t(open.page_rows()) * 256 +
-        uint64_t(open.variable_count()) * 16;
+                               uint64_t(open.variable_count()) * 16;
     prefetch_limit_ = open.triples_size() > 1 ? std::min<uint64_t>(8, spare / per_probe) : 0;
-    if (prefetch_limit_ < 2) prefetch_limit_ = 0;
+    if (prefetch_limit_ < 2) {
+      prefetch_limit_ = 0;
+    }
     if (prefetch_limit_) {
       prefetch_.reserve(prefetch_limit_);
       prefetch_reserved_bytes_ = prefetch_.capacity() * per_probe;
@@ -120,7 +174,9 @@ class Worker {
 
   Status Next(FragmentResponsePB* response) {
     PhaseTimer timer(Phase(&next_us_));
-    if (phase_enabled_) ++next_calls_;
+    if (phase_enabled_) {
+      ++next_calls_;
+    }
     return NextImpl(response);
   }
 
@@ -156,24 +212,31 @@ class Worker {
     uint32_t rows = 0;
     // A work quantum permits empty nonterminal responses without monopolizing Gather.
     for (size_t work = 0; work < 4096 && rows < open_.batch_rows(); ++work) {
-      if (CoarseMonoClock::Now() >= deadline_)
+      if (CoarseMonoClock::Now() >= deadline_) {
         return STATUS(TimedOut, "MDB worker execution deadline expired");
-      if (session_->IsRestartRequired())
+      }
+      if (session_->IsRestartRequired()) {
         return STATUS(TryAgain, "MDB child read view requires restart");
+      }
       auto& level = levels_[depth_];
-      if (!level.open) RETURN_NOT_OK(OpenLevel());
+      if (!level.open) {
+        RETURN_NOT_OK(OpenLevel());
+      }
       if (level.position == level.batch.rows.size()) {
         if (level.batch.eof) {
           level.cursor.Close();
           level.open = false;
           // One completed page stays in its existing level buffer. Never
           // retain a tail page as if it were the complete probe result.
-          if (!level.reusable) level.batch = {};
+          if (!level.reusable) {
+            level.batch = {};
+          }
           level.position = 0;
           if (depth_ == 0) {
             auto result = VERIFY_RESULT(transaction_->FinishChild());
-            if (transaction_->IsRestartRequired())
+            if (transaction_->IsRestartRequired()) {
               return STATUS(TryAgain, "MDB child read view requires restart");
+            }
             *response->mutable_transaction_result() = std::move(result);
             response->set_eof(true);
             break;
@@ -182,7 +245,10 @@ class Worker {
           continue;
         }
         const auto before = level.cursor.rpc_calls();
-        level.batch = VERIFY_RESULT([&] { PhaseTimer timer(Phase(&scan_us_)); return level.cursor.NextBatch(); }());
+        level.batch = VERIFY_RESULT([&] {
+          PhaseTimer timer(Phase(&scan_us_));
+          return level.cursor.NextBatch();
+        }());
         ++level.generation;
         ++level.pages;
         level.reusable = depth_ != 0 && level.pages == 1 && level.batch.eof;
@@ -193,13 +259,19 @@ class Worker {
           max_read_in_flight_ = std::max<uint64_t>(max_read_in_flight_, 1);
         }
         level.position = 0;
-        if (level.batch.rows.empty()) continue;
+        if (level.batch.rows.empty()) {
+          continue;
+        }
       }
       const auto& stored = level.batch.rows[level.position++];
       auto& next = bindings_[depth_ + 1];
-      if (!VERIFY_RESULT(BindRow(depth_, stored, bindings_[depth_], &next))) continue;
+      if (!VERIFY_RESULT(BindRow(depth_, stored, bindings_[depth_], &next))) {
+        continue;
+      }
       if (depth_ + 1 == static_cast<size_t>(open_.triples_size())) {
-        for (auto variable : open_.projection()) response->add_values(next[variable]);
+        for (auto variable : open_.projection()) {
+          response->add_values(next[variable]);
+        }
         ++rows;
       } else {
         ++depth_;
@@ -213,14 +285,16 @@ class Worker {
   uint64_t* Phase(uint64_t* value) { return phase_enabled_ ? value : nullptr; }
   uint64_t* WritePhase() { return Phase(&write_us_); }
   void LogPhases(uint32_t fragment, bool success) const {
-    if (!phase_enabled_) return;
+    if (!phase_enabled_) {
+      return;
+    }
     LOG(INFO) << "MDB_WORKER_PHASE {\"pid\":" << getpid() << ",\"fragment\":" << fragment
-              << ",\"success\":" << (success ? "true" : "false")
-              << ",\"open_us\":" << open_us_ << ",\"client_us\":" << client_us_
-              << ",\"tables_us\":" << tables_us_ << ",\"transaction_us\":" << transaction_us_
-              << ",\"next_us\":" << next_us_ << ",\"scan_api_us\":" << scan_us_
-              << ",\"writes_before_eof_us\":" << write_us_ << ",\"next_calls\":" << next_calls_
-              << ",\"reads\":" << read_operations_ << ",\"flush_rounds\":" << read_flush_rounds_ << "}";
+              << ",\"success\":" << (success ? "true" : "false") << ",\"open_us\":" << open_us_
+              << ",\"client_us\":" << client_us_ << ",\"tables_us\":" << tables_us_
+              << ",\"transaction_us\":" << transaction_us_ << ",\"next_us\":" << next_us_
+              << ",\"scan_api_us\":" << scan_us_ << ",\"writes_before_eof_us\":" << write_us_
+              << ",\"next_calls\":" << next_calls_ << ",\"reads\":" << read_operations_
+              << ",\"flush_rounds\":" << read_flush_rounds_ << "}";
   }
   CoarseTimePoint deadline() const { return deadline_; }
   void LogIo(const std::string& query, uint32_t fragment) const {
@@ -233,7 +307,6 @@ class Worker {
               << ",\"base_reserved_bytes\":" << FragmentBufferedReservation(open_)
               << ",\"memory_bytes\":" << open_.memory_bytes() << "}";
   }
-
 
  private:
   struct Level {
@@ -257,20 +330,26 @@ class Worker {
     bool taken = false;
   };
 
-  Result<bool> BindRow(size_t depth, const DocDBScanBatch::Row& stored,
-                       const std::vector<uint64_t>& input, std::vector<uint64_t>* next) {
+  Result<bool> BindRow(
+      size_t depth, const DocDBScanBatch::Row& stored, const std::vector<uint64_t>& input,
+      std::vector<uint64_t>* next) {
     std::array<uint64_t, 3> triple;
-    DocKeyEncoder::ReversePermute(levels_[depth].perm, stored[0], stored[1], stored[2],
-                                 &triple[0], &triple[1], &triple[2]);
+    DocKeyEncoder::ReversePermute(
+        levels_[depth].perm, stored[0], stored[1], stored[2], &triple[0], &triple[1], &triple[2]);
     *next = input;
     bool matches = true;
     for (int i = 0; i < 3; ++i) {
-      if (!triple[i]) return STATUS(Corruption, "Zero is not a persistent RDF term ID");
+      if (!triple[i]) {
+        return STATUS(Corruption, "Zero is not a persistent RDF term ID");
+      }
       const auto& term = open_.triples(depth).terms(i);
-      if (term.has_constant()) matches &= term.constant() == triple[i];
-      else {
+      if (term.has_constant()) {
+        matches &= term.constant() == triple[i];
+      } else {
         auto& value = (*next)[term.variable()];
-        if (value && value != triple[i]) matches = false;
+        if (value && value != triple[i]) {
+          matches = false;
+        }
         value = triple[i];
       }
     }
@@ -294,8 +373,14 @@ class Worker {
     std::array<uint64_t, 3> keys{};
     DocKeyEncoder::Permute(perm, known[0], known[1], known[2], &keys[0], &keys[1], &keys[2]);
     DocDBScanSpec spec;
-    for (int i = 0; i < 3; ++i) if (keys[i]) spec.columns[i] = {keys[i], keys[i]};
-    if (keys[0]) spec.hash_key = keys[0];
+    for (int i = 0; i < 3; ++i) {
+      if (keys[i]) {
+        spec.columns[i] = {keys[i], keys[i]};
+      }
+    }
+    if (keys[0]) {
+      spec.hash_key = keys[0];
+    }
     if (depth == 0) {
       spec.partition_start = open_.partition_start();
       spec.partition_end = open_.partition_end();
@@ -318,37 +403,56 @@ class Worker {
       prefetch_end_ = std::min(parent.batch.rows.size(), position + prefetch_limit_);
       std::vector<uint64_t> candidate;
       for (size_t i = position; i < prefetch_end_; ++i) {
-        if (CoarseMonoClock::Now() >= deadline_)
+        if (CoarseMonoClock::Now() >= deadline_) {
           return STATUS(TimedOut, "MDB worker prefetch deadline expired");
-        if (!VERIFY_RESULT(BindRow(depth_ - 1, parent.batch.rows[i],
-                                   bindings_[depth_ - 1], &candidate))) continue;
+        }
+        if (!VERIFY_RESULT(
+                BindRow(depth_ - 1, parent.batch.rows[i], bindings_[depth_ - 1], &candidate))) {
+          continue;
+        }
         const auto known = Known(depth_, candidate);
         const auto chosen = Permutation(depth_, known);
         const auto duplicate = std::any_of(prefetch_.begin(), prefetch_.end(), [&](const auto& p) {
           return p.perm == chosen && p.key == known;
         });
-        if (duplicate) continue;
+        if (duplicate) {
+          continue;
+        }
         Prefetch probe;
-        probe.key = known; probe.perm = chosen;
-        RETURN_NOT_OK(probe.cursor.Open(&tables_[chosen], session_, ProbeSpec(depth_, known, chosen)));
+        probe.key = known;
+        probe.perm = chosen;
+        RETURN_NOT_OK(
+            probe.cursor.Open(&tables_[chosen], session_, ProbeSpec(depth_, known, chosen)));
         prefetch_.push_back(std::move(probe));
       }
       std::vector<DocDBScanCursor*> cursors;
-      for (auto& probe : prefetch_) cursors.push_back(&probe.cursor);
-      auto pages = [&] { PhaseTimer timer(Phase(&scan_us_));
-        return DocDBScanCursor::NextBatches(cursors); }();
+      for (auto& probe : prefetch_) {
+        cursors.push_back(&probe.cursor);
+      }
+      auto pages = [&] {
+        PhaseTimer timer(Phase(&scan_us_));
+        return DocDBScanCursor::NextBatches(cursors);
+      }();
       uint64_t operations = 0;
-      for (auto* cursor : cursors) operations += cursor->rpc_calls();
+      for (auto* cursor : cursors) {
+        operations += cursor->rpc_calls();
+      }
       read_operations_ += operations;
       if (operations) {
         ++read_flush_rounds_;
         max_read_in_flight_ = std::max(max_read_in_flight_, operations);
       }
-      if (!pages.ok()) return pages.status();
-      for (size_t i = 0; i < prefetch_.size(); ++i) prefetch_[i].page = std::move((*pages)[i]);
+      if (!pages.ok()) {
+        return pages.status();
+      }
+      for (size_t i = 0; i < prefetch_.size(); ++i) {
+        prefetch_[i].page = std::move((*pages)[i]);
+      }
     }
     for (auto& probe : prefetch_) {
-      if (probe.perm != perm || probe.key != key || probe.taken) continue;
+      if (probe.perm != perm || probe.key != key || probe.taken) {
+        continue;
+      }
       if (probe.page.eof) {
         // A bounded complete first page can serve every duplicate key in the
         // lookahead window. The active level uses its already reserved page.
@@ -370,7 +474,6 @@ class Worker {
     return false;
   }
 
-
   Status OpenLevel() {
     auto& level = levels_[depth_];
     const auto known = Known(depth_, bindings_[depth_]);
@@ -388,8 +491,11 @@ class Worker {
     level.pages = 0;
     level.reusable = false;
     if (prefetch_limit_ && depth_ + 1 == levels_.size() &&
-        VERIFY_RESULT(TakePrefetched(known, perm, &level))) return Status::OK();
-    RETURN_NOT_OK(level.cursor.Open(&tables_[level.perm], session_, ProbeSpec(depth_, known, perm)));
+        VERIFY_RESULT(TakePrefetched(known, perm, &level))) {
+      return Status::OK();
+    }
+    RETURN_NOT_OK(
+        level.cursor.Open(&tables_[level.perm], session_, ProbeSpec(depth_, known, perm)));
     ++level.generation;
     level.batch = {};
     level.position = 0;
@@ -401,12 +507,13 @@ class Worker {
   uint64_t graph_rows_ = 0;
   FragmentOpenPB open_;
   CoarseTimePoint deadline_;
-  scoped_refptr<server::Clock> clock_;
-  std::unique_ptr<client::YBClient> client_;
-  std::shared_ptr<client::TransactionManager> manager_;
+  WorkerRuntime& runtime_;
+  scoped_refptr<server::Clock>& clock_;
+  std::unique_ptr<client::YBClient>& client_;
+  std::shared_ptr<client::TransactionManager>& manager_;
   client::YBTransactionPtr transaction_;
   client::YBSessionPtr session_;
-  std::array<client::TableHandle, 6> tables_;
+  std::array<client::TableHandle, 6>& tables_;
   std::vector<Level> levels_;
   std::vector<std::vector<uint64_t>> bindings_;
   std::vector<Prefetch> prefetch_;
@@ -428,13 +535,15 @@ class Worker {
 
 }  // namespace
 
-Status RunFragmentWorker(int input_fd, int output_fd) {
+Status RunFragmentWorker(int input_fd, int output_fd, bool allow_reuse) {
   RETURN_NOT_OK(SetFragmentNonblocking(input_fd));
   RETURN_NOT_OK(SetFragmentNonblocking(output_fd));
-  Worker worker;
+  WorkerRuntime runtime;
+  std::unique_ptr<Worker> worker;
   auto deadline = CoarseMonoClock::Now() + MonoDelta::FromSeconds(30);
   FragmentRequestPB first;
-  uint64_t sequence = 0;
+  uint64_t sequence = 0, lease = 0;
+  bool reusable = false, waiting_release = false, shutdown = false;
   for (;;) {
     FragmentRequestPB request;
     RETURN_NOT_OK(ReadFragmentFrame(input_fd, &request, deadline));
@@ -446,52 +555,125 @@ Status RunFragmentWorker(int input_fd, int output_fd) {
     response.set_stream_id(request.stream_id());
     response.set_batch_seq(request.batch_seq());
     response.set_worker_pid(getpid());
+    if (request.has_lease_id()) {
+      response.set_lease_id(request.lease_id());
+    }
+    bool released = false;
     auto handle = [&]() -> Status {
-      if ((request.version() != kFragmentVersion && request.version() != 2) ||
+      const bool v3 = request.version() == 3;
+      if ((!v3 && request.version() != kFragmentVersion && request.version() != 2) ||
           request.query_id().empty() || request.query_id().size() > 64 ||
           request.attempt_id() != 1 || request.stream_id() != request.fragment_id() ||
           request.batch_seq() != sequence) {
         return STATUS(InvalidArgument, "MDB worker envelope/version/sequence mismatch");
       }
-      if (sequence == 0) {
-        if (!request.has_open()) return STATUS(InvalidArgument, "MDB worker requires OPEN");
-        if ((request.version() == 2) != (request.open().graph_version() == 1)) {
-          return STATUS(NotSupported, "Graph executor requires explicit version-2 envelope");
+      if (v3) {
+        if (!allow_reuse || request.reuse_version() != 1 || !request.lease_id()) {
+          return STATUS(NotSupported, "Worker requires explicitly enabled v3 reuse capability");
+        }
+      } else if (
+          reusable || request.has_lease_id() || request.has_reuse_version() ||
+          request.has_release() || request.has_shutdown()) {
+        return STATUS(NotSupported, "Reuse requires a v3 envelope");
+      }
+      if (!worker) {
+        if (v3 && request.shutdown() && reusable) {
+          if (request.has_open() || request.release() || request.lease_id() != lease + 1) {
+            return STATUS(InvalidArgument, "Invalid idle worker shutdown");
+          }
+          shutdown = true;
+          response.set_shutdown_ack(true);
+          response.set_reuse_version(1);
+          return Status::OK();
+        }
+        if (!request.has_open() || request.release() || request.shutdown() ||
+            (v3 && (lease >= 256 || request.lease_id() != lease + 1))) {
+          return STATUS(InvalidArgument, "Worker requires a fresh bounded OPEN lease");
+        }
+        if ((request.version() == 2 && request.open().graph_version() != 1) ||
+            (request.version() == 1 && request.open().graph_version()) ||
+            (v3 && request.open().graph_version() > 1)) {
+          return STATUS(NotSupported, "Graph executor version requirement mismatch");
+        }
+        reusable = v3;
+        if (v3) {
+          lease = request.lease_id();
         }
         first = request;
-        RETURN_NOT_OK(worker.Open(request.open()));
-        deadline = worker.deadline();
-        if (request.version() == 2) {
+        const bool runtime_reused = runtime.ready;
+        worker = std::make_unique<Worker>(runtime);
+        RETURN_NOT_OK(worker->Open(request.open()));
+        if (v3) response.set_runtime_reused(runtime_reused);
+        deadline = worker->deadline();
+        if (request.open().graph_version()) {
           response.set_graph_version(1);
+        }
+        if (v3) {
+          response.set_reuse_version(1);
         }
         return Status::OK();
       }
-      if (request.version() != first.version() || request.has_open() ||
-          request.query_id() != first.query_id() || request.fragment_id() != first.fragment_id()) {
-        return STATUS(InvalidArgument, "MDB worker stream identity changed");
+      if (request.version() != first.version() || request.has_open() || request.shutdown() ||
+          request.query_id() != first.query_id() || request.fragment_id() != first.fragment_id() ||
+          (v3 && request.lease_id() != lease)) {
+        return STATUS(InvalidArgument, "MDB worker stream or lease identity changed");
       }
-      return worker.Next(&response);
+      if (waiting_release) {
+        if (!request.release()) {
+          return STATUS(InvalidArgument, "Completed lease requires RELEASE");
+        }
+        // The ACK replaces the legacy process-exit check only after query state
+        // are released; the retained runtime owns infrastructure callbacks.
+        worker.reset();
+        response.set_released(true);
+        response.set_reuse_version(1);
+        released = true;
+        return Status::OK();
+      }
+      if (request.release()) {
+        return STATUS(InvalidArgument, "Cannot release before fragment EOF");
+      }
+      return worker->Next(&response);
     };
     auto status = handle();
     if (!status.ok()) {
+      if (worker) {
+        worker->LogPhases(request.fragment_id(), false);
+      }
+      worker.reset();
       response.clear_values();
       response.set_rows(0);
       response.clear_transaction_result();
       response.set_error(status.ToString());
       response.set_eof(true);
     }
-    // Gather can reap a process immediately after EOF; emit opt-in diagnostics first.
-    if (response.eof() && status.ok() && std::getenv("MDB_WORKER_IO_PROFILE"))
-      worker.LogIo(request.query_id(), request.fragment_id());
-    // Emit before EOF can cause Gather to reap the worker. The final write
-    // and shutdown are consequently outside this diagnostic's write total.
-    if (response.eof()) worker.LogPhases(request.fragment_id(), status.ok());
+    if (worker && response.eof() && status.ok() && std::getenv("MDB_WORKER_IO_PROFILE")) {
+      worker->LogIo(request.query_id(), request.fragment_id());
+    }
+    if (worker && response.eof()) {
+      worker->LogPhases(request.fragment_id(), status.ok());
+    }
     {
-      PhaseTimer timer(worker.WritePhase());
+      PhaseTimer timer(worker ? worker->WritePhase() : nullptr);
       RETURN_NOT_OK(WriteFragmentFrame(output_fd, response, deadline));
     }
-    if (response.eof()) return status;
-    ++sequence;
+    if (!status.ok() || shutdown) {
+      return status;
+    }
+    if (released) {
+      waiting_release = false;
+      sequence = 0;
+      first.Clear();
+      deadline = CoarseMonoClock::Now() + MonoDelta::FromSeconds(30);
+    } else {
+      if (response.eof()) {
+        if (!reusable) {
+          return Status::OK();
+        }
+        waiting_release = true;
+      }
+      ++sequence;
+    }
   }
 }
 

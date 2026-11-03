@@ -4,6 +4,6 @@
 #include "yb/util/status.h"
 
 namespace yb::mdb {
-// One authenticated transport session owns one fragment and child transaction.
-Status RunFragmentWorker(int input_fd, int output_fd);
+// Legacy transports own one fragment. Opt-in v3 requires a release ACK between leases.
+Status RunFragmentWorker(int input_fd, int output_fd, bool allow_reuse = false);
 }  // namespace yb::mdb
