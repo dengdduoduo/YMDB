@@ -231,3 +231,6 @@ ADD_YB_TEST(mdb_fragment_integration_test)
 YB_TEST_TARGET_LINK_LIBRARIES(mdb_fragment_integration_test yb_mdb integration-tests)
 add_dependencies(mdb_fragment_integration_test mdb_fragment_worker mdb_cli)
 target_compile_options(mdb_fragment_integration_test PRIVATE -Wno-shorten-64-to-32)
+
+ADD_YB_TEST(mdb_round3_policy_test)
+YB_TEST_TARGET_LINK_LIBRARIES(mdb_round3_policy_test yb_mdb)
