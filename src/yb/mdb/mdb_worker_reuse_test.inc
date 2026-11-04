@@ -188,6 +188,120 @@ TEST_F(MdbWorkerReuseTest, LateLeaseFrameCannotBecomeNextQuery) {
   ASSERT_NOK(process->Wait());
 }
 
+TEST_F(MdbWorkerReuseTest, RefillsEveryAvailableSlotAfterTargetWait) {
+  Seed(16);
+  auto plan = Plan({{-1, 9000, -2}}, 2, {0, 1}, 16, 128);
+  ASSERT_OK(plan);
+  const auto relay = GetTestPath("pool-refill-relay");
+  const auto warm_flags = GetTestPath("pool-refill-warm.flags");
+  const auto active_flags = GetTestPath("pool-refill-active.flags");
+  const auto opened = GetTestPath("pool-refill-open-");
+  const auto expired = GetTestPath("pool-refill-expired");
+  { std::ofstream flags(warm_flags); }
+  { std::ofstream flags(active_flags); }
+  {
+    std::ofstream f(relay);
+    f << "#!/usr/bin/python3\nimport os,struct,subprocess,sys,time\n"
+      << "worker='" << workers_.binary << "'\nopened='" << opened
+      << "'\nexpired='" << expired << "'\nactive='--flagfile=" << active_flags
+      << "' in sys.argv\n" << R"PY(
+def exact(stream,n):
+ out=b''
+ while len(out)<n:
+  part=stream.read(n-len(out))
+  if not part: raise EOFError('truncated frame')
+  out+=part
+ return out
+def frame(stream):
+ header=exact(stream,4);size=struct.unpack('!I',header)[0]
+ if not 0<size<=1048576: raise ValueError('frame limit')
+ return header+exact(stream,size)
+def varint(data,pos):
+ value=shift=0
+ while True:
+  byte=data[pos];pos+=1;value|=(byte&127)<<shift
+  if byte<128:return value,pos
+  shift+=7
+def number(data,field):
+ pos=0
+ while pos<len(data):
+  tag,pos=varint(data,pos);wire=tag&7
+  if wire==0:
+   value,pos=varint(data,pos)
+   if tag>>3==field:return value
+  elif wire==1:pos+=8
+  elif wire==2:size,pos=varint(data,pos);pos+=size
+  elif wire==5:pos+=4
+  else:raise ValueError('wire type')
+ return 0
+p=subprocess.Popen([worker]+sys.argv[1:],stdin=subprocess.PIPE,stdout=subprocess.PIPE)
+try:
+ while True:
+  request=frame(sys.stdin.buffer);body=request[4:]
+  fragment=number(body,3);sequence=number(body,6);shutdown=number(body,33)
+  if active and sequence==0 and not shutdown:
+   with open(opened+str(fragment),'w') as marker:marker.write(str(os.getpid()))
+  p.stdin.write(request);p.stdin.flush();response=frame(p.stdout)
+  if active and fragment==0 and sequence==0 and not shutdown:
+   # Let the different-key idle lease expire while this worker owns the only
+   # active slot. No SSH or scheduler-speed assumption is needed.
+   time.sleep(21)
+  if active and fragment==1 and sequence==1:
+   until=time.monotonic()+5
+   while not os.path.exists(opened+'2') and time.monotonic()<until:time.sleep(.001)
+   if not os.path.exists(opened+'2'):open(expired,'w').close()
+  sys.stdout.buffer.write(response);sys.stdout.buffer.flush()
+  if number(response[4:],33):break
+ p.stdin.close();sys.exit(p.wait())
+finally:
+ if p.poll() is None:p.kill();p.wait()
+)PY";
+  }
+  std::filesystem::permissions(relay, std::filesystem::perms::owner_all);
+  auto options = workers_;
+  options.binary = relay;
+  options.targets = {"local"};
+  options.reuse_processes = true;
+  options.max_workers = 2;
+  options.page_rows = 16;
+  options.batch_rows = 128;
+  FragmentWorkerPool pool(2);
+  Rows expected;
+  for (uint64_t s = 101; s < 117; ++s) expected.insert({s, 1});
+  std::string pids;
+  for (const auto& flags : {warm_flags, active_flags}) {
+    options.flagfile = flags;
+    auto view = RdfYBModel::Instance().NewQueryReadContext();
+    ASSERT_OK(view);
+    (*view)->deadline = CoarseMonoClock::Now() + MonoDelta::FromSeconds(60);
+    Rows rows;
+    ASSERT_OK(GatherFragments(*plan, options, **view, [&](const auto& row) {
+      rows.insert(row);
+      return Status::OK();
+    }));
+    ASSERT_EQ(rows, expected);
+    ASSERT_EQ((*view)->stats.remote_fragments, 4);
+    ASSERT_EQ((*view)->stats.remote_max_workers, 2);
+    if (!pids.empty()) pids += ',';
+    pids += (*view)->stats.remote_worker_pids;
+  }
+  rapidjson::Document stats;
+  stats.Parse(pool.StatsJson().c_str());
+  ASSERT_EQ(stats["process_starts"].GetUint64(), 4);
+  ASSERT_EQ(stats["open_acks"].GetUint64(), 8);
+  ASSERT_OK(pool.Close());
+  std::istringstream processes(pids);
+  for (std::string pid; std::getline(processes, pid, ',');) {
+    ASSERT_OK(WaitFor([&] {
+      errno = 0;
+      return kill(static_cast<pid_t>(std::stoll(pid)), 0) == -1 && errno == ESRCH;
+    }, MonoDelta::FromSeconds(5), "Refill test worker must exit"));
+  }
+  ASSERT_TRUE(std::filesystem::exists(opened + "2"));
+  ASSERT_FALSE(std::filesystem::exists(expired))
+      << "Fragment 2 must OPEN before fragment 1 is allowed to finish";
+}
+
 TEST_F(MdbWorkerReuseTest, SessionPoolBoundsStartsAndKeepsFreshViews) {
   Seed(8);
   auto plan = Plan({{-1, 9000, -2}, {-2, 9001, -3}}, 3, {0, 2}, 2, 1);

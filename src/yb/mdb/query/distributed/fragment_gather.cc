@@ -473,8 +473,11 @@ Status GatherInputs(
         }
         active.erase(active.begin() + current);
       }
-      if (fragment < task_count) {
-        (void)VERIFY_RESULT(start());
+      // A target wait can leave another slot idle after this worker finishes.
+      while (fragment < task_count && active.size() < options.max_workers) {
+        if (!VERIFY_RESULT(start())) {
+          break;
+        }
       }
     } else {
       stream.request.set_batch_seq(stream.request.batch_seq() + 1);
