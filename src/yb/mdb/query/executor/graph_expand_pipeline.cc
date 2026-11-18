@@ -3,8 +3,58 @@
 
 #include <algorithm>
 #include <exception>
+#include <map>
+
+#include "yb/client/table.h"
+#include "yb/client/table_handle.h"
+#include "yb/common/ql_protocol.pb.h"
+#include "yb/dockv/partition.h"
+#include "yb/mdb/storage/docdb_key_encoder.h"
+#include "yb/util/logging.h"
 
 namespace yb::mdb {
+
+void GraphExpandPipeline::LogSecondHopPlacement() const {
+  using Probe = std::pair<uint64_t, uint64_t>;
+  std::map<Probe, bool> all_local;
+  size_t local_rows = 0;
+  size_t unknown_rows = 0;
+  const bool same_index = first_spec_.direction == second_spec_.direction;
+  const auto index = first_spec_.direction == GraphDirection::Out
+      ? DocKeyEncoder::kSPO : DocKeyEncoder::kOPS;
+  const auto& table = tables_[index]->table();
+  const auto partitions = table->GetVersionedPartitions();
+  std::map<uint64_t, PartitionKeyPtr> locations;
+  auto location = [&](uint64_t id) -> PartitionKeyPtr {
+    auto [it, inserted] = locations.try_emplace(id);
+    if (!inserted || !id || !partitions || partitions->keys.empty()) return it->second;
+    google::protobuf::RepeatedPtrField<QLExpressionPB> values;
+    values.Add()->mutable_value()->set_int64_value(static_cast<int64_t>(id));
+    std::string key;
+    if (table->partition_schema().EncodeKey(values, &key).ok()) {
+      it->second = client::FindPartitionStart(partitions, key);
+    }
+    return it->second;
+  };
+  for (const auto& row : pending_) {
+    const auto start = row.values[second_spec_.start_slot];
+    bool local = false;
+    if (same_index) {
+      const auto first = location(row.values[first_spec_.start_slot]);
+      const auto second = location(start);
+      unknown_rows += !first || !second;
+      local = first && second && *first == *second;
+    }
+    local_rows += local;
+    auto it = all_local.try_emplace({start, row.values[second_spec_.neighbor_slot]}, true).first;
+    it->second &= local;
+  }
+  const auto local_probes = std::count_if(all_local.begin(), all_local.end(),
+      [](const auto& entry) { return entry.second; });
+  LOG(INFO) << "MDB_SECOND_HOP_PLACEMENT rows=" << pending_.size()
+            << " same_tablet_rows=" << local_rows << " unknown_rows=" << unknown_rows
+            << " probes=" << all_local.size() << " fully_local_probes=" << local_probes;
+}
 
 Status GraphExpandPipeline::Open(const std::vector<GraphBinding>& input) {
   Close();
@@ -36,7 +86,9 @@ Status GraphExpandPipeline::Open(const std::vector<GraphBinding>& input) {
     second.memory_bytes = std::min(second.memory_bytes,
         (options_.memory_bytes - pending_bytes) / 2);
     first_ = std::make_unique<GraphExpand>(tables_, context_, first);
-    second_ = std::make_unique<GraphExpand>(tables_, context_, second);
+    // Pair level 2 with async_rpc=3 to see the actual tablet Read RPC membership.
+    second_ = std::make_unique<GraphExpand>(
+        tables_, context_, second, VLOG_IS_ON(2) ? &first_spec_ : nullptr);
     RETURN_NOT_OK(first_->Open(input));
     // Validate second-hop predicate, table, direction and page/batch limits
     // before any first-hop output is consumed.
@@ -72,7 +124,14 @@ Result<bool> GraphExpandPipeline::NextImpl(GraphBinding* output) {
   while (true) {
     if (second_open_) {
       GraphBinding row;
-      const auto more = VERIFY_RESULT(second_->Next(&row));
+      const bool diagnose = VLOG_IS_ON(1);
+      bool more;
+      if (diagnose) {
+        DocDBReadContextScope scope(context_);
+        more = VERIFY_RESULT(second_->Next(&row));
+      } else {
+        more = VERIFY_RESULT(second_->Next(&row));
+      }
       if (more) {
         if (options_.filter) {
           try {
@@ -93,6 +152,10 @@ Result<bool> GraphExpandPipeline::NextImpl(GraphBinding* output) {
         return true;
       }
       completed_reads_ += second_->stats().read_operations;
+      if (diagnose) {
+        LOG(INFO) << "MDB_SECOND_HOP_READ read_operations=" << second_->stats().read_operations
+                  << " flush_us=" << context_.stats.storage_flush_us - second_flush_start_us_;
+      }
       second_->Close(); second_open_ = false;
     }
     if (exhausted_) return false;
@@ -104,6 +167,10 @@ Result<bool> GraphExpandPipeline::NextImpl(GraphBinding* output) {
     }
     if (pending_.empty()) return false;
     peak_seed_rows_ = std::max(peak_seed_rows_, pending_.size());
+    if (VLOG_IS_ON(1)) {
+      LogSecondHopPlacement();
+      second_flush_start_us_ = context_.stats.storage_flush_us;
+    }
     RETURN_NOT_OK(second_->Open(pending_));
     // The second hop now owns its bounded seed copy; retain no binding payload twice.
     pending_.clear();
@@ -117,6 +184,7 @@ void GraphExpandPipeline::Close() {
   std::vector<GraphBinding>().swap(pending_);
   peak_seed_rows_ = reserved_bytes_ = 0;
   second_hop_batches_ = completed_reads_ = 0;
+  second_flush_start_us_ = 0;
   second_open_ = exhausted_ = false;
   failure_ = Status::OK();
 }

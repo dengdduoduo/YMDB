@@ -41,6 +41,7 @@ class GraphExpandPipeline {
 
  private:
   Result<bool> NextImpl(GraphBinding* output);
+  void LogSecondHopPlacement() const;
   std::array<const client::TableHandle*, 6> tables_;
   DocDBReadContext& context_;
   GraphExpandSpec first_spec_, second_spec_;
@@ -50,6 +51,7 @@ class GraphExpandPipeline {
   size_t peak_seed_rows_ = 0;
   size_t reserved_bytes_ = 0;
   uint64_t second_hop_batches_ = 0, completed_reads_ = 0;
+  uint64_t second_flush_start_us_ = 0;
   bool second_open_ = false;
   bool exhausted_ = false;
   Status failure_;

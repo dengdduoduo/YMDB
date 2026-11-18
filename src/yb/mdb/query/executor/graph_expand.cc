@@ -2,9 +2,16 @@
 #include "yb/mdb/query/executor/graph_expand.h"
 
 #include <algorithm>
+#include <chrono>
+#include <sstream>
 
 #include "yb/client/session.h"
+#include "yb/client/table.h"
+#include "yb/client/table_handle.h"
+#include "yb/common/ql_protocol.pb.h"
+#include "yb/dockv/partition.h"
 #include "yb/mdb/storage/docdb_key_encoder.h"
+#include "yb/util/logging.h"
 
 namespace yb::mdb {
 
@@ -80,17 +87,9 @@ Status GraphExpand::OpenWave() {
     const auto& group = groups_[next_group_];
     auto probe = std::make_unique<Probe>();
     probe->group = next_group_++;
-    DocDBScanSpec scan;
-    scan.hash_key = group.start;
-    scan.columns[0] = {group.start, group.start};
-    scan.columns[1] = {spec_.predicate, spec_.predicate};
-    if (group.neighbor) scan.columns[2] = {group.neighbor, group.neighbor};
-    scan.page_rows = spec_.page_rows;
-    scan.page_bytes = spec_.page_rows * sizeof(DocDBScanBatch::Row);
-    scan.deadline = context_.deadline;
-    scan.cancelled = &context_.cancelled;
-    scan.push_exact_filters = true;
-    RETURN_NOT_OK(probe->cursor.Open(tables_[permutation_], context_.session, scan));
+    RETURN_NOT_OK(probe->cursor.Open(
+        tables_, context_.session, spec_.direction, group.start, spec_.predicate,
+        group.neighbor, spec_.page_rows, context_.deadline, context_.cancelled));
     wave_.push_back(std::move(probe));
     ++stats_.probes;
   }
@@ -98,21 +97,60 @@ Status GraphExpand::OpenWave() {
   return Status::OK();
 }
 
+void GraphExpand::LogProbeSources(size_t slot, const Probe& probe) const {
+  const bool source_out = trace_source_->direction == GraphDirection::Out;
+  const auto& table = tables_[source_out ? DocKeyEncoder::kSPO : DocKeyEncoder::kOPS]->table();
+  const auto& group = groups_[probe.group];
+  std::ostringstream sources;
+  for (const auto seed : group.seeds) {
+    const auto& row = seeds_[seed];
+    const auto start = row.values[trace_source_->start_slot];
+    google::protobuf::RepeatedPtrField<QLExpressionPB> values;
+    values.Add()->mutable_value()->set_int64_value(static_cast<int64_t>(start));
+    std::string key;
+    if (seed != group.seeds.front()) sources << ',';
+    sources << row.origin << ':' << start << ':';
+    if (table->partition_schema().EncodeKey(values, &key).ok() &&
+        key.size() == sizeof(uint16_t)) {
+      sources << dockv::PartitionSchema::DecodeMultiColumnHashValue(key);
+    } else {
+      sources << '-';
+    }
+  }
+  LOG(INFO) << "MDB_HOP2_PROBE slot=" << slot << " group=" << probe.group
+            << " start=" << group.start << " predicate=" << spec_.predicate
+            << " neighbor=" << group.neighbor << " source_index=" << (source_out ? "spo" : "ops")
+            << " sources=" << sources.str();
+}
+
 Status GraphExpand::RefillPages() {
-  std::vector<DocDBScanCursor*> cursors;
+  std::vector<DocDBNeighborCursor*> cursors;
   std::vector<Probe*> probes;
   uint64_t before = 0;
   for (auto& probe : wave_) {
     if (probe->edge != probe->page.rows.size() || probe->page.eof) continue;
     probe->page = {};
     probe->edge = 0;
-    before += probe->cursor.rpc_calls();
+    before += probe->cursor.read_operations();
     cursors.push_back(&probe->cursor);
     probes.push_back(probe.get());
   }
-  auto pages = DocDBScanCursor::NextBatches(cursors);
+  std::chrono::steady_clock::time_point trace_start;
+  if (trace_source_) {
+    LOG(INFO) << "MDB_HOP2_BEGIN target_index="
+              << (spec_.direction == GraphDirection::Out ? "spo" : "ops");
+    for (size_t i = 0; i < probes.size(); ++i) LogProbeSources(i, *probes[i]);
+    trace_start = std::chrono::steady_clock::now();
+  }
+  auto pages = DocDBNeighborCursor::ScanNeighbors(cursors, trace_source_ != nullptr);
+  if (trace_source_) {
+    const auto elapsed = std::chrono::steady_clock::now() - trace_start;
+    LOG(INFO) << "MDB_HOP2_END read_us="
+              << std::chrono::duration_cast<std::chrono::microseconds>(elapsed).count()
+              << " ok=" << pages.ok();
+  }
   uint64_t after = 0;
-  for (auto* cursor : cursors) after += cursor->rpc_calls();
+  for (auto* cursor : cursors) after += cursor->read_operations();
   stats_.read_operations += after - before;
   if (after != before) ++stats_.flush_rounds;
   if (!pages.ok()) return pages.status();

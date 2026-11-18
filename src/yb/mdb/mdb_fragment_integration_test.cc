@@ -41,6 +41,7 @@
 #include "yb/mdb/query/executor/graph_expand.h"
 #include "yb/mdb/query/executor/graph_expand_pipeline.h"
 #include "yb/mdb/query/executor/wall_time_scope.h"
+#include "yb/util/scope_exit.h"
 #include "yb/mdb/storage/docdb_read_context.h"
 #include "yb/mdb/storage/docdb_scan_cursor.h"
 #include "yb/mdb/storage/legacy_dictionary_scan.h"
@@ -6560,18 +6561,26 @@ TEST_F(MdbFragmentIntegrationTest, GraphExpandAdmissionLateErrorsAndRecovery) {
   ASSERT_OK(next);
   ASSERT_TRUE(*next);
   (*view)->cancelled.store(true);
-  ASSERT_TRUE(expand.Next(&row).status().IsAborted());
+  next = expand.Next(&row);
+  ASSERT_FALSE(next.ok());
+  ASSERT_TRUE(next.status().IsAborted());
   ASSERT_TRUE(row.values.empty());
   (*view)->cancelled.store(false);
-  ASSERT_TRUE(expand.Next(&row).status().IsAborted());
+  next = expand.Next(&row);
+  ASSERT_FALSE(next.ok());
+  ASSERT_TRUE(next.status().IsAborted());
   ASSERT_OK(expand.Open({{1, {2, 0}}}));
   next = expand.Next(&row);
   ASSERT_OK(next);
   ASSERT_TRUE(*next);
   (*view)->deadline = CoarseMonoClock::Now();
-  ASSERT_TRUE(expand.Next(&row).status().IsTimedOut());
+  next = expand.Next(&row);
+  ASSERT_FALSE(next.ok());
+  ASSERT_TRUE(next.status().IsTimedOut());
   (*view)->deadline = CoarseMonoClock::Now() + MonoDelta::FromSeconds(30);
-  ASSERT_TRUE(expand.Next(&row).status().IsTimedOut());
+  next = expand.Next(&row);
+  ASSERT_FALSE(next.ok());
+  ASSERT_TRUE(next.status().IsTimedOut());
   ASSERT_OK(expand.Open({}));
   next = expand.Next(&row);
   ASSERT_OK(next);

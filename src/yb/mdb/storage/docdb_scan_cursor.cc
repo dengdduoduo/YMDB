@@ -13,7 +13,9 @@
 #include "yb/dockv/partition.h"
 #include "yb/mdb/storage/yb_client_compat.h"
 #include "yb/mdb/storage/docdb_read_context.h"
+#include "yb/mdb/storage/docdb_key_encoder.h"
 #include "yb/mdb/query/executor/wall_time_scope.h"
+#include "yb/util/logging.h"
 
 namespace yb::mdb {
 namespace {
@@ -27,6 +29,43 @@ void StartPageArena(const Session& session) {
   }
 }
 }  // namespace
+
+Status DocDBNeighborCursor::Open(
+    const std::array<const client::TableHandle*, 6>& tables,
+    const client::YBSessionPtr& session, GraphDirection direction,
+    uint64_t start, uint64_t predicate, uint64_t bound_neighbor,
+    size_t page_rows, CoarseTimePoint deadline, const std::atomic<bool>& cancelled) {
+  cursor_.Close();
+  if ((direction != GraphDirection::Out && direction != GraphDirection::In) ||
+      !start || !predicate || !page_rows || page_rows > 256) {
+    return STATUS(InvalidArgument, "Invalid MDB adjacency scan");
+  }
+  const auto index = direction == GraphDirection::Out ? DocKeyEncoder::kSPO : DocKeyEncoder::kOPS;
+  DocDBScanSpec scan;
+  scan.hash_key = start;
+  scan.columns[0] = {start, start};
+  scan.columns[1] = {predicate, predicate};
+  if (bound_neighbor) scan.columns[2] = {bound_neighbor, bound_neighbor};
+  scan.page_rows = page_rows;
+  scan.page_bytes = page_rows * sizeof(DocDBScanBatch::Row);
+  scan.deadline = deadline;
+  scan.cancelled = &cancelled;
+  scan.push_exact_filters = true;
+  return cursor_.Open(tables[index], session, std::move(scan));
+}
+
+Result<std::vector<DocDBScanBatch>> DocDBNeighborCursor::ScanNeighbors(
+    const std::vector<DocDBNeighborCursor*>& cursors, bool trace_second_hop) {
+  if (cursors.size() > 16) {
+    return STATUS(InvalidArgument, "MDB adjacency batch exceeds 16 probes");
+  }
+  std::vector<DocDBScanCursor*> pages;
+  pages.reserve(cursors.size());
+  for (auto* cursor : cursors) {
+    pages.push_back(cursor ? &cursor->cursor_ : nullptr);
+  }
+  return DocDBScanCursor::NextBatches(pages, trace_second_hop);
+}
 
 Status DocDBScanCursor::Open(
     const client::TableHandle* table, client::YBSessionPtr session, DocDBScanSpec spec) {
@@ -59,7 +98,7 @@ Result<DocDBScanBatch> DocDBScanCursor::NextBatch() {
 }
 
 Result<std::vector<DocDBScanBatch>> DocDBScanCursor::NextBatches(
-    const std::vector<DocDBScanCursor*>& cursors) {
+    const std::vector<DocDBScanCursor*>& cursors, bool trace_second_hop) {
   if (cursors.empty()) return std::vector<DocDBScanBatch>();
   if (!cursors.front()) return STATUS(InvalidArgument, "Null MDB batch cursor");
   const auto session = cursors.front()->session_;
@@ -79,6 +118,12 @@ Result<std::vector<DocDBScanBatch>> DocDBScanCursor::NextBatches(
     for (size_t i = 0; i < ops.size(); ++i) {
       if (!ops[i]) continue;
       ++cursors[i]->rpc_calls_;  // Read operations, not a claim about wire RPC count.
+      if (trace_second_hop) {
+        const auto& request = ops[i]->request();
+        LOG(INFO) << "MDB_HOP2_PAGE slot=" << i << " query_id=" << request.query_id()
+                  << " page=" << cursors[i]->rpc_calls_
+                  << " continuation=" << request.has_paging_state();
+      }
       session->Apply(ops[i]);
       pending = true;
     }

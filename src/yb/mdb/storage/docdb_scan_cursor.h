@@ -51,7 +51,7 @@ class DocDBScanCursor {
   // Queue one page per cursor, then flush once. All cursors must use the same
   // query session; the client routes the bounded operation set concurrently.
   static Result<std::vector<DocDBScanBatch>> NextBatches(
-      const std::vector<DocDBScanCursor*>& cursors);
+      const std::vector<DocDBScanCursor*>& cursors, bool trace_second_hop = false);
   void Close();
   uint64_t rpc_calls() const { return rpc_calls_; }
   uint64_t payload_bytes() const { return payload_bytes_; }
@@ -73,6 +73,28 @@ class DocDBScanCursor {
   uint64_t payload_bytes_ = 0;
   uint64_t decoded_rows_ = 0;
   uint64_t retained_payload_bytes_ = 0;
+};
+
+enum class GraphDirection { Out, In };
+
+// A tablet-routed adjacency scan. Continuation state belongs to this cursor
+// and remains bound to the original query session and read view.
+class DocDBNeighborCursor {
+ public:
+  Status Open(const std::array<const client::TableHandle*, 6>& tables,
+              const client::YBSessionPtr& session, GraphDirection direction,
+              uint64_t start, uint64_t predicate, uint64_t bound_neighbor,
+              size_t page_rows, CoarseTimePoint deadline, const std::atomic<bool>& cancelled);
+
+  // One page per input, in input order. The client groups the underlying
+  // reads into tablet Read RPCs, each carrying a ql_batch.
+  static Result<std::vector<DocDBScanBatch>> ScanNeighbors(
+      const std::vector<DocDBNeighborCursor*>& cursors, bool trace_second_hop = false);
+  uint64_t read_operations() const { return cursor_.rpc_calls(); }
+  uint64_t retained_payload_bytes() const { return cursor_.retained_payload_bytes(); }
+
+ private:
+  DocDBScanCursor cursor_;
 };
 
 }  // namespace yb::mdb

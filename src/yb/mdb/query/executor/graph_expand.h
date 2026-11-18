@@ -18,8 +18,6 @@ struct GraphBinding {
   std::vector<uint64_t> values;
 };
 
-enum class GraphDirection { Out, In };
-
 struct GraphExpandSpec {
   GraphDirection direction = GraphDirection::Out;
   uint64_t predicate = 0;
@@ -48,8 +46,9 @@ struct GraphExpandStats {
 class GraphExpand {
  public:
   GraphExpand(std::array<const client::TableHandle*, 6> tables,
-              DocDBReadContext& context, GraphExpandSpec spec)
-      : tables_(tables), context_(context), spec_(spec) {}
+              DocDBReadContext& context, GraphExpandSpec spec,
+              const GraphExpandSpec* trace_source = nullptr)
+      : tables_(tables), context_(context), spec_(spec), trace_source_(trace_source) {}
   ~GraphExpand() { Close(); }
   GraphExpand(const GraphExpand&) = delete;
   GraphExpand& operator=(const GraphExpand&) = delete;
@@ -69,7 +68,7 @@ class GraphExpand {
   };
   struct Probe {
     size_t group = 0;
-    DocDBScanCursor cursor;
+    DocDBNeighborCursor cursor;
     DocDBScanBatch page;
     size_t edge = 0;
     size_t source = 0;
@@ -77,10 +76,12 @@ class GraphExpand {
   Status Check() const;
   Status OpenWave();
   Status RefillPages();
+  void LogProbeSources(size_t slot, const Probe& probe) const;
   Result<bool> NextImpl(GraphBinding* output);
   std::array<const client::TableHandle*, 6> tables_;
   DocDBReadContext& context_;
   GraphExpandSpec spec_;
+  const GraphExpandSpec* trace_source_;
   std::vector<GraphBinding> seeds_;
   std::vector<Group> groups_;
   std::vector<std::unique_ptr<Probe>> wave_;
